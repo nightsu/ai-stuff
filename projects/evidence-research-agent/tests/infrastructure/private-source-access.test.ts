@@ -20,6 +20,7 @@ import {
   ArtifactIntegrityError,
   ContentAddressedArtifactStore,
 } from "../../src/infrastructure/content-addressed-artifact-store.js";
+import { preparePrivateRuntimeHome } from "../../src/infrastructure/private-runtime-home.js";
 import {
   MAX_SOURCE_LINE_WINDOW,
   PrivateSourceAccess,
@@ -676,13 +677,13 @@ async function createFixture(): Promise<Fixture> {
   temporaryDirectories.push(baseDirectory);
   const approvedRoot = join(baseDirectory, "approved");
   const outsideRoot = join(baseDirectory, "outside");
-  const runtimeHome = join(baseDirectory, "runtime");
+  const requestedRuntimeHome = join(baseDirectory, "runtime");
   await Promise.all([
     mkdir(join(approvedRoot, "config"), { recursive: true }),
     mkdir(join(approvedRoot, "excluded"), { recursive: true }),
     mkdir(join(approvedRoot, "directory.md"), { recursive: true }),
     mkdir(outsideRoot, { recursive: true }),
-    mkdir(runtimeHome, { recursive: true }),
+    mkdir(requestedRuntimeHome, { recursive: true }),
   ]);
 
   await Promise.all([
@@ -717,6 +718,7 @@ async function createFixture(): Promise<Fixture> {
     maxFileBytes: 256,
     maxTotalBytes: 2_000,
   });
+  const runtimeHome = preparePrivateRuntimeHome(requestedRuntimeHome);
   return {
     baseDirectory,
     approvedRoot,

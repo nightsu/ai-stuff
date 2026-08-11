@@ -19,6 +19,7 @@ import {
   ArtifactIntegrityError,
   ContentAddressedArtifactStore,
 } from "../../src/infrastructure/content-addressed-artifact-store.js";
+import { preparePrivateRuntimeHome } from "../../src/infrastructure/private-runtime-home.js";
 
 const temporaryDirectories: string[] = [];
 const createdAt = "2026-08-12T08:00:00.000Z";
@@ -34,7 +35,6 @@ afterEach(async () => {
 describe("private Source Snapshot store", () => {
   it("uses a dedicated identity and private directory and file modes", async () => {
     const runtimeHome = await createRuntimeHome();
-    await chmod(runtimeHome, 0o755);
     const bytes = Buffer.from("private source\n", "utf8");
     const store = new ContentAddressedArtifactStore(runtimeHome);
 
@@ -129,7 +129,6 @@ describe("private Source Snapshot store", () => {
     const absolutePath = join(runtimeHome, first.relativePath);
     const prefixDirectory = join(absolutePath, "..");
     await Promise.all([
-      chmod(runtimeHome, 0o755),
       chmod(join(runtimeHome, "source-snapshots"), 0o755),
       chmod(prefixDirectory, 0o755),
       chmod(absolutePath, 0o644),
@@ -157,7 +156,9 @@ describe("private Source Snapshot store", () => {
 });
 
 async function createRuntimeHome(): Promise<string> {
-  return createTemporaryDirectory("snapshot-runtime-");
+  return preparePrivateRuntimeHome(
+    await createTemporaryDirectory("snapshot-runtime-"),
+  );
 }
 
 async function createTemporaryDirectory(prefix: string): Promise<string> {

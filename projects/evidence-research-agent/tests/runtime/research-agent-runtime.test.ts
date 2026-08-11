@@ -1,4 +1,13 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,6 +32,85 @@ afterEach(async () => {
 });
 
 describe("ResearchAgentRuntime planning slice", () => {
+  it("rejects a final Runtime Home symlink before changing its target", async () => {
+    const baseDirectory = await createTemporaryDirectory("evidence-agent-home-");
+    const outside = await createTemporaryDirectory("evidence-agent-outside-");
+    const runtimeHome = join(baseDirectory, "runtime");
+    const sentinelPath = join(outside, "sentinel.txt");
+    await Promise.all([
+      chmod(outside, 0o755),
+      writeFile(sentinelPath, "unchanged", "utf8"),
+    ]);
+    await symlink(outside, runtimeHome, "dir");
+
+    let unexpectedlyOpened: ResearchAgentRuntime | undefined;
+    let thrown: unknown;
+    try {
+      unexpectedlyOpened = ResearchAgentRuntime.open({
+        runtimeHome,
+        model: new ScriptedModel([]),
+      });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      unexpectedlyOpened?.close();
+    }
+
+    expect(thrown).toMatchObject({
+      name: "PrivateRuntimeHomeError",
+      message: "私有 Runtime Home 无法安全准备",
+    });
+    await expect(modeOf(outside)).resolves.toBe(0o755);
+    await expect(readFile(sentinelPath, "utf8")).resolves.toBe("unchanged");
+    await expect(readdir(outside)).resolves.toEqual(["sentinel.txt"]);
+  });
+
+  it("normalizes a final non-directory Runtime Home before SQLite opens", async () => {
+    const baseDirectory = await createTemporaryDirectory("evidence-agent-home-");
+    const runtimeHome = join(baseDirectory, "runtime");
+    await writeFile(runtimeHome, "not a directory", "utf8");
+
+    expect(() =>
+      ResearchAgentRuntime.open({
+        runtimeHome,
+        model: new ScriptedModel([]),
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        name: "PrivateRuntimeHomeError",
+        message: "私有 Runtime Home 无法安全准备",
+      }),
+    );
+    await expect(readFile(runtimeHome, "utf8")).resolves.toBe(
+      "not a directory",
+    );
+  });
+
+  it("prepares existing and missing Runtime Homes as private directories", async () => {
+    const existing = await createTemporaryDirectory("evidence-agent-existing-");
+    await chmod(existing, 0o755);
+    const existingRuntime = ResearchAgentRuntime.open({
+      runtimeHome: existing,
+      model: new ScriptedModel([]),
+    });
+    existingRuntime.close();
+
+    const baseDirectory = await createTemporaryDirectory("evidence-agent-home-");
+    const missingParent = join(baseDirectory, "private-state");
+    const missing = join(missingParent, "runtime");
+    const missingRuntime = ResearchAgentRuntime.open({
+      runtimeHome: missing,
+      model: new ScriptedModel([]),
+    });
+    missingRuntime.close();
+
+    await expect(modeOf(existing)).resolves.toBe(0o700);
+    await expect(readdir(existing)).resolves.toContain("runtime.sqlite");
+    await expect(modeOf(missingParent)).resolves.toBe(0o700);
+    await expect(modeOf(missing)).resolves.toBe(0o700);
+    await expect(readdir(missing)).resolves.toContain("runtime.sqlite");
+  });
+
   it("persists a proposed plan and rebuilds the same approval-wait state", async () => {
     const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-"));
     runtimeHomes.push(runtimeHome);
@@ -228,6 +316,16 @@ async function createCachedRun(runtimeHome: string): Promise<RunProjection> {
   } finally {
     runtime.close();
   }
+}
+
+async function createTemporaryDirectory(prefix: string): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  runtimeHomes.push(directory);
+  return directory;
+}
+
+async function modeOf(path: string): Promise<number> {
+  return (await stat(path)).mode & 0o777;
 }
 
 function overwriteProjectionCache(runtimeHome: string, cacheJson: string): void {

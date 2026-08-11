@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
 
 import { z } from "zod";
 
@@ -25,6 +24,7 @@ import {
   ConcurrentRunWriteError,
   SqliteRunStore,
 } from "../infrastructure/sqlite-run-store.js";
+import { preparePrivateRuntimeHome } from "../infrastructure/private-runtime-home.js";
 import type { Clock, IdGenerator, ModelPort } from "./ports.js";
 
 /** 打开一个 headless runtime 所需的基础设施与可控边界。 */
@@ -156,7 +156,9 @@ export class ResearchAgentRuntime {
   readonly #store: SqliteRunStore;
 
   private constructor(options: OpenRuntimeOptions) {
-    const runtimeHome = resolve(options.runtimeHome);
+    // 两个 store 只能收到同一次集中准备得到的 canonical Runtime Home，避免
+    // SQLite 先创建文件、Artifact Store 随后才发现 caller final path 是 symlink。
+    const runtimeHome = preparePrivateRuntimeHome(options.runtimeHome);
     this.#clock = options.clock ?? systemClock;
     this.#ids = options.ids ?? uuidGenerator;
     this.#model = options.model;

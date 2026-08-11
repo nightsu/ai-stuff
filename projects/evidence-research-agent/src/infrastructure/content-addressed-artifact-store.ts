@@ -26,11 +26,11 @@ export class ArtifactIntegrityError extends Error {
 
 /** 把不可变 payload 存入 Runtime Home 内的角色隔离内容寻址目录。 */
 export class ContentAddressedArtifactStore {
-  /** 调用方提供并规范为绝对路径、每次写入仍会做 lstat/realpath 复核的 Runtime Home。 */
+  /** runtime 打开时已集中准备、供两个 store 共享的 canonical Runtime Home。 */
   readonly #runtimeHome: string;
 
   public constructor(runtimeHome: string) {
-    this.#runtimeHome = resolve(runtimeHome);
+    this.#runtimeHome = runtimeHome;
   }
 
   public async putJson(
@@ -41,7 +41,7 @@ export class ContentAddressedArtifactStore {
     const content = `${JSON.stringify(value, null, 2)}\n`;
     const bytes = Buffer.from(content, "utf8");
     const sha256 = hashBytes(bytes);
-    const runtimeHome = await this.#prepareRuntimeHome();
+    const runtimeHome = this.#runtimeHome;
     const prefixDirectory = await preparePrivateDirectoryChain(runtimeHome, [
       "artifacts",
       "sha256",
@@ -69,7 +69,7 @@ export class ContentAddressedArtifactStore {
       // UTF-8 重编码结果；独立 identity 也避免与同 hash 的 JSON artifact 混淆角色。
       const bytes = Buffer.from(sourceBytes);
       const sha256 = hashBytes(bytes);
-      const runtimeHome = await this.#prepareRuntimeHome();
+      const runtimeHome = this.#runtimeHome;
       const prefixDirectory = await preparePrivateDirectoryChain(runtimeHome, [
         "source-snapshots",
         "sha256",
@@ -94,22 +94,6 @@ export class ContentAddressedArtifactStore {
     }
   }
 
-  async #prepareRuntimeHome(): Promise<string> {
-    try {
-      await mkdir(this.#runtimeHome, { recursive: true, mode: 0o700 });
-      const metadata = await lstat(this.#runtimeHome);
-      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-        throw new ArtifactIntegrityError();
-      }
-      await chmod(this.#runtimeHome, 0o700);
-      return await realpath(this.#runtimeHome);
-    } catch (error) {
-      if (error instanceof ArtifactIntegrityError) {
-        throw error;
-      }
-      throw new ArtifactIntegrityError();
-    }
-  }
 }
 
 async function preparePrivateDirectoryChain(

@@ -9,6 +9,7 @@ export {
 } from "./application/research-agent-runtime.js";
 export { formatRunTrace } from "./application/trace-format.js";
 export { runCli } from "./cli.js";
+export { PrivateRuntimeHomeError } from "./infrastructure/private-runtime-home.js";
 export {
   createPlanApprovalBinding,
   hashCanonicalJson,
