@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -9,6 +10,7 @@ import {
   ScriptedModel,
   formatRunTrace,
 } from "../../src/index.js";
+import type { RunProjection } from "../../src/index.js";
 
 const runtimeHomes: string[] = [];
 
@@ -97,6 +99,40 @@ describe("ResearchAgentRuntime planning slice", () => {
     );
     expect(created.lastEventSequence).toBe(3);
     runtime.close();
+
+    const database = new Database(join(runtimeHome, "runtime.sqlite"));
+    const cachedJson = database
+      .prepare(
+        "SELECT projection_json FROM run_projections WHERE run_id = ?",
+      )
+      .pluck()
+      .get("run-001");
+    if (typeof cachedJson !== "string") {
+      throw new Error("测试要求 SQLite 中存在 Projection cache");
+    }
+    const cachedProjection = JSON.parse(cachedJson) as RunProjection;
+    if (cachedProjection.state.type !== "waiting_plan_approval") {
+      throw new Error("测试要求缓存处于等待计划审批状态");
+    }
+    database
+      .prepare(
+        "UPDATE run_projections SET projection_json = ? WHERE run_id = ?",
+      )
+      .run(
+        JSON.stringify({
+          ...cachedProjection,
+          state: {
+            ...cachedProjection.state,
+            approvalBinding: {
+              ...cachedProjection.state.approvalBinding,
+              bindingHash:
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            },
+          },
+        }),
+        "run-001",
+      );
+    database.close();
 
     const reopened = ResearchAgentRuntime.open({
       runtimeHome,

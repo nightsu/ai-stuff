@@ -1,4 +1,6 @@
+import { createPlanApprovalBinding } from "./integrity.js";
 import type {
+  PlanApprovalBinding,
   ResearchRunEvent,
   RunProjection,
   RunTrace,
@@ -97,12 +99,31 @@ function applyRunEvent(
       if (current.state.type !== "planning") {
         throw new IllegalRunEventError("只有 planning Run 可以提交计划");
       }
+      const expectedApprovalBinding = createPlanApprovalBinding({
+        question: current.question,
+        planHash: event.payload.planArtifact.sha256,
+        sourceScope: current.sourceScope,
+        runBudget: current.runBudget,
+      });
+      // approvalBinding 是方便审计的冗余摘要，不是新的事实源。回放必须从
+      // run_created 与 plan artifact 重新计算，否则被篡改但内部自洽的摘要
+      // 会把 Journal 中未授权的问题、范围或预算伪装成有效审批边界。
+      if (
+        !approvalBindingsEqual(
+          expectedApprovalBinding,
+          event.payload.approvalBinding,
+        )
+      ) {
+        throw new IllegalRunEventError(
+          "plan_proposed 审批绑定与当前 Run 事实不一致",
+        );
+      }
       return {
         ...current,
         state: {
           type: "waiting_plan_approval",
           planArtifact: event.payload.planArtifact,
-          approvalBinding: event.payload.approvalBinding,
+          approvalBinding: expectedApprovalBinding,
           proposedAt: event.occurredAt,
         },
         lastEventSequence: event.sequence,
@@ -110,4 +131,18 @@ function applyRunEvent(
       };
     }
   }
+}
+
+function approvalBindingsEqual(
+  expected: PlanApprovalBinding,
+  actual: PlanApprovalBinding,
+): boolean {
+  return (
+    actual.questionHash === expected.questionHash &&
+    actual.planHash === expected.planHash &&
+    actual.sourceScopeHash === expected.sourceScopeHash &&
+    actual.budgetVersion === expected.budgetVersion &&
+    actual.budgetHash === expected.budgetHash &&
+    actual.bindingHash === expected.bindingHash
+  );
 }

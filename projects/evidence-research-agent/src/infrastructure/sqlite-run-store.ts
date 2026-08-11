@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import Database from "better-sqlite3";
 
@@ -150,13 +151,21 @@ export class SqliteRunStore {
   }
 
   public readProjection(runId: string): RunProjection {
-    const row = this.#database
-      .prepare("SELECT projection_json FROM run_projections WHERE run_id = ?")
-      .get(runId) as ProjectionRow | undefined;
-    if (row === undefined) {
-      return this.rebuildProjection(runId);
-    }
-    return parseRunProjection(JSON.parse(row.projection_json));
+    const transaction = this.#database.transaction(() => {
+      const row = this.#database
+        .prepare("SELECT projection_json FROM run_projections WHERE run_id = ?")
+        .get(runId) as ProjectionRow | undefined;
+      const replayed = reduceRunEvents(this.readEvents(runId));
+      if (row === undefined) {
+        return replayed;
+      }
+
+      const cached = parseRunProjection(JSON.parse(row.projection_json));
+      // Projection cache 没有独立授权力：schema-valid 仍可能是被一致篡改的值。
+      // 同一 SQLite 读事务内回放 canonical Journal，只有完全相等才接受 cache。
+      return isDeepStrictEqual(cached, replayed) ? cached : replayed;
+    });
+    return transaction();
   }
 
   public readEvents(runId: string): ResearchRunEvent[] {

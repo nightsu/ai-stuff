@@ -30,6 +30,18 @@ describe("approval integrity", () => {
     );
   });
 
+  it("preserves array order in canonical hashes", () => {
+    expect(hashCanonicalJson(["first", "second"])).not.toBe(
+      hashCanonicalJson(["second", "first"]),
+    );
+  });
+
+  it("rejects sparse arrays instead of silently normalizing holes", () => {
+    expect(() => hashCanonicalJson(["first", , "third"])).toThrowError(
+      TypeError,
+    );
+  });
+
   it("binds the exact question, plan, Source Scope, and budget version", () => {
     expect(
       createPlanApprovalBinding({

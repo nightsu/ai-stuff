@@ -75,6 +75,13 @@ function toCanonicalJsonValue(value: unknown): CanonicalJsonValue {
   }
 
   if (Array.isArray(value)) {
+    // 稀疏数组不是本项目的 JSON 领域输入；若让 map 跳过 hole，多个不同
+    // JavaScript 值可能静默折叠到同一字节串。审批哈希宁可拒绝也不猜测。
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) {
+        throw new TypeError("canonical JSON 不接受稀疏数组");
+      }
+    }
     return value.map((item) => toCanonicalJsonValue(item));
   }
 
