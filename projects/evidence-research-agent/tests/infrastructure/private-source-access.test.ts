@@ -21,6 +21,7 @@ import {
 import {
   MAX_SOURCE_LINE_WINDOW,
   PrivateSourceAccess,
+  canonicalizeSourceScope,
 } from "../../src/infrastructure/private-source-access.js";
 import type { ReadSourceRequest } from "../../src/infrastructure/private-source-access.js";
 
@@ -382,7 +383,13 @@ describe("PrivateSourceAccess", () => {
     const fixture = await createFixture();
     const unavailable = new PrivateSourceAccess({
       ...fixture.scope,
-      roots: [join(fixture.baseDirectory, "does-not-exist")],
+      roots: [
+        {
+          canonicalPath: join(fixture.baseDirectory, "does-not-exist"),
+          device: "0",
+          inode: "0",
+        },
+      ],
     });
 
     const result = await unavailable.capture(
@@ -395,7 +402,7 @@ describe("PrivateSourceAccess", () => {
       2_000,
     );
 
-    expect(result).toEqual({ status: "failed", code: "root_unavailable" });
+    expect(result).toEqual({ status: "failed", code: "root_changed" });
     expect(JSON.stringify(result)).not.toContain(fixture.baseDirectory);
     await expect(snapshotFiles(fixture.runtimeHome)).resolves.toEqual([]);
   });
@@ -405,10 +412,12 @@ describe("PrivateSourceAccess", () => {
     const secondRoot = join(fixture.baseDirectory, "approved-second");
     await mkdir(secondRoot);
     await writeFile(join(secondRoot, "second.md"), "second root\n", "utf8");
-    const access = new PrivateSourceAccess({
-      ...fixture.scope,
-      roots: [fixture.approvedRoot, secondRoot],
-    });
+    const access = new PrivateSourceAccess(
+      await canonicalizeSourceScope({
+        ...fixture.scope,
+        roots: [fixture.approvedRoot, secondRoot],
+      }),
+    );
 
     const result = await access.capture(
       {
@@ -441,7 +450,7 @@ describe("PrivateSourceAccess", () => {
 
   it("does not let later caller mutation expand the approved Source Scope", async () => {
     const fixture = await createFixture();
-    const roots = [fixture.approvedRoot];
+    const roots = [fixture.scope.roots[0]!];
     const allowedExtensions = [".md"];
     const access = new PrivateSourceAccess({
       ...fixture.scope,
@@ -449,7 +458,11 @@ describe("PrivateSourceAccess", () => {
       allowedExtensions,
     });
 
-    roots.push(fixture.outsideRoot);
+    const outsideScope = await canonicalizeSourceScope({
+      ...fixture.scope,
+      roots: [fixture.outsideRoot],
+    });
+    roots.push(outsideScope.roots[0]!);
     allowedExtensions.push(".txt");
 
     await expect(
@@ -536,13 +549,13 @@ async function createFixture(): Promise<Fixture> {
     ),
   ]);
 
-  const scope: SourceScope = {
+  const scope: SourceScope = await canonicalizeSourceScope({
     roots: [approvedRoot],
     exclusions: ["excluded/**"],
     allowedExtensions: [".md", ".bin", ".json", ".pem"],
     maxFileBytes: 256,
     maxTotalBytes: 2_000,
-  };
+  });
   return {
     baseDirectory,
     approvedRoot,

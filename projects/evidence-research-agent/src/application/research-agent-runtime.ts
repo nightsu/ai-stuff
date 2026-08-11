@@ -7,15 +7,20 @@ import { createPlanApprovalBinding } from "../domain/integrity.js";
 import { buildRunTrace } from "../domain/reducer.js";
 import {
   parseResearchPlan,
+  parseRequestedSourceScope,
   parseRunBudget,
-  parseSourceScope,
 } from "../domain/schemas.js";
 import type {
   ResearchRunEvent,
   RunProjection,
   RunTrace,
+  SourceScope,
 } from "../domain/types.js";
 import { ContentAddressedArtifactStore } from "../infrastructure/content-addressed-artifact-store.js";
+import {
+  canonicalizeSourceScope,
+  SourceScopeCanonicalizationError,
+} from "../infrastructure/private-source-access.js";
 import {
   ConcurrentRunWriteError,
   SqliteRunStore,
@@ -102,6 +107,14 @@ export class PlanApprovalConflictError extends Error {
   }
 }
 
+/** Source Scope 请求无法安全绑定时抛出的 payload-safe 应用错误。 */
+export class InvalidSourceScopeError extends Error {
+  public constructor() {
+    super("Source Scope 无效或本地根不可用");
+    this.name = "InvalidSourceScopeError";
+  }
+}
+
 const createRunCommandSchema = z.object({
   question: z.string().trim().min(1),
   sourceScope: z.unknown(),
@@ -157,7 +170,19 @@ export class ResearchAgentRuntime {
 
   public async createRun(command: CreateRunCommand): Promise<RunProjection> {
     const parsed = createRunCommandSchema.parse(command);
-    const sourceScope = parseSourceScope(parsed.sourceScope);
+    let sourceScope: SourceScope;
+    try {
+      const requestedSourceScope = parseRequestedSourceScope(parsed.sourceScope);
+      sourceScope = await canonicalizeSourceScope(requestedSourceScope);
+    } catch (error) {
+      if (
+        error instanceof SourceScopeCanonicalizationError ||
+        error instanceof z.ZodError
+      ) {
+        throw new InvalidSourceScopeError();
+      }
+      throw error;
+    }
     const runBudget = parseRunBudget(parsed.runBudget);
     const runId = this.#ids.nextRunId();
     const createdAt = this.#clock.now();

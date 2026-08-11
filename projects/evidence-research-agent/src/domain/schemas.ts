@@ -8,22 +8,49 @@ import type {
   PlanApprovalReceipt,
   ResearchPlan,
   ResearchRunEvent,
+  RequestedSourceScope,
   RunBudget,
   RunProjection,
   SourceScope,
 } from "./types.js";
 
-export const sourceScopeSchema = z.object({
-  roots: z
-    .array(z.string().min(1).refine(isAbsolute, "Source Scope root 必须是绝对路径"))
-    .min(1),
+const sourceScopePolicyFields = {
   exclusions: z.array(z.string().min(1)),
   allowedExtensions: z
-    .array(z.string().regex(/^\.[A-Za-z0-9]+$/, "扩展名必须包含前导点"))
+    .array(z.string().regex(/^\.[a-z0-9]+$/, "扩展名必须是含前导点的小写 ASCII"))
     .min(1),
   maxFileBytes: z.number().int().positive(),
   maxTotalBytes: z.number().int().positive(),
-});
+};
+
+export const requestedSourceScopeSchema = z
+  .object({
+    roots: z
+      .array(z.string().min(1).refine(isAbsolute, "Source Scope root 必须是绝对路径"))
+      .min(1),
+    ...sourceScopePolicyFields,
+  })
+  .strict();
+
+export const sourceScopeSchema = z
+  .object({
+    roots: z
+      .array(
+        z
+          .object({
+            canonicalPath: z
+              .string()
+              .min(1)
+              .refine(isAbsolute, "canonical Source Root 必须是绝对路径"),
+            device: z.string().regex(/^\d+$/),
+            inode: z.string().regex(/^\d+$/),
+          })
+          .strict(),
+      )
+      .min(1),
+    ...sourceScopePolicyFields,
+  })
+  .strict();
 
 export const runBudgetSchema = z.object({
   version: z.string().trim().min(1),
@@ -175,6 +202,10 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
 
 export function parseSourceScope(input: unknown): SourceScope {
   return sourceScopeSchema.parse(input);
+}
+
+export function parseRequestedSourceScope(input: unknown): RequestedSourceScope {
+  return requestedSourceScopeSchema.parse(input);
 }
 
 export function parseResearchPlan(input: unknown): ResearchPlan {

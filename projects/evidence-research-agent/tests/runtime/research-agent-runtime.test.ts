@@ -71,7 +71,7 @@ describe("ResearchAgentRuntime planning slice", () => {
     const created = await runtime.createRun({
       question: "追加式 Run Journal 如何驱动派生状态投影？",
       sourceScope: {
-        roots: ["/tmp/agent-learning-sources"],
+        roots: [runtimeHome],
         exclusions: ["**/node_modules/**"],
         allowedExtensions: [".md", ".ts"],
         maxFileBytes: 256_000,
@@ -210,7 +210,7 @@ async function createCachedRun(runtimeHome: string): Promise<RunProjection> {
     return await runtime.createRun({
       question: "Projection cache 损坏时如何恢复？",
       sourceScope: {
-        roots: ["/tmp/agent-learning-sources"],
+        roots: [runtimeHome],
         exclusions: ["**/.git/**"],
         allowedExtensions: [".md"],
         maxFileBytes: 256_000,

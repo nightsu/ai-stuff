@@ -50,7 +50,13 @@ describe("approval integrity", () => {
           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         sourceScope: {
           maxTotalBytes: 2_000_000,
-          roots: ["/tmp/sources"],
+          roots: [
+            {
+              canonicalPath: "/tmp/sources",
+              device: "100",
+              inode: "200",
+            },
+          ],
           allowedExtensions: [".ts", ".md"],
           exclusions: ["**/node_modules/**"],
           maxFileBytes: 256_000,
@@ -70,12 +76,12 @@ describe("approval integrity", () => {
       planHash:
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       sourceScopeHash:
-        "564195c62dafa64798ee3b68655938a39b5b754ea0b9cf1d03fecdc7c809dfdd",
+        "e779f677a3d744bd1c231df8e656e29e9b73f6c7418e62226415ce4209d369bc",
       budgetVersion: "budget-v1",
       budgetHash:
         "5435023e0e4fa9e60d09d0652b2e942eaf6850dd8424ac1a31b66828007ecb98",
       bindingHash:
-        "95daa8be65be86da77ca4f8b2060d34777307607f659e6ac37ed5b34ca20709a",
+        "bd6c08dde05595ab6e72916175df5781426e6441751dfabde38a57b221d80691",
     });
   });
 });

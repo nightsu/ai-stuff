@@ -18,7 +18,13 @@ import type {
 
 const question = "不得泄露的测试问题";
 const sourceScope: SourceScope = {
-  roots: ["/private/sensitive-source"],
+  roots: [
+    {
+      canonicalPath: "/private/sensitive-source",
+      device: "100",
+      inode: "200",
+    },
+  ],
   exclusions: ["**/.git/**"],
   allowedExtensions: [".md"],
   maxFileBytes: 256_000,
@@ -123,7 +129,7 @@ describe("artifact content identity", () => {
         "plan_proposed artifact identity 与内容摘要不一致",
       );
       expect(error.message).not.toContain(question);
-      expect(error.message).not.toContain(sourceScope.roots[0]);
+      expect(error.message).not.toContain(sourceScope.roots[0]!.canonicalPath);
       expect(error.message).not.toContain(planHash);
     }
   });
@@ -220,7 +226,7 @@ function expectReplayToRejectWithoutSensitiveDetails(
     }
     expect(error.message).toBe("plan_proposed 审批绑定与当前 Run 事实不一致");
     expect(error.message).not.toContain(question);
-    expect(error.message).not.toContain(sourceScope.roots[0]);
+    expect(error.message).not.toContain(sourceScope.roots[0]!.canonicalPath);
     expect(error.message).not.toContain(planHash);
   }
 }

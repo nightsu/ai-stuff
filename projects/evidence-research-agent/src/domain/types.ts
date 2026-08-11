@@ -1,7 +1,31 @@
-/** 一个 Research Run 被允许研究的本地文本范围。 */
-export interface SourceScope {
-  /** 允许访问的绝对目录根；本 ticket 只记录授权意图，realpath 强制检查由后续读取 ticket 实现。 */
+/** 已在 Run 创建边界解析并绑定的本地 Source Root identity。 */
+export interface SourceRootIdentity {
+  /** 审批时由 `realpath` 得到且后续不得重新解释的 canonical 绝对目录。 */
+  readonly canonicalPath: string;
+  /** 审批时目录设备号的无损十进制字符串，避免大整数经过 JS number 丢失。 */
+  readonly device: string;
+  /** 审批时目录 inode 的无损十进制字符串，避免大整数经过 JS number 丢失。 */
+  readonly inode: string;
+}
+
+/** 调用方提交、尚未取得文件系统 identity 的 Source Scope 请求。 */
+export interface RequestedSourceScope {
+  /** 调用方请求批准的绝对目录；不能提交 canonical identity 字段。 */
   readonly roots: readonly string[];
+  /** 相对根目录匹配的排除模式；搜索与读取端口必须共同执行。 */
+  readonly exclusions: readonly string[];
+  /** 请求允许的小写文件扩展名，统一包含前导点，例如 `.md`。 */
+  readonly allowedExtensions: readonly string[];
+  /** 单个源文件请求的最大字节数，单位为 byte。 */
+  readonly maxFileBytes: number;
+  /** 一个 Run 请求的累计最大源字节数，单位为 byte。 */
+  readonly maxTotalBytes: number;
+}
+
+/** 一个 Research Run 已批准且绑定 canonical identities 的本地文本范围。 */
+export interface SourceScope {
+  /** 允许访问且已经绑定 canonical path、device 与 inode 的目录根。 */
+  readonly roots: readonly SourceRootIdentity[];
   /** 相对根目录匹配的排除模式；后续搜索与读取端口必须共同执行。 */
   readonly exclusions: readonly string[];
   /** 允许读取的文件扩展名，统一包含前导点，例如 `.md`。 */

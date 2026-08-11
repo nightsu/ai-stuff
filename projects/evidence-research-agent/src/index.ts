@@ -1,6 +1,7 @@
 export { ScriptedModel, ScriptedModelExhaustedError } from "./adapters/scripted-model.js";
 export {
   IllegalPlanApprovalStateError,
+  InvalidSourceScopeError,
   InvalidPlanApprovalCommandError,
   PlanApprovalConflictError,
   ResearchAgentRuntime,
@@ -33,5 +34,7 @@ export type {
   RunProjection,
   RunTrace,
   RunTraceEvent,
+  RequestedSourceScope,
+  SourceRootIdentity,
   SourceScope,
 } from "./domain/types.js";

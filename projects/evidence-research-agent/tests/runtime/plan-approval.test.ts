@@ -15,6 +15,7 @@ import type {
   PlanApprovalReceipt,
   ResearchPlan,
   ResearchRunEvent,
+  RequestedSourceScope,
   RunBudget,
   RunProjection,
   SourceScope,
@@ -32,11 +33,24 @@ const SECRET_QUESTION = "不得泄露的审批测试问题 secret-question";
 const SECRET_ROOT = "/private/secret-approval-sources";
 
 const sourceScope: SourceScope = {
-  roots: [SECRET_ROOT],
+  roots: [
+    {
+      canonicalPath: SECRET_ROOT,
+      device: "100",
+      inode: "200",
+    },
+  ],
   exclusions: ["**/.git/**"],
   allowedExtensions: [".md", ".ts"],
   maxFileBytes: 256_000,
   maxTotalBytes: 2_000_000,
+};
+
+const sourceScopePolicy: Omit<RequestedSourceScope, "roots"> = {
+  exclusions: sourceScope.exclusions,
+  allowedExtensions: sourceScope.allowedExtensions,
+  maxFileBytes: sourceScope.maxFileBytes,
+  maxTotalBytes: sourceScope.maxTotalBytes,
 };
 
 const runBudget: RunBudget = {
@@ -248,7 +262,7 @@ describe("ResearchAgentRuntime plan approval", () => {
         "Source Scope",
         {
           sourceScope: {
-            ...sourceScope,
+            ...sourceScopePolicy,
             exclusions: [...sourceScope.exclusions, "**/generated/**"],
           },
         },
@@ -261,7 +275,11 @@ describe("ResearchAgentRuntime plan approval", () => {
 
     for (const [name, overrides] of variants) {
       const runtimeHome = await createRuntimeHome();
-      const waiting = await createWaitingRun(runtimeHome, overrides);
+      const waiting = await createWaitingRun(
+        runtimeHome,
+        overrides,
+        baseline.sourceScope.roots[0]!.canonicalPath,
+      );
       expect(
         waitingStateOf(waiting).approvalBinding.bindingHash,
         `${name} 必须改变 aggregate binding`,
@@ -557,7 +575,7 @@ interface WaitingRunOverrides {
   /** 覆盖默认计划，用于证明 artifact 内容会改变审批边界。 */
   readonly plan?: ResearchPlan;
   /** 覆盖默认 Source Scope，用于证明本地授权范围不可复用。 */
-  readonly sourceScope?: SourceScope;
+  readonly sourceScope?: Omit<RequestedSourceScope, "roots">;
   /** 覆盖默认 Run Budget，用于证明预算版本不可复用。 */
   readonly runBudget?: RunBudget;
 }
@@ -582,6 +600,7 @@ async function createRuntimeHome(): Promise<string> {
 async function createWaitingRun(
   runtimeHome: string,
   overrides: WaitingRunOverrides = {},
+  approvedRoot: string = runtimeHome,
 ): Promise<RunProjection> {
   const eventIds = ["event-001", "event-002", "event-003"];
   const runtime = ResearchAgentRuntime.open({
@@ -606,7 +625,10 @@ async function createWaitingRun(
   try {
     return await runtime.createRun({
       question: overrides.question ?? SECRET_QUESTION,
-      sourceScope: overrides.sourceScope ?? sourceScope,
+      sourceScope: {
+        roots: [approvedRoot],
+        ...(overrides.sourceScope ?? sourceScopePolicy),
+      },
       runBudget: overrides.runBudget ?? runBudget,
     });
   } finally {

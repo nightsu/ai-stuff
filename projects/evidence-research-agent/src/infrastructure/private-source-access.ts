@@ -1,5 +1,6 @@
 import { constants } from "node:fs";
-import { open, realpath, stat } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
+import { lstat, open, realpath, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import {
   extname,
@@ -12,7 +13,11 @@ import {
   win32,
 } from "node:path";
 
-import type { SourceScope } from "../domain/types.js";
+import type {
+  RequestedSourceScope,
+  SourceRootIdentity,
+  SourceScope,
+} from "../domain/types.js";
 
 /** Harness 固定拥有的单次 `read_source` 最大 1-based inclusive 行窗。 */
 export const MAX_SOURCE_LINE_WINDOW = 200;
@@ -46,7 +51,7 @@ export type SourceAccessDenialCode =
 
 /** 预期文件系统失败被归一化后公开的稳定代码。 */
 export type SourceAccessFailureCode =
-  | "root_unavailable"
+  | "root_changed"
   | "source_not_found"
   | "source_not_file"
   | "source_io_error";
@@ -130,6 +135,66 @@ type EvaluatedSource = ReadySource | SourceAccessDenied | SourceAccessFailed;
 
 const READ_CHUNK_BYTES = 64 * 1024;
 
+/** 请求的 Source Root 无法安全绑定为 canonical identity。 */
+export class SourceScopeCanonicalizationError extends Error {
+  public constructor() {
+    super("Source Scope root canonicalization failed");
+    this.name = "SourceScopeCanonicalizationError";
+  }
+}
+
+/** 在写入 Run Journal 前把 caller roots 转换为不可伪造的文件系统 identities。 */
+export async function canonicalizeSourceScope(
+  requested: RequestedSourceScope,
+): Promise<SourceScope> {
+  const roots: SourceRootIdentity[] = [];
+
+  for (const requestedRoot of requested.roots) {
+    try {
+      const requestedMetadata = await lstat(requestedRoot, { bigint: true });
+      if (!requestedMetadata.isDirectory() || requestedMetadata.isSymbolicLink()) {
+        throw new SourceScopeCanonicalizationError();
+      }
+      const canonicalPath = await realpath(requestedRoot);
+      const [canonicalLinkMetadata, canonicalMetadata] = await Promise.all([
+        lstat(canonicalPath, { bigint: true }),
+        stat(canonicalPath, { bigint: true }),
+      ]);
+      if (
+        !canonicalLinkMetadata.isDirectory() ||
+        canonicalLinkMetadata.isSymbolicLink() ||
+        !canonicalMetadata.isDirectory() ||
+        !sameFileIdentity(requestedMetadata, canonicalLinkMetadata) ||
+        !sameFileIdentity(requestedMetadata, canonicalMetadata)
+      ) {
+        throw new SourceScopeCanonicalizationError();
+      }
+
+      const identity = {
+        canonicalPath,
+        device: canonicalMetadata.dev.toString(10),
+        inode: canonicalMetadata.ino.toString(10),
+      };
+      if (roots.some((approved) => rootsOverlap(approved, identity))) {
+        // 重复或嵌套 root 会让同一路径具有多个 rootIndex 解释；审批边界拒绝，
+        // 而不是静默去重或替调用方改变索引。
+        throw new SourceScopeCanonicalizationError();
+      }
+      roots.push(identity);
+    } catch {
+      throw new SourceScopeCanonicalizationError();
+    }
+  }
+
+  return {
+    roots,
+    exclusions: [...requested.exclusions],
+    allowedExtensions: [...requested.allowedExtensions],
+    maxFileBytes: requested.maxFileBytes,
+    maxTotalBytes: requested.maxTotalBytes,
+  };
+}
+
 /** 在私有基础设施边界内执行 Source Scope 预检与精确字节读取。 */
 export class PrivateSourceAccess {
   /** 创建组件时复制冻结、且已经应用层验证过的 Source Scope。 */
@@ -137,7 +202,9 @@ export class PrivateSourceAccess {
 
   public constructor(scope: SourceScope) {
     this.#scope = Object.freeze({
-      roots: Object.freeze([...scope.roots]),
+      roots: Object.freeze(
+        scope.roots.map((root) => Object.freeze({ ...root })),
+      ),
       exclusions: Object.freeze([...scope.exclusions]),
       allowedExtensions: Object.freeze([...scope.allowedExtensions]),
       maxFileBytes: scope.maxFileBytes,
@@ -160,7 +227,6 @@ export class PrivateSourceAccess {
     // capture 重新执行完整预检，而不信任较早的 discovery/preflight 结果；两次
     // realpath 之间仍可能发生 TOCTOU，因此真正的类型、大小和全部读取都绑定在
     // 随后打开的同一个 handle 上。Node 的 realpath 与 open 无法组成原子操作，
-    // 所以这里缩短竞争窗口并在 handle 上 fail closed，而不声称消除了竞态。
     const evaluated = await this.#evaluate(request, remainingSourceBytes);
     if (evaluated.status !== "ready") {
       return evaluated;
@@ -285,15 +351,10 @@ export class PrivateSourceAccess {
       return denied("invalid_root");
     }
 
-    let canonicalRoot: string;
-    try {
-      canonicalRoot = await realpath(approvedRoot);
-      if (!(await stat(canonicalRoot)).isDirectory()) {
-        return failed("root_unavailable");
-      }
-    } catch {
-      return failed("root_unavailable");
+    if (!(await rootIdentityStillMatches(approvedRoot))) {
+      return failed("root_changed");
     }
+    const canonicalRoot = approvedRoot.canonicalPath;
 
     let canonicalPath: string;
     try {
@@ -364,6 +425,68 @@ function isValidRelativeRequestPath(value: unknown): value is string {
     !isAbsolute(value) &&
     !posix.isAbsolute(value) &&
     !win32.isAbsolute(value)
+  );
+}
+
+async function rootIdentityStillMatches(
+  approved: SourceRootIdentity,
+): Promise<boolean> {
+  try {
+    const linkMetadata = await lstat(approved.canonicalPath, { bigint: true });
+    if (!linkMetadata.isDirectory() || linkMetadata.isSymbolicLink()) {
+      return false;
+    }
+    const [currentRealpath, metadata] = await Promise.all([
+      realpath(approved.canonicalPath),
+      stat(approved.canonicalPath, { bigint: true }),
+    ]);
+    return (
+      currentRealpath === approved.canonicalPath &&
+      metadata.isDirectory() &&
+      sameApprovedIdentity(linkMetadata, approved) &&
+      sameApprovedIdentity(metadata, approved)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function rootsOverlap(
+  left: SourceRootIdentity,
+  right: SourceRootIdentity,
+): boolean {
+  if (left.device === right.device && left.inode === right.inode) {
+    return true;
+  }
+  return (
+    isStrictlyContainedPath(left.canonicalPath, right.canonicalPath) ||
+    isStrictlyContainedPath(right.canonicalPath, left.canonicalPath)
+  );
+}
+
+function isStrictlyContainedPath(parent: string, candidate: string): boolean {
+  const rootRelative = relative(parent, candidate);
+  return (
+    rootRelative.length > 0 &&
+    !isAbsolute(rootRelative) &&
+    rootRelative.split(sep)[0] !== ".."
+  );
+}
+
+function sameFileIdentity(
+  left: Pick<BigIntStats, "dev" | "ino">,
+  right: Pick<BigIntStats, "dev" | "ino">,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameApprovedIdentity(
+  metadata: Pick<BigIntStats, "dev" | "ino">,
+  approved: SourceRootIdentity,
+): boolean {
+  return (
+    metadata.dev.toString(10) === approved.device &&
+    metadata.ino.toString(10) === approved.inode
   );
 }
 
