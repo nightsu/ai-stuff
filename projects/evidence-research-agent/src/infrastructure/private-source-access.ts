@@ -142,6 +142,10 @@ interface ReadySource {
 type EvaluatedSource = ReadySource | SourceAccessDenied | SourceAccessFailed;
 
 const READ_CHUNK_BYTES = 64 * 1024;
+const CREDENTIAL_CONFIG_NAME =
+  /^(?:credentials?|tokens?|secrets?)\.(?:json|ya?ml|toml|ini|conf|cfg)$/;
+const SERVICE_ACCOUNT_CONFIG_NAME =
+  /^service[-_]account(?:[-_][a-z0-9]+)*\.(?:json|ya?ml|toml|ini|conf|cfg)$/;
 
 /** capture 生命周期中的可选异步边界，不接收私有路径或源字节。 */
 export interface SourceAccessLifecycleHooks {
@@ -658,9 +662,13 @@ function isExcluded(
   normalizedRelativePath: string,
   exclusions: readonly string[],
 ): boolean {
+  // Exclusion 是保守 denial 边界：path 与 pattern 在 glob 前统一做 NFC 与
+  // locale-independent lowercase，只会扩大“拒绝”集合，不会扩大 Source Scope
+  // 授权；因此 macOS 的 NFD 名称或大小写差异不能绕过已批准排除项。
+  const comparablePath = normalizeExclusionValue(normalizedRelativePath);
   return exclusions.some((pattern) => {
     try {
-      return matchesGlob(normalizedRelativePath, pattern);
+      return matchesGlob(comparablePath, normalizeExclusionValue(pattern));
     } catch {
       // 未能解释批准 Scope 中的排除表达式时宁可拒绝，不能将解析失败当作扩权。
       return true;
@@ -704,9 +712,14 @@ function isSecretPath(normalizedRelativePath: string): boolean {
   ) {
     return true;
   }
-  return /^(?:credentials?|tokens?|secrets?)(?:\.json|\.ya?ml|\.toml|\.ini)$/.test(
-    fileName,
+  return (
+    CREDENTIAL_CONFIG_NAME.test(fileName) ||
+    SERVICE_ACCOUNT_CONFIG_NAME.test(fileName)
   );
+}
+
+function normalizeExclusionValue(value: string): string {
+  return value.normalize("NFC").toLowerCase();
 }
 
 function hasAllowedExtension(

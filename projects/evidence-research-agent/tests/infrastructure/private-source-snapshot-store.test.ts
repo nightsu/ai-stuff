@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { constants } from "node:fs";
 import {
   chmod,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
+  rename,
   rm,
   stat,
   symlink,
@@ -152,6 +156,73 @@ describe("private Source Snapshot store", () => {
     await expect(
       store.putSourceSnapshot(Buffer.from("private source\n"), createdAt),
     ).rejects.toBeInstanceOf(ArtifactIntegrityError);
+  });
+
+  it(
+    "rejects an existing FIFO snapshot object without blocking on open",
+    async () => {
+      const runtimeHome = await createRuntimeHome();
+      const bytes = Buffer.from("fifo collision\n", "utf8");
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const prefixDirectory = join(
+        runtimeHome,
+        "source-snapshots",
+        "sha256",
+        sha256.slice(0, 2),
+      );
+      await mkdir(prefixDirectory, { recursive: true });
+      const fifoPath = join(prefixDirectory, sha256);
+      execFileSync("mkfifo", [fifoPath]);
+      const store = new ContentAddressedArtifactStore(runtimeHome);
+      let unblockWriter: Promise<void> | undefined;
+      const unblockTimer = setTimeout(() => {
+        unblockWriter = open(
+          fifoPath,
+          constants.O_WRONLY | constants.O_NONBLOCK,
+        )
+          .then((handle) => handle.close())
+          .catch(() => undefined);
+      }, 300);
+      const startedAt = performance.now();
+
+      try {
+        await expect(
+          store.putSourceSnapshot(bytes, createdAt),
+        ).rejects.toBeInstanceOf(ArtifactIntegrityError);
+      } finally {
+        clearTimeout(unblockTimer);
+        await unblockWriter;
+      }
+
+      expect(performance.now() - startedAt).toBeLessThan(200);
+    },
+    2_000,
+  );
+
+  it("rejects a snapshot prefix replaced after preparation and cleans temp files", async () => {
+    const runtimeHome = await createRuntimeHome();
+    const outside = await createTemporaryDirectory("snapshot-outside-");
+    const bytes = Buffer.from("prefix identity race\n", "utf8");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const prefixDirectory = join(
+      runtimeHome,
+      "source-snapshots",
+      "sha256",
+      sha256.slice(0, 2),
+    );
+    const displacedPrefix = join(runtimeHome, "displaced-prefix");
+    const store = new ContentAddressedArtifactStore(runtimeHome, {
+      afterSourceSnapshotDirectoryPreparation: async () => {
+        await rename(prefixDirectory, displacedPrefix);
+        await symlink(outside, prefixDirectory, "dir");
+      },
+    });
+
+    await expect(store.putSourceSnapshot(bytes, createdAt)).rejects.toBeInstanceOf(
+      ArtifactIntegrityError,
+    );
+    await expect(readdir(outside)).resolves.toEqual([]);
+    await expect(readdir(displacedPrefix)).resolves.toEqual([]);
   });
 });
 

@@ -546,8 +546,15 @@ describe("PrivateSourceAccess", () => {
     "nested/.config/gh/hosts.yml",
     ".yarnrc.yml",
     "nested/.yarnrc.yml",
+    "service-account.json",
+    "nested/service_account.json",
+    "service-account-prod.json",
+    "nested/service_account_prod.json",
     "service-account-key.json",
     "nested/service-account-key.json",
+    "service_account_key.yml",
+    "nested/service-account-prod-key.yaml",
+    "nested/SERVICE_ACCOUNT_PROD_KEY.JSON",
   ])("denies the credential configuration matrix for %s", async (relativePath) => {
     const fixture = await createFixture();
     const absolutePath = join(fixture.approvedRoot, relativePath);
@@ -563,7 +570,14 @@ describe("PrivateSourceAccess", () => {
     await expect(snapshotFiles(fixture.runtimeHome)).resolves.toEqual([]);
   });
 
-  it.each(["tokens.md", "secrets.md", "nested/tokens.md", "nested/secrets.md"])(
+  it.each([
+    "tokens.md",
+    "secrets.md",
+    "service-account.md",
+    "nested/tokens.md",
+    "nested/secrets.md",
+    "nested/service_account.md",
+  ])(
     "allows an ordinary teaching document named %s",
     async (relativePath) => {
       const fixture = await createFixture();
@@ -582,6 +596,40 @@ describe("PrivateSourceAccess", () => {
       });
     },
   );
+
+  it.each([
+    {
+      name: "case-equivalent path",
+      directory: "CaseDocs",
+      exclusion: "casedocs/**",
+    },
+    {
+      name: "NFD path and NFC pattern",
+      directory: "Cafe\u0301",
+      exclusion: "caf\u00e9/**",
+    },
+  ])("conservatively excludes a $name", async ({ directory, exclusion }) => {
+    const fixture = await createFixture();
+    const relativePath = `${directory}/hidden.md`;
+    await mkdir(join(fixture.approvedRoot, directory));
+    await writeFile(
+      join(fixture.approvedRoot, relativePath),
+      "excluded teaching note\n",
+      "utf8",
+    );
+    const access = new PrivateSourceAccess({
+      ...fixture.scope,
+      exclusions: [exclusion],
+    });
+
+    await expect(
+      access.capture(
+        { rootIndex: 0, relativePath, startLine: 1, endLine: 1 },
+        2_000,
+      ),
+    ).resolves.toEqual({ status: "denied", code: "excluded_path" });
+    await expect(snapshotFiles(fixture.runtimeHome)).resolves.toEqual([]);
+  });
 
   it("rejects a root retarget between preflight and handle open", async () => {
     const fixture = await createFixture();
