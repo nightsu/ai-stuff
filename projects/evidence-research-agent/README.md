@@ -49,6 +49,8 @@ node dist/src/cli.js approve-plan \
 node dist/src/cli.js trace --runtime-home .runtime --run-id <run-id> --json
 ```
 
+每个子命令只接受上面属于自己的 options；跨命令参数、未知 option、未知命令与额外 positional 都会在打开 Runtime Home 前 fail closed。`--json` 同时约束成功与失败输出：成功结果写 stdout；失败时 stdout 为空，stderr 写入稳定的最小 envelope，例如 `{"error":{"code":"CLI_USAGE_ERROR","message":"命令参数无效"}}`。错误 code 可供脚本分支判断，message 不回显 question、binding hash 或 artifact payload。
+
 这个聚合 binding 同时覆盖原始 question、不可变 plan artifact、完整 Source Scope，以及 Run Budget 的 `version` 与内容 hash。它不是可缩写的确认码：格式错误会被判为 malformed command；合法的 64 位 hash 若不匹配当前等待版本，则被判为 stale approval，两类错误都不会回显提交值或受保护 payload。模型输出、Research Tool 参数、环境变量和调用方自造 Receipt 都不能代替用户命令。
 
 审批是跨进程可恢复且幂等的：关闭创建 Run 的进程后，仍可从同一 Runtime Home 审批；相同 `runId` 与 `bindingHash` 的重复命令会返回同一个 durable Projection，`lastEventSequence` 保持为 4，不会生成第二份 Receipt。此时 `researching` **只表示精确计划审批已经持久化**；直到 Issue #4 才会读取私有 Source Snapshot 或执行 Research Tool。

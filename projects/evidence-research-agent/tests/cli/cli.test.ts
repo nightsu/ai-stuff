@@ -1,10 +1,10 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, expect, it } from "vitest";
 
-import { runCli } from "../../src/cli.js";
+import { runCli, type CliIo } from "../../src/cli.js";
 import type { RunProjection } from "../../src/index.js";
 
 const runtimeHomes: string[] = [];
@@ -252,3 +252,216 @@ it("rejects missing, malformed, environment, and unknown approval authority safe
     lastEventSequence: 3,
   });
 });
+
+it("rejects an approval-only option on run before creating durable state", async () => {
+  const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
+  runtimeHomes.push(runtimeHome);
+  const output: string[] = [];
+  const errorOutput: string[] = [];
+  const io = {
+    stdout: (line: string) => output.push(line),
+    stderr: (line: string) => errorOutput.push(line),
+  };
+  const secretQuestion = "secret question must not enter a CLI error";
+  const secretBindingHash = "a".repeat(64);
+
+  expect(
+    await runCli(
+      [
+        "run",
+        "--runtime-home",
+        runtimeHome,
+        "--question",
+        secretQuestion,
+        "--source-root",
+        "/tmp/agent-learning-sources",
+        "--binding-hash",
+        secretBindingHash,
+        "--json",
+      ],
+      io,
+    ),
+  ).toBe(1);
+  expect(output).toEqual([]);
+  expectJsonError(errorOutput, "CLI_USAGE_ERROR", "命令参数无效");
+  expect(errorOutput.join("\n")).not.toContain(secretQuestion);
+  expect(errorOutput.join("\n")).not.toContain(secretBindingHash);
+  await expect(readdir(runtimeHome)).resolves.toEqual([]);
+});
+
+it("rejects a run-only option on approve-plan without appending approval", async () => {
+  const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
+  runtimeHomes.push(runtimeHome);
+  const output: string[] = [];
+  const errorOutput: string[] = [];
+  const io = {
+    stdout: (line: string) => output.push(line),
+    stderr: (line: string) => errorOutput.push(line),
+  };
+  const waiting = await createWaitingRunViaCli(runtimeHome, output, io);
+  if (waiting.state.type !== "waiting_plan_approval") {
+    throw new Error("测试要求 CLI 创建等待计划审批的 Run");
+  }
+  output.length = 0;
+  const secretQuestion = "secret injected approval question";
+  const bindingHash = waiting.state.approvalBinding.bindingHash;
+
+  expect(
+    await runCli(
+      [
+        "approve-plan",
+        "--runtime-home",
+        runtimeHome,
+        "--run-id",
+        waiting.runId,
+        "--binding-hash",
+        bindingHash,
+        "--question",
+        secretQuestion,
+        "--json",
+      ],
+      io,
+    ),
+  ).toBe(1);
+  expect(output).toEqual([]);
+  expectJsonError(errorOutput, "CLI_USAGE_ERROR", "命令参数无效");
+  expect(errorOutput.join("\n")).not.toContain(secretQuestion);
+  expect(errorOutput.join("\n")).not.toContain(bindingHash);
+
+  errorOutput.length = 0;
+  expect(
+    await runCli(
+      [
+        "trace",
+        "--runtime-home",
+        runtimeHome,
+        "--run-id",
+        waiting.runId,
+        "--json",
+      ],
+      io,
+    ),
+  ).toBe(0);
+  expect(JSON.parse(output.pop() ?? "null")).toMatchObject({
+    finalState: "waiting_plan_approval",
+    events: [
+      { type: "run_created" },
+      { type: "planning_started" },
+      { type: "plan_proposed" },
+    ],
+  });
+  expect(errorOutput).toEqual([]);
+});
+
+it.each([
+  ["inspect", ["--binding-hash", "b".repeat(64)]],
+  ["trace", ["--question", "secret cross-command question"]],
+  ["rebuild", []],
+  ["inspect", ["unexpected-positional"]],
+] as const)(
+  "fails closed for isolated or unknown command invocation: %s %j",
+  async (command, extraArgs) => {
+    const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
+    runtimeHomes.push(runtimeHome);
+    const output: string[] = [];
+    const errorOutput: string[] = [];
+    const io = {
+      stdout: (line: string) => output.push(line),
+      stderr: (line: string) => errorOutput.push(line),
+    };
+    const waiting = await createWaitingRunViaCli(runtimeHome, output, io);
+    output.length = 0;
+
+    expect(
+      await runCli(
+        [
+          command,
+          "--runtime-home",
+          runtimeHome,
+          "--run-id",
+          waiting.runId,
+          ...extraArgs,
+          "--json",
+        ],
+        io,
+      ),
+    ).toBe(1);
+    expect(output).toEqual([]);
+    expectJsonError(errorOutput, "CLI_USAGE_ERROR", "命令参数无效");
+    expect(errorOutput.join("\n")).not.toContain(waiting.runId);
+    for (const extraArg of extraArgs) {
+      expect(errorOutput.join("\n")).not.toContain(extraArg);
+    }
+  },
+);
+
+it("writes a stable JSON envelope for a rejected approval command", async () => {
+  const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
+  runtimeHomes.push(runtimeHome);
+  const output: string[] = [];
+  const errorOutput: string[] = [];
+  const io = {
+    stdout: (line: string) => output.push(line),
+    stderr: (line: string) => errorOutput.push(line),
+  };
+  const waiting = await createWaitingRunViaCli(runtimeHome, output, io);
+  output.length = 0;
+  const malformedBinding = "malformed-secret-binding";
+
+  expect(
+    await runCli(
+      [
+        "approve-plan",
+        "--runtime-home",
+        runtimeHome,
+        "--run-id",
+        waiting.runId,
+        "--binding-hash",
+        malformedBinding,
+        "--json",
+      ],
+      io,
+    ),
+  ).toBe(1);
+  expect(output).toEqual([]);
+  expectJsonError(
+    errorOutput,
+    "PLAN_APPROVAL_REJECTED",
+    "计划审批未被接受",
+  );
+  expect(errorOutput.join("\n")).not.toContain(malformedBinding);
+});
+
+async function createWaitingRunViaCli(
+  runtimeHome: string,
+  output: string[],
+  io: CliIo,
+): Promise<RunProjection> {
+  expect(
+    await runCli(
+      [
+        "run",
+        "--runtime-home",
+        runtimeHome,
+        "--question",
+        "验证 CLI 子命令参数隔离",
+        "--source-root",
+        "/tmp/agent-learning-sources",
+        "--json",
+      ],
+      io,
+    ),
+  ).toBe(0);
+  return JSON.parse(output.pop() ?? "null") as RunProjection;
+}
+
+function expectJsonError(
+  errorOutput: string[],
+  code: string,
+  message: string,
+): void {
+  expect(errorOutput).toHaveLength(1);
+  expect(JSON.parse(errorOutput[0] ?? "null")).toEqual({
+    error: { code, message },
+  });
+}

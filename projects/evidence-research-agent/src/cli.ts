@@ -5,7 +5,13 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 
 import { ScriptedModel } from "./adapters/scripted-model.js";
-import { ResearchAgentRuntime } from "./application/research-agent-runtime.js";
+import {
+  IllegalPlanApprovalStateError,
+  InvalidPlanApprovalCommandError,
+  PlanApprovalConflictError,
+  ResearchAgentRuntime,
+  StalePlanApprovalError,
+} from "./application/research-agent-runtime.js";
 import { formatRunTrace } from "./application/trace-format.js";
 import type {
   ResearchPlan,
@@ -39,29 +45,32 @@ export async function runCli(
   args: readonly string[],
   io: CliIo = processIo,
 ): Promise<number> {
+  const jsonRequested = args.includes("--json");
   try {
-    const { positionals, values } = parseArgs({
-      args,
-      allowPositionals: true,
-      strict: true,
-      options: {
-        "allowed-extension": { type: "string", multiple: true },
-        "binding-hash": { type: "string" },
-        "exclude": { type: "string", multiple: true },
-        "json": { type: "boolean", default: false },
-        "max-file-bytes": { type: "string" },
-        "max-total-bytes": { type: "string" },
-        "question": { type: "string" },
-        "run-id": { type: "string" },
-        "runtime-home": { type: "string" },
-        "source-root": { type: "string", multiple: true },
-      },
-    });
-    const command = positionals[0];
-    const runtimeHome = resolve(values["runtime-home"] ?? ".runtime");
+    const command = args[0];
+    const commandArgs = args.slice(1);
 
+    // 子命令专属 option 是授权边界而不只是 CLI 易用性：先固定唯一命令，再只把
+    // 该命令获准的字段交给 strict parser，可防止 approval hash、question 等跨边界
+    // 参数被静默接受，更不会在拒绝前打开 Runtime Home 或追加 Journal 事件。
     switch (command) {
       case "run": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            "allowed-extension": { type: "string", multiple: true },
+            exclude: { type: "string", multiple: true },
+            json: { type: "boolean", default: false },
+            "max-file-bytes": { type: "string" },
+            "max-total-bytes": { type: "string" },
+            question: { type: "string" },
+            "runtime-home": { type: "string" },
+            "source-root": { type: "string", multiple: true },
+          },
+        });
+        const runtimeHome = resolve(values["runtime-home"] ?? ".runtime");
         const question = requireOption(values.question, "--question");
         const roots = requireMultipleOption(values["source-root"], "--source-root");
         const runtime = ResearchAgentRuntime.open({
@@ -93,6 +102,17 @@ export async function runCli(
         return 0;
       }
       case "inspect": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
+        const runtimeHome = resolve(values["runtime-home"] ?? ".runtime");
         const runId = requireOption(values["run-id"], "--run-id");
         const runtime = ResearchAgentRuntime.open({
           runtimeHome,
@@ -107,6 +127,17 @@ export async function runCli(
         return 0;
       }
       case "approve-plan": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            "binding-hash": { type: "string" },
+            json: { type: "boolean", default: false },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
         const approvalRuntimeHome = resolve(
           requireOption(values["runtime-home"], "--runtime-home"),
         );
@@ -131,6 +162,17 @@ export async function runCli(
         return 0;
       }
       case "trace": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
+        const runtimeHome = resolve(values["runtime-home"] ?? ".runtime");
         const runId = requireOption(values["run-id"], "--run-id");
         const runtime = ResearchAgentRuntime.open({
           runtimeHome,
@@ -145,12 +187,18 @@ export async function runCli(
         return 0;
       }
       default:
-        io.stderr(usage());
-        return 1;
+        throw new CliUsageError("命令参数无效");
     }
   } catch (error) {
-    io.stderr(error instanceof Error ? error.message : String(error));
+    io.stderr(formatCliError(error, jsonRequested));
     return 1;
+  }
+}
+
+class CliUsageError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "CliUsageError";
   }
 }
 
@@ -185,7 +233,7 @@ function formatProjection(projection: RunProjection, json: boolean): string {
 
 function requireOption(value: string | undefined, name: string): string {
   if (value === undefined || value.trim() === "") {
-    throw new Error(`缺少必填参数 ${name}`);
+    throw new CliUsageError(`缺少必填参数 ${name}`);
   }
   return value;
 }
@@ -195,7 +243,7 @@ function requireMultipleOption(
   name: string,
 ): string[] {
   if (value === undefined || value.length === 0) {
-    throw new Error(`缺少必填参数 ${name}`);
+    throw new CliUsageError(`缺少必填参数 ${name}`);
   }
   return value;
 }
@@ -203,19 +251,44 @@ function requireMultipleOption(
 function parsePositiveInteger(value: string, name: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new Error(`${name} 必须是正整数`);
+    throw new CliUsageError(`${name} 必须是正整数`);
   }
   return parsed;
 }
 
-function usage(): string {
-  return [
-    "Usage:",
-    "  evidence-research-agent run --question <text> --source-root <absolute-path> [--runtime-home <path>] [--json]",
-    "  evidence-research-agent inspect --run-id <id> [--runtime-home <path>] [--json]",
-    "  evidence-research-agent approve-plan --runtime-home <path> --run-id <id> --binding-hash <sha256> [--json]",
-    "  evidence-research-agent trace --run-id <id> [--runtime-home <path>] [--json]",
-  ].join("\n");
+function formatCliError(error: unknown, json: boolean): string {
+  const [code, message] = describeCliError(error);
+  if (json) {
+    return JSON.stringify({ error: { code, message } });
+  }
+  return message;
+}
+
+function describeCliError(error: unknown): readonly [string, string] {
+  if (error instanceof CliUsageError) {
+    return ["CLI_USAGE_ERROR", error.message];
+  }
+  if (isParseArgsError(error)) {
+    return ["CLI_USAGE_ERROR", "命令参数无效"];
+  }
+  if (
+    error instanceof InvalidPlanApprovalCommandError ||
+    error instanceof StalePlanApprovalError ||
+    error instanceof IllegalPlanApprovalStateError ||
+    error instanceof PlanApprovalConflictError
+  ) {
+    return ["PLAN_APPROVAL_REJECTED", "计划审批未被接受"];
+  }
+  return ["CLI_COMMAND_FAILED", "命令执行失败"];
+}
+
+function isParseArgsError(error: unknown): boolean {
+  if (!(error instanceof TypeError) || !("code" in error)) {
+    return false;
+  }
+  return (
+    typeof error.code === "string" && error.code.startsWith("ERR_PARSE_ARGS_")
+  );
 }
 
 const executedPath = process.argv[1];
