@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import Database from "better-sqlite3";
+import { ZodError } from "zod";
 
 import {
   parseResearchRunEvent,
@@ -160,7 +161,17 @@ export class SqliteRunStore {
         return replayed;
       }
 
-      const cached = parseRunProjection(JSON.parse(row.projection_json));
+      let cached: RunProjection;
+      try {
+        cached = parseRunProjection(JSON.parse(row.projection_json));
+      } catch (error) {
+        // cache 是可丢弃的派生数据，所以只对 JSON/Zod 解析损坏降级；Journal
+        // 已在 try 外成功回放，其他事务或领域错误绝不能被这里吞掉。
+        if (error instanceof SyntaxError || error instanceof ZodError) {
+          return replayed;
+        }
+        throw error;
+      }
       // Projection cache 没有独立授权力：schema-valid 仍可能是被一致篡改的值。
       // 同一 SQLite 读事务内回放 canonical Journal，只有完全相等才接受 cache。
       return isDeepStrictEqual(cached, replayed) ? cached : replayed;

@@ -8,6 +8,7 @@ import {
   IllegalRunEventError,
   reduceRunEvents,
 } from "../../src/domain/reducer.js";
+import { parseResearchRunEvent } from "../../src/domain/schemas.js";
 import type {
   PlanApprovalBinding,
   ResearchRunEvent,
@@ -87,6 +88,8 @@ describe("plan approval binding replay", () => {
         ...planProposed.payload,
         planArtifact: {
           ...planProposed.payload.planArtifact,
+          artifactId:
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           sha256:
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         },
@@ -94,6 +97,35 @@ describe("plan approval binding replay", () => {
     };
 
     expectReplayToRejectWithoutSensitiveDetails(events);
+  });
+});
+
+describe("artifact content identity", () => {
+  it("rejects mismatched artifactId and sha256 at the schema boundary", () => {
+    const events = createArtifactIdentityMismatchEvents();
+    expect(() => parseResearchRunEvent(events[2])).toThrowError(
+      /artifact content identity 与摘要不一致/,
+    );
+  });
+
+  it("rejects mismatched artifactId and sha256 during direct replay", () => {
+    const events = createArtifactIdentityMismatchEvents();
+
+    try {
+      reduceRunEvents(events);
+      throw new Error("测试要求 reducer 拒绝不一致的 artifact identity");
+    } catch (error) {
+      expect(error).toBeInstanceOf(IllegalRunEventError);
+      if (!(error instanceof Error)) {
+        throw error;
+      }
+      expect(error.message).toBe(
+        "plan_proposed artifact identity 与内容摘要不一致",
+      );
+      expect(error.message).not.toContain(question);
+      expect(error.message).not.toContain(sourceScope.roots[0]);
+      expect(error.message).not.toContain(planHash);
+    }
   });
 });
 
@@ -135,6 +167,26 @@ function createEvents(
       },
     },
   ];
+}
+
+function createArtifactIdentityMismatchEvents(): ResearchRunEvent[] {
+  const events = createEvents(approvalBinding);
+  const planProposed = events[2];
+  if (planProposed?.type !== "plan_proposed") {
+    throw new Error("测试夹具缺少 plan_proposed 事件");
+  }
+  events[2] = {
+    ...planProposed,
+    payload: {
+      ...planProposed.payload,
+      planArtifact: {
+        ...planProposed.payload.planArtifact,
+        artifactId:
+          "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
+    },
+  };
+  return events;
 }
 
 function replaceBindingComponent(

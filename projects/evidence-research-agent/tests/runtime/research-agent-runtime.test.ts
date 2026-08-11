@@ -156,4 +156,83 @@ describe("ResearchAgentRuntime planning slice", () => {
     expect(rebuilt).toEqual(inspected);
     reopened.close();
   });
+
+  it.each([
+    ["malformed JSON", "{"],
+    ["schema-invalid JSON", JSON.stringify({ runId: "run-001" })],
+  ])("falls back to Journal replay for %s cache", async (_name, cacheJson) => {
+    const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cache-"));
+    runtimeHomes.push(runtimeHome);
+    const created = await createCachedRun(runtimeHome);
+    overwriteProjectionCache(runtimeHome, cacheJson);
+
+    const reopened = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: new ScriptedModel([]),
+    });
+    await expect(reopened.inspectRun({ runId: "run-001" })).resolves.toEqual(
+      created,
+    );
+    reopened.close();
+  });
 });
+
+async function createCachedRun(runtimeHome: string): Promise<RunProjection> {
+  const eventIds = ["event-001", "event-002", "event-003"];
+  const runtime = ResearchAgentRuntime.open({
+    runtimeHome,
+    model: new ScriptedModel([
+      {
+        title: "验证 Projection cache 降级",
+        objectives: ["从 canonical Journal 恢复"],
+        steps: [{ id: "step-001", description: "验证缓存损坏不会阻断回放" }],
+      },
+    ]),
+    clock: { now: () => "2026-08-12T08:00:00.000Z" },
+    ids: {
+      nextRunId: () => "run-001",
+      nextEventId: () => {
+        const eventId = eventIds.shift();
+        if (eventId === undefined) {
+          throw new Error("测试事件 ID 已耗尽");
+        }
+        return eventId;
+      },
+    },
+  });
+  try {
+    return await runtime.createRun({
+      question: "Projection cache 损坏时如何恢复？",
+      sourceScope: {
+        roots: ["/tmp/agent-learning-sources"],
+        exclusions: ["**/.git/**"],
+        allowedExtensions: [".md"],
+        maxFileBytes: 256_000,
+        maxTotalBytes: 2_000_000,
+      },
+      runBudget: {
+        version: "budget-v1",
+        maxModelTurns: 8,
+        maxToolCalls: 24,
+        maxDistinctSources: 12,
+        maxSourceBytes: 2_000_000,
+        maxWallTimeMs: 300_000,
+      },
+    });
+  } finally {
+    runtime.close();
+  }
+}
+
+function overwriteProjectionCache(runtimeHome: string, cacheJson: string): void {
+  const database = new Database(join(runtimeHome, "runtime.sqlite"));
+  try {
+    database
+      .prepare(
+        "UPDATE run_projections SET projection_json = ? WHERE run_id = ?",
+      )
+      .run(cacheJson, "run-001");
+  } finally {
+    database.close();
+  }
+}

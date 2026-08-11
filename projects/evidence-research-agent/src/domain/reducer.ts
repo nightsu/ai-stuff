@@ -1,4 +1,7 @@
-import { createPlanApprovalBinding } from "./integrity.js";
+import {
+  artifactReferenceHasMatchingContentIdentity,
+  createPlanApprovalBinding,
+} from "./integrity.js";
 import type {
   PlanApprovalBinding,
   ResearchRunEvent,
@@ -98,6 +101,17 @@ function applyRunEvent(
     case "plan_proposed": {
       if (current.state.type !== "planning") {
         throw new IllegalRunEventError("只有 planning Run 可以提交计划");
+      }
+      // reducer 也是可直接调用的领域边界，不能假设事件一定先经过 Zod。
+      // identity 与摘要若命名不同对象，planHash 即使正确也无法授权该引用。
+      if (
+        !artifactReferenceHasMatchingContentIdentity(
+          event.payload.planArtifact,
+        )
+      ) {
+        throw new IllegalRunEventError(
+          "plan_proposed artifact identity 与内容摘要不一致",
+        );
       }
       const expectedApprovalBinding = createPlanApprovalBinding({
         question: current.question,

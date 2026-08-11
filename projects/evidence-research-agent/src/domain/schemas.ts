@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 
 import { z } from "zod";
 
+import { artifactReferenceHasMatchingContentIdentity } from "./integrity.js";
 import type {
   PlanApprovalBinding,
   ResearchPlan,
@@ -45,13 +46,25 @@ export const researchPlanSchema = z.object({
     .min(1),
 });
 
-const artifactReferenceSchema = z.object({
-  artifactId: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-  sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  mediaType: z.string().min(1),
-  byteLength: z.number().int().nonnegative(),
-  relativePath: z.string().min(1),
-});
+const artifactReferenceSchema = z
+  .object({
+    artifactId: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    mediaType: z.string().min(1),
+    byteLength: z.number().int().nonnegative(),
+    relativePath: z.string().min(1),
+  })
+  .superRefine((reference, context) => {
+    // 稳定内容寻址 identity 必须与同一引用中的摘要完全一致；分别满足格式
+    // 仍可能让审批绑定 A，却让 artifactId 指向 B。
+    if (!artifactReferenceHasMatchingContentIdentity(reference)) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifactId"],
+        message: "artifact content identity 与摘要不一致",
+      });
+    }
+  });
 
 const sourceScopeValueSchema = sourceScopeSchema.transform(
   (scope): SourceScope => scope,

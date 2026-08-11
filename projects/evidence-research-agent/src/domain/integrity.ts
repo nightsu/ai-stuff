@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type {
+  ArtifactReference,
   PlanApprovalBinding,
   RunBudget,
   SourceScope,
@@ -27,6 +28,13 @@ type CanonicalJsonValue =
   | { readonly [key: string]: CanonicalJsonValue };
 
 const sha256Pattern = /^[a-f0-9]{64}$/;
+
+/** 判断内容寻址 artifact identity 是否精确命名了同一个摘要。 */
+export function artifactReferenceHasMatchingContentIdentity(
+  reference: ArtifactReference,
+): boolean {
+  return reference.artifactId === `sha256:${reference.sha256}`;
+}
 
 /** 对递归 key 排序后的 JSON 值计算小写十六进制 SHA-256 摘要。 */
 export function hashCanonicalJson(value: unknown): string {
