@@ -30,6 +30,39 @@ export class ContentAddressedArtifactStore {
       sha256.slice(0, 2),
       `${sha256}.json`,
     );
+    return this.#putExactBytes(bytes, absolutePath, mediaType, createdAt);
+  }
+
+  public async putSourceSnapshot(
+    sourceBytes: Uint8Array,
+    createdAt: string,
+  ): Promise<PersistedArtifact> {
+    // Source Snapshot 必须保存显式读取成功时得到的完整字节，不能保存摘录或
+    // UTF-8 重新编码结果；否则同一 Evidence range 无法回到当时检查的精确版本。
+    const bytes = Buffer.from(sourceBytes);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const absolutePath = join(
+      this.#runtimeHome,
+      "source-snapshots",
+      "sha256",
+      sha256.slice(0, 2),
+      sha256,
+    );
+    return this.#putExactBytes(
+      bytes,
+      absolutePath,
+      "text/plain; charset=utf-8",
+      createdAt,
+    );
+  }
+
+  async #putExactBytes(
+    bytes: Buffer,
+    absolutePath: string,
+    mediaType: string,
+    createdAt: string,
+  ): Promise<PersistedArtifact> {
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
     await mkdir(dirname(absolutePath), { recursive: true });
 
     try {
