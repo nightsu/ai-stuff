@@ -6,7 +6,7 @@ import {
   sourceSnapshotHasMatchingContentIdentity,
 } from "./integrity.js";
 import {
-  sourcePathMatchesApprovedPolicy,
+  sourcePathPolicyDenial,
   sourceRequestDenial,
 } from "./source-policy.js";
 import type {
@@ -329,10 +329,10 @@ function validateSourceReadObservation(
         sourceScope.roots.length,
         Number.MAX_SAFE_INTEGER,
       ) !== undefined ||
-      !sourcePathMatchesApprovedPolicy(
+      sourcePathPolicyDenial(
         observation.relativePath,
         sourceScope,
-      ) ||
+      ) !== undefined ||
       hashReadSourceRequest(persistedRequest) !== observation.requestHash ||
       !Number.isSafeInteger(observation.totalLines) ||
       observation.totalLines <= 0 ||

@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
 
 import {
   ResearchAgentRuntime,
@@ -24,6 +24,7 @@ import {
 } from "../../src/index.js";
 import type {
   ReadSourceCommand,
+  IdGenerator,
   ResearchRunEvent,
   RunBudget,
   RunProjection,
@@ -52,6 +53,15 @@ afterEach(async () => {
 });
 
 describe("ResearchAgentRuntime source reads", () => {
+  it("requires both source-read identity methods on the injected ID port", () => {
+    expectTypeOf<
+      Pick<IdGenerator, "nextToolCallId" | "nextObservationId">
+    >().toEqualTypeOf<{
+      nextToolCallId(): string;
+      nextObservationId(): string;
+    }>();
+  });
+
   it("persists one successful read, snapshot, and safe trace across live-file loss", async () => {
     const fixture = await createApprovedRun();
     const request = {
@@ -219,7 +229,59 @@ describe("ResearchAgentRuntime source reads", () => {
     }
   });
 
-  it("keeps the first registry createdAt for cross-Run registration races", async () => {
+  it("uses the shared exclusion-first path policy in capture and replay", async () => {
+    const workspace = await createWorkspace();
+    await mkdir(join(workspace.sourceRoot, "blocked"));
+    await writeFile(
+      join(workspace.sourceRoot, "blocked", "secret.pem"),
+      "private key bytes\n",
+    );
+    const fixture = await createApprovedRun({
+      workspace,
+      exclusions: ["blocked/**"],
+      allowedExtensions: [".md"],
+    });
+    const runtime = openReadingRuntime(workspace.runtimeHome);
+
+    try {
+      await runtime.readSource({
+        runId: fixture.runId,
+        request: readWholeRequest("fixture.md", 1),
+      });
+      const denied = await runtime.readSource({
+        runId: fixture.runId,
+        request: readWholeRequest("blocked/secret.pem", 1),
+      });
+      expect(lastObservation(denied)).toMatchObject({
+        status: "denied",
+        code: "excluded_path",
+      });
+    } finally {
+      runtime.close();
+    }
+
+    const events = readResearchRunEvents(workspace.runtimeHome, fixture.runId);
+    const succeeded = sourceReadEventOf(events);
+    if (succeeded.payload.observation.status !== "succeeded") {
+      throw new Error("测试要求先持久化一个成功 observation");
+    }
+    const excludedRequest = readWholeRequest("blocked/secret.pem", 1);
+    const tampered = {
+      ...succeeded,
+      payload: {
+        observation: {
+          ...succeeded.payload.observation,
+          relativePath: excludedRequest.relativePath,
+          requestHash: hashCanonicalJson(excludedRequest),
+        },
+      },
+    } as ResearchRunEvent;
+    expect(() => reduceRunEvents([...events.slice(0, 4), tampered])).toThrow(
+      IllegalRunEventError,
+    );
+  });
+
+  it("keeps the first registry createdAt after two Runs prepare before sequential registration", async () => {
     const workspace = await createWorkspace();
     const firstRun = await createApprovedRun({ workspace });
     const secondRun = await createApprovedRun({ workspace });
@@ -242,6 +304,8 @@ describe("ResearchAgentRuntime source reads", () => {
     const request = readWholeRequest("fixture.md", 1);
 
     try {
+      // 两个 store 都先得到“尚未登记”的 stale prepare 结果，再按确定顺序提交；
+      // 这只验证 registry first-writer 语义，不声称模拟了 worker/process 并行。
       firstStore.appendEvents(
         firstRun.runId,
         4,
@@ -437,6 +501,105 @@ describe("ResearchAgentRuntime source reads", () => {
     }
   });
 
+  it("generates controlled source-read identities and time only after the command is authorized", async () => {
+    const workspace = await createWorkspace();
+    await writeFile(join(workspace.sourceRoot, ".env"), "TOKEN=secret\n");
+    const fixture = await createApprovedRun({ workspace });
+    const boundaries = createReadBoundaries("controlled", [
+      "2026-08-12T11:00:00.000Z",
+      "2026-08-12T11:01:00.000Z",
+    ]);
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome: workspace.runtimeHome,
+      model: new ScriptedModel([]),
+      clock: boundaries.clock,
+      ids: boundaries.ids,
+    });
+
+    try {
+      const succeeded = await runtime.readSource({
+        runId: fixture.runId,
+        request: readWholeRequest("fixture.md", 1),
+      });
+      const denied = await runtime.readSource({
+        runId: fixture.runId,
+        request: readWholeRequest(".env", 1),
+      });
+      const trace = await runtime.traceRun({ runId: fixture.runId });
+      const sourceEvents = trace.events.filter(
+        ({ type }) => type === "source_read_observed",
+      );
+
+      expect(onlySuccessfulObservation(succeeded)).toMatchObject({
+        observationId: "observation-controlled-1",
+        toolCallId: "tool-call-controlled-1",
+        observedAt: "2026-08-12T11:00:00.000Z",
+      });
+      expect(lastObservation(denied)).toEqual({
+        observationId: "observation-controlled-2",
+        toolCallId: "tool-call-controlled-2",
+        toolName: "read_source",
+        requestHash: hashCanonicalJson(readWholeRequest(".env", 1)),
+        observedAt: "2026-08-12T11:01:00.000Z",
+        status: "denied",
+        code: "secret_path",
+      });
+      expect(sourceEvents.map(({ eventId }) => eventId)).toEqual([
+        "event-controlled-1",
+        "event-controlled-2",
+      ]);
+      expect(boundaries.calls()).toEqual({
+        clock: 2,
+        event: 2,
+        observation: 2,
+        toolCall: 2,
+      });
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("does not consume source-read identities or time for malformed or non-researching commands", async () => {
+    const workspace = await createWorkspace();
+    const approved = await createApprovedRun({ workspace });
+    const waiting = await createWaitingRun(workspace);
+    const boundaries = createReadBoundaries("unused", [
+      "2026-08-12T11:10:00.000Z",
+    ]);
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome: workspace.runtimeHome,
+      model: new ScriptedModel([]),
+      clock: boundaries.clock,
+      ids: boundaries.ids,
+    });
+
+    try {
+      await expect(
+        runtime.readSource({
+          runId: approved.runId,
+          request: {
+            ...readWholeRequest("fixture.md", 1),
+            callerOwnedStatus: "succeeded",
+          },
+        } as unknown as ReadSourceCommand),
+      ).rejects.toMatchObject({ name: "InvalidSourceReadCommandError" });
+      await expect(
+        runtime.readSource({
+          runId: waiting.runId,
+          request: readWholeRequest("fixture.md", 1),
+        }),
+      ).rejects.toMatchObject({ name: "IllegalSourceReadStateError" });
+      expect(boundaries.calls()).toEqual({
+        clock: 0,
+        event: 0,
+        observation: 0,
+        toolCall: 0,
+      });
+    } finally {
+      runtime.close();
+    }
+  });
+
   it("uses named safe errors for missing and non-researching Runs", async () => {
     const workspace = await createWorkspace();
     const waiting = await createWaitingRun(workspace);
@@ -492,8 +655,24 @@ describe("ResearchAgentRuntime source reads", () => {
 
   it("reports a concurrent append conflict without claiming both reads were persisted", async () => {
     const fixture = await createApprovedRun();
-    const first = openReadingRuntime(fixture.runtimeHome);
-    const second = openReadingRuntime(fixture.runtimeHome);
+    const firstBoundaries = createReadBoundaries("first-attempt", [
+      "2026-08-12T11:20:00.000Z",
+    ]);
+    const secondBoundaries = createReadBoundaries("second-attempt", [
+      "2026-08-12T11:20:01.000Z",
+    ]);
+    const first = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      model: new ScriptedModel([]),
+      clock: firstBoundaries.clock,
+      ids: firstBoundaries.ids,
+    });
+    const second = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      model: new ScriptedModel([]),
+      clock: secondBoundaries.clock,
+      ids: secondBoundaries.ids,
+    });
     const command = {
       runId: fixture.runId,
       request: readWholeRequest("fixture.md", 1),
@@ -516,9 +695,318 @@ describe("ResearchAgentRuntime source reads", () => {
       expect(researchingStateOf(persisted).sourceBytesRead).toBe(
         fixture.sourceBytes.byteLength,
       );
+      // 两次 attempt 都在进入短事务前完成 capture 并消费自己的 clock/ID；
+      // 只有赢得 expected sequence 的那一个成为 Journal 事实。
+      expect(firstBoundaries.calls()).toEqual({
+        clock: 1,
+        event: 1,
+        observation: 1,
+        toolCall: 1,
+      });
+      expect(secondBoundaries.calls()).toEqual({
+        clock: 1,
+        event: 1,
+        observation: 1,
+        toolCall: 1,
+      });
     } finally {
       first.close();
       second.close();
+    }
+  });
+});
+
+describe("SqliteRunStore Source Snapshot coupling", () => {
+  it("rolls back a succeeded observation when its referenced snapshot is absent", async () => {
+    const fixture = await createApprovedRun();
+    const canonicalRuntimeHome = await realpath(fixture.runtimeHome);
+    const artifacts = new ContentAddressedArtifactStore(canonicalRuntimeHome);
+    const snapshot = await artifacts.putSourceSnapshot(
+      fixture.sourceBytes,
+      "2026-08-12T10:00:00.000Z",
+    );
+    const store = new SqliteRunStore(canonicalRuntimeHome);
+
+    try {
+      expect(() =>
+        store.appendEvents(
+          fixture.runId,
+          4,
+          [
+            successfulSourceEvent(
+              fixture.runId,
+              readWholeRequest("fixture.md", 1),
+              snapshot,
+              "2026-08-12T10:00:00.000Z",
+              "missing-registry",
+            ),
+          ],
+        ),
+      ).toThrowError(
+        expect.objectContaining({
+          name: "SourceSnapshotEventInvariantError",
+        }),
+      );
+      expect(store.readProjection(fixture.runId).lastEventSequence).toBe(4);
+      expect(countSourceReadEvents(fixture.runtimeHome, fixture.runId)).toBe(0);
+      expect(countSourceSnapshots(fixture.runtimeHome)).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it.each(["denied", "failed"] as const)(
+    "rolls back an unrelated snapshot supplied with a %s observation",
+    async (status) => {
+      const fixture = await createApprovedRun();
+      const canonicalRuntimeHome = await realpath(fixture.runtimeHome);
+      const artifacts = new ContentAddressedArtifactStore(canonicalRuntimeHome);
+      const snapshot = await artifacts.putSourceSnapshot(
+        fixture.sourceBytes,
+        "2026-08-12T10:01:00.000Z",
+      );
+      const store = new SqliteRunStore(canonicalRuntimeHome);
+
+      try {
+        expect(() =>
+          store.appendEvents(
+            fixture.runId,
+            4,
+            [
+              nonSuccessfulSourceEvent(
+                fixture.runId,
+                status,
+                "2026-08-12T10:01:00.000Z",
+              ),
+            ],
+            [],
+            [snapshot],
+          ),
+        ).toThrowError(
+          expect.objectContaining({
+            name: "SourceSnapshotEventInvariantError",
+          }),
+        );
+        expect(store.readProjection(fixture.runId).lastEventSequence).toBe(4);
+        expect(countSourceReadEvents(fixture.runtimeHome, fixture.runId)).toBe(0);
+        expect(countSourceSnapshots(fixture.runtimeHome)).toBe(0);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  it("rejects a provided snapshot that no succeeded event in the batch references", async () => {
+    const workspace = await createWorkspace();
+    const firstRun = await createApprovedRun({ workspace });
+    const secondRun = await createApprovedRun({ workspace });
+    const canonicalRuntimeHome = await realpath(workspace.runtimeHome);
+    const artifacts = new ContentAddressedArtifactStore(canonicalRuntimeHome);
+    const firstSnapshot = await artifacts.putSourceSnapshot(
+      firstRun.sourceBytes,
+      "2026-08-12T10:02:00.000Z",
+    );
+    const unrelatedSnapshot = await artifacts.putSourceSnapshot(
+      Buffer.from("unrelated source bytes\n", "utf8"),
+      "2026-08-12T10:03:00.000Z",
+    );
+    const store = new SqliteRunStore(canonicalRuntimeHome);
+
+    try {
+      store.appendEvents(
+        firstRun.runId,
+        4,
+        [
+          successfulSourceEvent(
+            firstRun.runId,
+            readWholeRequest("fixture.md", 1),
+            firstSnapshot,
+            "2026-08-12T10:02:00.000Z",
+            "registered-first",
+          ),
+        ],
+        [],
+        [firstSnapshot],
+      );
+
+      expect(() =>
+        store.appendEvents(
+          secondRun.runId,
+          4,
+          [
+            successfulSourceEvent(
+              secondRun.runId,
+              readWholeRequest("fixture.md", 1),
+              firstSnapshot,
+              "2026-08-12T10:03:00.000Z",
+              "unreferenced-provided",
+            ),
+          ],
+          [],
+          [unrelatedSnapshot],
+        ),
+      ).toThrowError(
+        expect.objectContaining({
+          name: "SourceSnapshotEventInvariantError",
+        }),
+      );
+      expect(countSourceReadEvents(workspace.runtimeHome, secondRun.runId)).toBe(0);
+      expect(countSourceSnapshots(workspace.runtimeHome)).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects mismatched succeeded references and provided registry metadata", async () => {
+    const fixture = await createApprovedRun();
+    const canonicalRuntimeHome = await realpath(fixture.runtimeHome);
+    const artifacts = new ContentAddressedArtifactStore(canonicalRuntimeHome);
+    const referencedSnapshot = await artifacts.putSourceSnapshot(
+      fixture.sourceBytes,
+      "2026-08-12T10:04:00.000Z",
+    );
+    const mismatchedSnapshot = await artifacts.putSourceSnapshot(
+      Buffer.from("different source bytes\n", "utf8"),
+      "2026-08-12T10:04:00.000Z",
+    );
+    const store = new SqliteRunStore(canonicalRuntimeHome);
+
+    try {
+      expect(() =>
+        store.appendEvents(
+          fixture.runId,
+          4,
+          [
+            successfulSourceEvent(
+              fixture.runId,
+              readWholeRequest("fixture.md", 1),
+              referencedSnapshot,
+              "2026-08-12T10:04:00.000Z",
+              "mismatched",
+            ),
+          ],
+          [],
+          [mismatchedSnapshot],
+        ),
+      ).toThrowError(
+        expect.objectContaining({
+          name: "SourceSnapshotEventInvariantError",
+        }),
+      );
+      expect(countSourceReadEvents(fixture.runtimeHome, fixture.runId)).toBe(0);
+      expect(countSourceSnapshots(fixture.runtimeHome)).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("atomically registers matching metadata and later reuses the exact registry row", async () => {
+    const workspace = await createWorkspace();
+    const firstRun = await createApprovedRun({ workspace });
+    const secondRun = await createApprovedRun({ workspace });
+    const canonicalRuntimeHome = await realpath(workspace.runtimeHome);
+    const artifacts = new ContentAddressedArtifactStore(canonicalRuntimeHome);
+    const snapshot = await artifacts.putSourceSnapshot(
+      firstRun.sourceBytes,
+      "2026-08-12T10:05:00.000Z",
+    );
+    const store = new SqliteRunStore(canonicalRuntimeHome);
+
+    try {
+      const firstProjection = store.appendEvents(
+        firstRun.runId,
+        4,
+        [
+          successfulSourceEvent(
+            firstRun.runId,
+            readWholeRequest("fixture.md", 1),
+            snapshot,
+            "2026-08-12T10:05:00.000Z",
+            "atomic-register",
+          ),
+        ],
+        [],
+        [snapshot],
+      );
+      expect(firstProjection.lastEventSequence).toBe(5);
+      expect(countSourceSnapshots(workspace.runtimeHome)).toBe(1);
+
+      const secondProjection = store.appendEvents(
+        secondRun.runId,
+        4,
+        [
+          successfulSourceEvent(
+            secondRun.runId,
+            readWholeRequest("fixture.md", 1),
+            snapshot,
+            "2026-08-12T10:06:00.000Z",
+            "reuse-existing",
+          ),
+        ],
+      );
+      expect(secondProjection.lastEventSequence).toBe(5);
+      expect(countSourceSnapshots(workspace.runtimeHome)).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects a succeeded reference that mismatches an existing registry row", async () => {
+    const workspace = await createWorkspace();
+    const firstRun = await createApprovedRun({ workspace });
+    const secondRun = await createApprovedRun({ workspace });
+    const canonicalRuntimeHome = await realpath(workspace.runtimeHome);
+    const artifacts = new ContentAddressedArtifactStore(canonicalRuntimeHome);
+    const snapshot = await artifacts.putSourceSnapshot(
+      firstRun.sourceBytes,
+      "2026-08-12T10:07:00.000Z",
+    );
+    const store = new SqliteRunStore(canonicalRuntimeHome);
+
+    try {
+      store.appendEvents(
+        firstRun.runId,
+        4,
+        [
+          successfulSourceEvent(
+            firstRun.runId,
+            readWholeRequest("fixture.md", 1),
+            snapshot,
+            "2026-08-12T10:07:00.000Z",
+            "existing-registry",
+          ),
+        ],
+        [],
+        [snapshot],
+      );
+      const mismatchedReference = {
+        ...snapshot,
+        byteLength: snapshot.byteLength + 1,
+      };
+
+      expect(() =>
+        store.appendEvents(
+          secondRun.runId,
+          4,
+          [
+            successfulSourceEvent(
+              secondRun.runId,
+              readWholeRequest("fixture.md", 1),
+              mismatchedReference,
+              "2026-08-12T10:08:00.000Z",
+              "existing-mismatch",
+            ),
+          ],
+        ),
+      ).toThrowError(
+        expect.objectContaining({
+          name: "SourceSnapshotEventInvariantError",
+        }),
+      );
+      expect(countSourceReadEvents(workspace.runtimeHome, secondRun.runId)).toBe(0);
+      expect(countSourceSnapshots(workspace.runtimeHome)).toBe(1);
+    } finally {
+      store.close();
     }
   });
 });
@@ -1099,6 +1587,91 @@ function successfulSourceEvent(
         byteLength: snapshot.byteLength,
       },
     },
+  };
+}
+
+function nonSuccessfulSourceEvent(
+  runId: string,
+  status: "denied" | "failed",
+  observedAt: string,
+): ResearchRunEvent {
+  const common = {
+    observationId: `observation-${status}`,
+    toolCallId: `tool-call-${status}`,
+    toolName: "read_source" as const,
+    requestHash: "a".repeat(64),
+    observedAt,
+  };
+  const observation =
+    status === "denied"
+      ? {
+          ...common,
+          status: "denied" as const,
+          code: "invalid_path" as const,
+        }
+      : {
+          ...common,
+          status: "failed" as const,
+          code: "source_not_found" as const,
+        };
+  return {
+    eventId: `event-source-${status}`,
+    runId,
+    sequence: 5,
+    type: "source_read_observed",
+    occurredAt: observedAt,
+    payload: {
+      observation,
+    },
+  };
+}
+
+function createReadBoundaries(
+  suffix: string,
+  timestamps: readonly string[],
+) {
+  let clockCalls = 0;
+  let eventCalls = 0;
+  let observationCalls = 0;
+  let toolCallCalls = 0;
+  const ids: IdGenerator = {
+    nextRunId: () => {
+      throw new Error("readSource 不得生成 Run ID");
+    },
+    nextApprovalId: () => {
+      throw new Error("readSource 不得生成 Approval ID");
+    },
+    nextEventId: () => {
+      eventCalls += 1;
+      return `event-${suffix}-${eventCalls}`;
+    },
+    nextObservationId: () => {
+      observationCalls += 1;
+      return `observation-${suffix}-${observationCalls}`;
+    },
+    nextToolCallId: () => {
+      toolCallCalls += 1;
+      return `tool-call-${suffix}-${toolCallCalls}`;
+    },
+  };
+  return {
+    clock: {
+      now: () => {
+        const value = timestamps[clockCalls];
+        clockCalls += 1;
+        if (value === undefined) {
+          throw new Error("readSource 消费了额外 clock 值");
+        }
+        return value;
+      },
+    },
+    ids,
+    calls: () => ({
+      clock: clockCalls,
+      event: eventCalls,
+      observation: observationCalls,
+      toolCall: toolCallCalls,
+    }),
   };
 }
 

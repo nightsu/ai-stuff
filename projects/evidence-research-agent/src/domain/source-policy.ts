@@ -62,17 +62,27 @@ export function sourceRequestDenial(
   return undefined;
 }
 
-/** 判断成功 observation 的规范相对路径是否仍满足冻结 Source Scope 的纯策略。 */
-export function sourcePathMatchesApprovedPolicy(
+/**
+ * 对 canonical 相对路径应用冻结 Source Scope，并返回唯一稳定 denial code。
+ * 优先级固定为 exclusion → secret → extension，reader 与 reducer 必须共用。
+ */
+export function sourcePathPolicyDenial(
   normalizedRelativePath: string,
   scope: SourceScope,
-): boolean {
-  return (
-    isNormalizedSourceRelativePath(normalizedRelativePath) &&
-    !isExcludedSourcePath(normalizedRelativePath, scope.exclusions) &&
-    !isSecretSourcePath(normalizedRelativePath) &&
-    hasAllowedSourceExtension(normalizedRelativePath, scope.allowedExtensions)
-  );
+): SourceAccessDenialCode | undefined {
+  if (!isNormalizedSourceRelativePath(normalizedRelativePath)) {
+    return "invalid_path";
+  }
+  if (isExcludedSourcePath(normalizedRelativePath, scope.exclusions)) {
+    return "excluded_path";
+  }
+  if (isSecretSourcePath(normalizedRelativePath)) {
+    return "secret_path";
+  }
+  if (!hasAllowedSourceExtension(normalizedRelativePath, scope.allowedExtensions)) {
+    return "extension_not_allowed";
+  }
+  return undefined;
 }
 
 /** 判断相对路径是否已是唯一、无 traversal 的 POSIX 表示。 */

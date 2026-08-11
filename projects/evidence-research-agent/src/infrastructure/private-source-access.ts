@@ -10,9 +10,7 @@ import {
 } from "node:path";
 
 import {
-  hasAllowedSourceExtension,
-  isExcludedSourcePath,
-  isSecretSourcePath,
+  sourcePathPolicyDenial,
   sourceRequestDenial,
 } from "../domain/source-policy.js";
 import type {
@@ -408,16 +406,12 @@ export class PrivateSourceAccess {
       return denied("invalid_path");
     }
 
-    if (isExcludedSourcePath(normalizedRelativePath, this.#scope.exclusions)) {
-      return denied("excluded_path");
-    }
-    // Secret denylist 必须早于扩展名 allowlist；否则把 `.pem` 加入允许列表会
-    // 意外授权私钥，`.env` 也可能因特殊扩展名语义得到不一致结论。
-    if (isSecretSourcePath(normalizedRelativePath)) {
-      return denied("secret_path");
-    }
-    if (!hasAllowedSourceExtension(normalizedRelativePath, this.#scope.allowedExtensions)) {
-      return denied("extension_not_allowed");
+    const pathDenial = sourcePathPolicyDenial(
+      normalizedRelativePath,
+      this.#scope,
+    );
+    if (pathDenial !== undefined) {
+      return denied(pathDenial);
     }
 
     let metadata;

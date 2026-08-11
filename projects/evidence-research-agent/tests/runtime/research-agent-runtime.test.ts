@@ -145,6 +145,8 @@ describe("ResearchAgentRuntime planning slice", () => {
           }
           return eventId;
         },
+        nextToolCallId: unexpectedSourceReadId,
+        nextObservationId: unexpectedSourceReadId,
       },
     });
 
@@ -292,6 +294,8 @@ async function createCachedRun(runtimeHome: string): Promise<RunProjection> {
         }
         return eventId;
       },
+      nextToolCallId: unexpectedSourceReadId,
+      nextObservationId: unexpectedSourceReadId,
     },
   });
   try {
@@ -316,6 +320,10 @@ async function createCachedRun(runtimeHome: string): Promise<RunProjection> {
   } finally {
     runtime.close();
   }
+}
+
+function unexpectedSourceReadId(): never {
+  throw new Error("planning slice 测试不得生成来源读取 ID");
 }
 
 async function createTemporaryDirectory(prefix: string): Promise<string> {

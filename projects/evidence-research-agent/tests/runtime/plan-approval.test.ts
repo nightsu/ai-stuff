@@ -400,6 +400,8 @@ describe("ResearchAgentRuntime plan approval", () => {
           triggerWinner();
           return "event-stale";
         },
+        nextToolCallId: unexpectedSourceReadId,
+        nextObservationId: unexpectedSourceReadId,
       },
     });
 
@@ -437,6 +439,8 @@ describe("ResearchAgentRuntime plan approval", () => {
         nextApprovalId: () => {
           throw identityFailure;
         },
+        nextToolCallId: unexpectedSourceReadId,
+        nextObservationId: unexpectedSourceReadId,
       },
     });
 
@@ -621,6 +625,8 @@ async function createWaitingRun(
         }
         return eventId;
       },
+      nextToolCallId: unexpectedSourceReadId,
+      nextObservationId: unexpectedSourceReadId,
     },
   });
 
@@ -649,6 +655,8 @@ function openApprovalRuntime(runtimeHome: string, ids: ApprovalIds) {
       },
       nextEventId: ids.nextEventId,
       nextApprovalId: ids.nextApprovalId,
+      nextToolCallId: unexpectedSourceReadId,
+      nextObservationId: unexpectedSourceReadId,
     },
   });
 }
@@ -674,6 +682,10 @@ function createApprovalIds(): ApprovalIds {
     eventCalls: () => eventCalls,
     approvalCalls: () => approvalCalls,
   };
+}
+
+function unexpectedSourceReadId(): never {
+  throw new Error("计划审批测试不得生成来源读取 ID");
 }
 
 function throwingApprovalIds(): ApprovalIds {

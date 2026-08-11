@@ -15,6 +15,7 @@ import type {
   PersistedSourceSnapshot,
   ResearchRunEvent,
   RunProjection,
+  SourceSnapshotReference,
 } from "../domain/types.js";
 
 interface EventRow {
@@ -63,6 +64,14 @@ export class SourceSnapshotRegistrationError extends Error {
   public constructor() {
     super("Source Snapshot registry 完整性校验失败");
     this.name = "SourceSnapshotRegistrationError";
+  }
+}
+
+/** Journal observation 与独立 Source Snapshot registry 无法原子对应。 */
+export class SourceSnapshotEventInvariantError extends Error {
+  public constructor() {
+    super("Source Snapshot 与来源读取事件的事务不变量校验失败");
+    this.name = "SourceSnapshotEventInvariantError";
   }
 }
 
@@ -132,8 +141,35 @@ export class SqliteRunStore {
           );
       }
 
+      const referencedSourceSnapshots =
+        collectSucceededSourceSnapshotReferences(events);
+      for (const providedSnapshot of sourceSnapshots) {
+        if (
+          !referencedSourceSnapshots.some((reference) =>
+            sourceSnapshotReferenceMatches(reference, providedSnapshot),
+          )
+        ) {
+          // sourceSnapshots 不是任意 registry 写入口；调用方只能随同本批成功事件
+          // 登记它实际引用的内容，否则 denial/failure 也会暗中获得发布能力。
+          throw new SourceSnapshotEventInvariantError();
+        }
+      }
+
       for (const sourceSnapshot of sourceSnapshots) {
         this.#registerSourceSnapshot(sourceSnapshot);
+      }
+
+      for (const reference of referencedSourceSnapshots) {
+        const row = this.#readSourceSnapshotRow(reference.snapshotId);
+        if (
+          row === undefined ||
+          !sourceSnapshotRowMatchesReference(row, reference)
+        ) {
+          // Journal 是成功事实源：只有 registry 中已经存在全字段一致的冻结内容，
+          // 成功 observation 才能在同一事务继续写入。任何失败都会回滚本事务内
+          // 的新登记与事件，事务外提前发布的私有 CAS orphan 可由后续 GC 回收。
+          throw new SourceSnapshotEventInvariantError();
+        }
       }
 
       const insertEvent = this.#database.prepare(
@@ -437,5 +473,51 @@ function sourceSnapshotRowMatches(
     row.relative_path === snapshot.relativePath &&
     isIsoUtc(row.created_at) &&
     (!requireCreatedAtMatch || row.created_at === snapshot.createdAt)
+  );
+}
+
+function collectSucceededSourceSnapshotReferences(
+  events: readonly ResearchRunEvent[],
+): SourceSnapshotReference[] {
+  const references: SourceSnapshotReference[] = [];
+  for (const event of events) {
+    if (event.type !== "source_read_observed") {
+      continue;
+    }
+    const observation = event.payload.observation;
+    if (observation.status === "succeeded") {
+      references.push(observation.sourceSnapshot);
+      continue;
+    }
+    if ("sourceSnapshot" in observation) {
+      throw new SourceSnapshotEventInvariantError();
+    }
+  }
+  return references;
+}
+
+function sourceSnapshotReferenceMatches(
+  reference: SourceSnapshotReference,
+  snapshot: PersistedSourceSnapshot,
+): boolean {
+  return (
+    reference.snapshotId === snapshot.snapshotId &&
+    reference.sha256 === snapshot.sha256 &&
+    reference.mediaType === snapshot.mediaType &&
+    reference.byteLength === snapshot.byteLength &&
+    reference.relativePath === snapshot.relativePath
+  );
+}
+
+function sourceSnapshotRowMatchesReference(
+  row: SourceSnapshotRow,
+  reference: SourceSnapshotReference,
+): boolean {
+  return (
+    row.snapshot_id === reference.snapshotId &&
+    row.sha256 === reference.sha256 &&
+    row.media_type === reference.mediaType &&
+    row.byte_length === reference.byteLength &&
+    row.relative_path === reference.relativePath
   );
 }

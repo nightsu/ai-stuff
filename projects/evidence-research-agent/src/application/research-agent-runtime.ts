@@ -428,11 +428,8 @@ export class ResearchAgentRuntime {
     const result = await access.capture(request, remainingSourceBytes);
     const observedAt = this.#clock.now();
     const lineage = {
-      observationId:
-        this.#ids.nextObservationId?.() ??
-        `observation-${randomUUID()}`,
-      toolCallId:
-        this.#ids.nextToolCallId?.() ?? `tool-call-${randomUUID()}`,
+      observationId: this.#ids.nextObservationId(),
+      toolCallId: this.#ids.nextToolCallId(),
       toolName: "read_source",
       requestHash,
       observedAt,
