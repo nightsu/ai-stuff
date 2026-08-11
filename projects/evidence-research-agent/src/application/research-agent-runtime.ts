@@ -2,26 +2,37 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { createPlanApprovalBinding } from "../domain/integrity.js";
+import {
+  createPlanApprovalBinding,
+  hashReadSourceRequest,
+  hashUtf8Text,
+} from "../domain/integrity.js";
 import { buildRunTrace } from "../domain/reducer.js";
 import {
   parseResearchPlan,
+  readSourceRequestSchema,
   parseRequestedSourceScope,
   parseRunBudget,
 } from "../domain/schemas.js";
 import type {
   ResearchRunEvent,
+  PersistedSourceSnapshot,
+  ReadSourceRequest,
   RunProjection,
   RunTrace,
+  SourceReadObservation,
   SourceScope,
 } from "../domain/types.js";
 import { ContentAddressedArtifactStore } from "../infrastructure/content-addressed-artifact-store.js";
 import {
   canonicalizeSourceScope,
+  PrivateSourceAccess,
   SourceScopeCanonicalizationError,
 } from "../infrastructure/private-source-access.js";
 import {
   ConcurrentRunWriteError,
+  RunNotFoundError,
+  SourceSnapshotRegistrationError,
   SqliteRunStore,
 } from "../infrastructure/sqlite-run-store.js";
 import { preparePrivateRuntimeHome } from "../infrastructure/private-runtime-home.js";
@@ -75,6 +86,14 @@ export interface ApprovePlanCommand {
   readonly bindingHash: string;
 }
 
+/** 对一个已批准 Research Run 执行显式来源读取的应用命令。 */
+export interface ReadSourceCommand {
+  /** 当前必须处于 researching 的 Research Run identity。 */
+  readonly runId: string;
+  /** 唯一允许由调用方提供的结构化 Research Tool 参数。 */
+  readonly request: ReadSourceRequest;
+}
+
 /** 提交的 binding 已不再对应当前等待计划时抛出的安全错误。 */
 export class StalePlanApprovalError extends Error {
   public constructor() {
@@ -115,6 +134,46 @@ export class InvalidSourceScopeError extends Error {
   }
 }
 
+/** 来源读取命令不满足严格公开输入契约时抛出的安全错误。 */
+export class InvalidSourceReadCommandError extends Error {
+  public constructor() {
+    super("来源读取命令格式无效");
+    this.name = "InvalidSourceReadCommandError";
+  }
+}
+
+/** 未知 Run 收到来源读取命令时抛出的 payload-safe 应用错误。 */
+export class SourceReadRunNotFoundError extends Error {
+  public constructor() {
+    super("找不到可读取来源的 Research Run");
+    this.name = "SourceReadRunNotFoundError";
+  }
+}
+
+/** 非 researching Run 收到来源读取命令时抛出的安全状态错误。 */
+export class IllegalSourceReadStateError extends Error {
+  public constructor() {
+    super("当前 Research Run 状态不能读取来源");
+    this.name = "IllegalSourceReadStateError";
+  }
+}
+
+/** 来源捕获后 Journal 已被其他命令推进时抛出的安全冲突错误。 */
+export class SourceReadConflictError extends Error {
+  public constructor() {
+    super("来源读取与另一项 Run 更新发生冲突");
+    this.name = "SourceReadConflictError";
+  }
+}
+
+/** 私有 snapshot 或 registry 无法安全提交时抛出的消毒后错误。 */
+export class SourceReadPersistenceError extends Error {
+  public constructor() {
+    super("来源读取结果无法安全持久化");
+    this.name = "SourceReadPersistenceError";
+  }
+}
+
 const createRunCommandSchema = z.object({
   question: z.string().trim().min(1),
   sourceScope: z.unknown(),
@@ -132,6 +191,13 @@ const approvePlanCommandSchema = z
   })
   .strict();
 
+const readSourceCommandSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+    request: readSourceRequestSchema,
+  })
+  .strict();
+
 const systemClock: Clock = {
   now: () => new Date().toISOString(),
 };
@@ -140,6 +206,8 @@ const uuidGenerator: IdGenerator = {
   nextRunId: () => `run-${randomUUID()}`,
   nextEventId: () => `event-${randomUUID()}`,
   nextApprovalId: () => `approval-${randomUUID()}`,
+  nextToolCallId: () => `tool-call-${randomUUID()}`,
+  nextObservationId: () => `observation-${randomUUID()}`,
 };
 
 /** CLI 与未来 UI 共同依赖的 command-oriented application seam。 */
@@ -323,6 +391,131 @@ export class ResearchAgentRuntime {
   public async traceRun(command: TraceRunCommand): Promise<RunTrace> {
     const { runId } = runIdentityCommandSchema.parse(command);
     return buildRunTrace(this.#store.readEvents(runId));
+  }
+
+  public async readSource(command: ReadSourceCommand): Promise<RunProjection> {
+    const parsedCommand = readSourceCommandSchema.safeParse(command);
+    if (!parsedCommand.success) {
+      // caller 可能把 secret path 或自造 authority 塞进错误输入；错误边界不回显。
+      throw new InvalidSourceReadCommandError();
+    }
+    const { runId, request } = parsedCommand.data;
+    let current: RunProjection;
+    try {
+      current = this.#store.readProjection(runId);
+    } catch (error) {
+      if (error instanceof RunNotFoundError) {
+        throw new SourceReadRunNotFoundError();
+      }
+      // Journal/schema/cache/SQLite 诊断属于私有运行时细节，可能包含持久化
+      // payload 或 identity；readSource 的公开错误边界不把它们转交给调用方。
+      throw new SourceReadPersistenceError();
+    }
+    if (current.state.type !== "researching") {
+      throw new IllegalSourceReadStateError();
+    }
+
+    const approvedByteLimit = Math.min(
+      current.sourceScope.maxTotalBytes,
+      current.runBudget.maxSourceBytes,
+    );
+    const remainingSourceBytes = Math.max(
+      0,
+      approvedByteLimit - current.state.sourceBytesRead,
+    );
+    const requestHash = hashReadSourceRequest(request);
+    const access = new PrivateSourceAccess(current.sourceScope);
+    const result = await access.capture(request, remainingSourceBytes);
+    const observedAt = this.#clock.now();
+    const lineage = {
+      observationId:
+        this.#ids.nextObservationId?.() ??
+        `observation-${randomUUID()}`,
+      toolCallId:
+        this.#ids.nextToolCallId?.() ?? `tool-call-${randomUUID()}`,
+      toolName: "read_source",
+      requestHash,
+      observedAt,
+    } as const;
+
+    let observation: SourceReadObservation;
+    let persistedSourceSnapshot: PersistedSourceSnapshot | undefined;
+    if (result.status === "captured") {
+      try {
+        // 文件 I/O 与私有 CAS 都位于 SQLite 短事务之外。只有下面 registry 与
+        // Journal 同时提交后，Run 才能声称这次观察是 durable fact。
+        persistedSourceSnapshot = this.#store.prepareSourceSnapshotRegistration(
+          await this.#artifacts.putSourceSnapshot(
+            result.fullBytes,
+            observedAt,
+          ),
+        );
+      } catch {
+        throw new SourceReadPersistenceError();
+      }
+      const {
+        createdAt: _registryCreatedAt,
+        ...sourceSnapshotReference
+      } = persistedSourceSnapshot;
+      observation = {
+        ...lineage,
+        status: "succeeded",
+        rootIndex: result.rootIndex,
+        relativePath: result.relativePath,
+        startLine: result.startLine,
+        endLine: result.endLine,
+        totalLines: result.totalLines,
+        excerpt: result.excerpt,
+        excerptHash: hashUtf8Text(result.excerpt),
+        sourceSnapshot: sourceSnapshotReference,
+        byteLength: result.byteLength,
+      };
+    } else if (result.status === "denied") {
+      // denial/failure 本身也是解释“为什么没有证据”的 Journal 事实；只保留
+      // request hash 与稳定 code，不落 raw path、OS error 或任何 snapshot。
+      observation = {
+        ...lineage,
+        status: "denied",
+        code: result.code,
+      };
+    } else {
+      observation = {
+        ...lineage,
+        status: "failed",
+        code: result.code,
+      };
+    }
+
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "source_read_observed",
+      occurredAt: observedAt,
+      payload: { observation },
+    };
+
+    try {
+      return this.#store.appendEvents(
+        runId,
+        current.lastEventSequence,
+        [event],
+        [],
+        persistedSourceSnapshot === undefined ? [] : [persistedSourceSnapshot],
+      );
+    } catch (error) {
+      if (error instanceof ConcurrentRunWriteError) {
+        // CAS bytes 可能已在冲突前原子落盘，成为可由未来 GC 回收的 orphan；
+        // Journal 仍是事实源，冲突后绝不能重读 live file 或伪称 observation 已提交。
+        throw new SourceReadConflictError();
+      }
+      if (error instanceof SourceSnapshotRegistrationError) {
+        throw new SourceReadPersistenceError();
+      }
+      // 基础设施、schema 或 reducer 诊断可能携带内部 identity；公开命令只给出
+      // 稳定安全错误，不把 Runtime Home、hash、payload 或 SQLite 细节外泄。
+      throw new SourceReadPersistenceError();
+    }
   }
 
   public async rebuildRunProjection(

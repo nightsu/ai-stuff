@@ -3,7 +3,9 @@ import { createHash } from "node:crypto";
 import type {
   ArtifactReference,
   PlanApprovalBinding,
+  ReadSourceRequest,
   RunBudget,
+  SourceSnapshotReference,
   SourceScope,
 } from "./types.js";
 
@@ -34,6 +36,32 @@ export function artifactReferenceHasMatchingContentIdentity(
   reference: ArtifactReference,
 ): boolean {
   return reference.artifactId === `sha256:${reference.sha256}`;
+}
+
+/** 判断 Source Snapshot identity、摘要与私有 namespace 路径是否命名同一内容。 */
+export function sourceSnapshotHasMatchingContentIdentity(
+  reference: SourceSnapshotReference,
+): boolean {
+  return (
+    reference.snapshotId === `source-sha256:${reference.sha256}` &&
+    reference.relativePath ===
+      `source-snapshots/sha256/${reference.sha256.slice(0, 2)}/${reference.sha256}`
+  );
+}
+
+/** 对调用方精确结构化 `read_source` 请求计算 canonical JSON SHA-256。 */
+export function hashReadSourceRequest(request: ReadSourceRequest): string {
+  return hashCanonicalJson({
+    rootIndex: request.rootIndex,
+    relativePath: request.relativePath,
+    startLine: request.startLine,
+    endLine: request.endLine,
+  });
+}
+
+/** 对摘录字符串的原始 UTF-8 编码计算小写十六进制 SHA-256。 */
+export function hashUtf8Text(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 /** 对递归 key 排序后的 JSON 值计算小写十六进制 SHA-256 摘要。 */

@@ -1,16 +1,50 @@
 import {
   artifactReferenceHasMatchingContentIdentity,
   createPlanApprovalBinding,
+  hashReadSourceRequest,
+  hashUtf8Text,
+  sourceSnapshotHasMatchingContentIdentity,
 } from "./integrity.js";
+import {
+  sourcePathMatchesApprovedPolicy,
+  sourceRequestDenial,
+} from "./source-policy.js";
 import type {
   PlanApprovalBinding,
   ResearchRunEvent,
   RunProjection,
+  SourceReadObservation,
   RunTrace,
   RunTraceEvent,
 } from "./types.js";
 
 export class IllegalRunEventError extends Error {}
+
+const stableSourceDenialCodes = new Set<string>([
+  "invalid_root",
+  "invalid_path",
+  "invalid_line_range",
+  "line_range_out_of_bounds",
+  "path_escape",
+  "symlink_escape",
+  "symlink_path",
+  "excluded_path",
+  "secret_path",
+  "extension_not_allowed",
+  "binary_file",
+  "file_too_large",
+  "source_budget_exceeded",
+  "line_range_too_large",
+]);
+
+const stableSourceFailureCodes = new Set<string>([
+  "root_changed",
+  "path_changed_during_read",
+  "source_changed_during_read",
+  "source_not_found",
+  "source_not_file",
+  "source_io_error",
+]);
 
 export function reduceRunEvents(
   events: readonly ResearchRunEvent[],
@@ -34,12 +68,26 @@ export function buildRunTrace(events: readonly ResearchRunEvent[]): RunTrace {
 
   for (const event of events) {
     projection = applyRunEvent(projection, event);
+    const lineage =
+      event.type === "source_read_observed"
+        ? {
+            toolCallId: event.payload.observation.toolCallId,
+            observationStatus: event.payload.observation.status,
+            ...(event.payload.observation.status === "succeeded"
+              ? {
+                  sourceSnapshotId:
+                    event.payload.observation.sourceSnapshot.snapshotId,
+                }
+              : {}),
+          }
+        : {};
     traceEvents.push({
       sequence: event.sequence,
       eventId: event.eventId,
       type: event.type,
       occurredAt: event.occurredAt,
       stateAfter: projection.state.type,
+      ...lineage,
     });
   }
 
@@ -187,11 +235,209 @@ function applyRunEvent(
           type: "researching",
           planArtifact: current.state.planArtifact,
           approvalReceipt,
+          sourceReadObservations: [],
+          sourceBytesRead: 0,
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
     }
+    case "source_read_observed": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError(
+          "只有 researching Run 可以记录来源读取 observation",
+        );
+      }
+      const observation = event.payload.observation;
+      validateSourceReadObservation(
+        current.sourceScope,
+        current.state.sourceReadObservations,
+        observation,
+        event.occurredAt,
+      );
+
+      // sourceBytesRead 是 Journal 的派生量。每次回放都从成功 observation 重新
+      // 求和，拒绝相信事件或缓存声称的 counter，避免篡改累计预算事实。
+      const priorSourceBytes = sourceBytesFromObservations(
+        current.state.sourceReadObservations,
+      );
+      if (priorSourceBytes !== current.state.sourceBytesRead) {
+        throw new IllegalRunEventError("来源读取累计字节派生值不一致");
+      }
+      const sourceBytesRead =
+        priorSourceBytes +
+        (observation.status === "succeeded" ? observation.byteLength : 0);
+      const approvedByteLimit = Math.min(
+        current.sourceScope.maxTotalBytes,
+        current.runBudget.maxSourceBytes,
+      );
+      if (sourceBytesRead > approvedByteLimit) {
+        throw new IllegalRunEventError("来源读取 observation 超出批准累计字节限制");
+      }
+
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          sourceReadObservations: [
+            ...current.state.sourceReadObservations,
+            observation,
+          ],
+          sourceBytesRead,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+  }
+}
+
+function validateSourceReadObservation(
+  sourceScope: RunProjection["sourceScope"],
+  observations: readonly SourceReadObservation[],
+  observation: SourceReadObservation,
+  occurredAt: string,
+): void {
+  if (
+    observation.observationId.trim() === "" ||
+    observation.toolCallId.trim() === "" ||
+    observation.toolName !== "read_source" ||
+    !isSha256(observation.requestHash) ||
+    observation.observedAt !== occurredAt ||
+    !isIsoUtc(observation.observedAt) ||
+    observations.some(
+      (prior) => prior.observationId === observation.observationId,
+    ) ||
+    observations.some((prior) => prior.toolCallId === observation.toolCallId)
+  ) {
+    throw new IllegalRunEventError("来源读取 observation 公共 lineage 无效");
+  }
+
+  if (observation.status === "succeeded") {
+    if (!hasExactSucceededShape(observation)) {
+      throw new IllegalRunEventError("成功来源读取 observation 形状无效");
+    }
+    const persistedRequest = {
+      rootIndex: observation.rootIndex,
+      relativePath: observation.relativePath,
+      startLine: observation.startLine,
+      endLine: observation.endLine,
+    };
+    if (
+      sourceRequestDenial(
+        persistedRequest,
+        sourceScope.roots.length,
+        Number.MAX_SAFE_INTEGER,
+      ) !== undefined ||
+      !sourcePathMatchesApprovedPolicy(
+        observation.relativePath,
+        sourceScope,
+      ) ||
+      hashReadSourceRequest(persistedRequest) !== observation.requestHash ||
+      !Number.isSafeInteger(observation.totalLines) ||
+      observation.totalLines <= 0 ||
+      observation.endLine > observation.totalLines ||
+      observation.excerpt.includes("\0") ||
+      observation.excerpt.includes("\r") ||
+      observation.excerpt.split("\n").length !==
+        observation.endLine - observation.startLine + 1 ||
+      hashUtf8Text(observation.excerpt) !== observation.excerptHash ||
+      !sourceSnapshotHasMatchingContentIdentity(
+        observation.sourceSnapshot,
+      ) ||
+      !hasExactKeys(observation.sourceSnapshot, [
+        "snapshotId",
+        "sha256",
+        "mediaType",
+        "byteLength",
+        "relativePath",
+      ]) ||
+      !isSha256(observation.sourceSnapshot.sha256) ||
+      observation.sourceSnapshot.mediaType !== "text/plain; charset=utf-8" ||
+      !Number.isSafeInteger(observation.byteLength) ||
+      observation.byteLength <= 0 ||
+      observation.sourceSnapshot.byteLength !== observation.byteLength
+    ) {
+      throw new IllegalRunEventError("成功来源读取 observation 完整性无效");
+    }
+    return;
+  }
+
+  if (
+    !hasExactNonSuccessShape(observation) ||
+    (observation.status === "denied" &&
+      !stableSourceDenialCodes.has(observation.code)) ||
+    (observation.status === "failed" &&
+      !stableSourceFailureCodes.has(observation.code))
+  ) {
+    throw new IllegalRunEventError("非成功来源读取 observation 形状无效");
+  }
+}
+
+function sourceBytesFromObservations(
+  observations: readonly SourceReadObservation[],
+): number {
+  return observations.reduce(
+    (total, observation) =>
+      total + (observation.status === "succeeded" ? observation.byteLength : 0),
+    0,
+  );
+}
+
+function hasExactSucceededShape(
+  observation: SourceReadObservation,
+): boolean {
+  return hasExactKeys(observation, [
+    "observationId",
+    "toolCallId",
+    "toolName",
+    "requestHash",
+    "observedAt",
+    "status",
+    "rootIndex",
+    "relativePath",
+    "startLine",
+    "endLine",
+    "totalLines",
+    "excerpt",
+    "excerptHash",
+    "sourceSnapshot",
+    "byteLength",
+  ]);
+}
+
+function hasExactNonSuccessShape(
+  observation: SourceReadObservation,
+): boolean {
+  return hasExactKeys(observation, [
+    "observationId",
+    "toolCallId",
+    "toolName",
+    "requestHash",
+    "observedAt",
+    "status",
+    "code",
+  ]);
+}
+
+function hasExactKeys(value: object, expectedKeys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  return (
+    actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index])
+  );
+}
+
+function isSha256(value: string): boolean {
+  return /^[a-f0-9]{64}$/.test(value);
+}
+
+function isIsoUtc(value: string): boolean {
+  try {
+    return new Date(value).toISOString() === value;
+  } catch {
+    return false;
   }
 }
 

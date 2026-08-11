@@ -1,10 +1,15 @@
 export { ScriptedModel, ScriptedModelExhaustedError } from "./adapters/scripted-model.js";
 export {
   IllegalPlanApprovalStateError,
+  IllegalSourceReadStateError,
+  InvalidSourceReadCommandError,
   InvalidSourceScopeError,
   InvalidPlanApprovalCommandError,
   PlanApprovalConflictError,
   ResearchAgentRuntime,
+  SourceReadConflictError,
+  SourceReadPersistenceError,
+  SourceReadRunNotFoundError,
   StalePlanApprovalError,
 } from "./application/research-agent-runtime.js";
 export { formatRunTrace } from "./application/trace-format.js";
@@ -20,6 +25,7 @@ export type {
   CreateRunCommand,
   InspectRunCommand,
   OpenRuntimeOptions,
+  ReadSourceCommand,
   RebuildRunProjectionCommand,
   TraceRunCommand,
 } from "./application/research-agent-runtime.js";
@@ -27,6 +33,7 @@ export type {
   ArtifactReference,
   PlanApprovalBinding,
   PlanApprovalReceipt,
+  ReadSourceRequest,
   ResearchPlan,
   ResearchRunEvent,
   ResearchRunState,
@@ -38,6 +45,12 @@ export type {
   RunTraceEvent,
   RequestedSourceScope,
   SourceRootIdentity,
+  SourceAccessDenialCode,
+  SourceAccessFailureCode,
+  SourceReadObservation,
+  SucceededSourceReadObservation,
+  DeniedSourceReadObservation,
+  FailedSourceReadObservation,
   SourceSnapshotReference,
   SourceScope,
 } from "./domain/types.js";

@@ -473,6 +473,8 @@ describe("plan_approved schema and reducer boundary", () => {
       type: "researching",
       planArtifact: planArtifact(),
       approvalReceipt: approvalReceipt(),
+      sourceReadObservations: [],
+      sourceBytesRead: 0,
     });
     expect(projection.lastEventSequence).toBe(4);
   });

@@ -3,62 +3,29 @@ import type { BigIntStats } from "node:fs";
 import { lstat, open, realpath, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import {
-  extname,
   isAbsolute,
-  matchesGlob,
-  posix,
   relative,
   resolve,
   sep,
-  win32,
 } from "node:path";
 
+import {
+  hasAllowedSourceExtension,
+  isExcludedSourcePath,
+  isSecretSourcePath,
+  sourceRequestDenial,
+} from "../domain/source-policy.js";
 import type {
+  ReadSourceRequest,
   RequestedSourceScope,
+  SourceAccessDenialCode,
+  SourceAccessFailureCode,
   SourceRootIdentity,
   SourceScope,
 } from "../domain/types.js";
 
-/** Harness 固定拥有的单次 `read_source` 最大 1-based inclusive 行窗。 */
-export const MAX_SOURCE_LINE_WINDOW = 200;
-
-/** 一次结构化私有源读取请求。 */
-export interface ReadSourceRequest {
-  /** 只选择已批准 `SourceScope.roots` 的零基索引，不接受调用方路径替代。 */
-  readonly rootIndex: number;
-  /** 相对于所选批准根的 POSIX 文件路径。 */
-  readonly relativePath: string;
-  /** 请求摘录的首行，使用 1-based inclusive 语义。 */
-  readonly startLine: number;
-  /** 请求摘录的末行，使用 1-based inclusive 语义。 */
-  readonly endLine: number;
-}
-
-/** Source Scope 策略拒绝读取时公开的稳定代码。 */
-export type SourceAccessDenialCode =
-  | "invalid_root"
-  | "invalid_path"
-  | "invalid_line_range"
-  | "line_range_out_of_bounds"
-  | "path_escape"
-  | "symlink_escape"
-  | "symlink_path"
-  | "excluded_path"
-  | "secret_path"
-  | "extension_not_allowed"
-  | "binary_file"
-  | "file_too_large"
-  | "source_budget_exceeded"
-  | "line_range_too_large";
-
-/** 预期文件系统失败被归一化后公开的稳定代码。 */
-export type SourceAccessFailureCode =
-  | "root_changed"
-  | "path_changed_during_read"
-  | "source_changed_during_read"
-  | "source_not_found"
-  | "source_not_file"
-  | "source_io_error";
+export { MAX_SOURCE_LINE_WINDOW } from "../domain/source-policy.js";
+export type { ReadSourceRequest } from "../domain/types.js";
 
 /** 请求因批准策略不允许而没有读取任何源字节。 */
 export interface SourceAccessDenied {
@@ -142,11 +109,6 @@ interface ReadySource {
 type EvaluatedSource = ReadySource | SourceAccessDenied | SourceAccessFailed;
 
 const READ_CHUNK_BYTES = 64 * 1024;
-const CREDENTIAL_CONFIG_NAME =
-  /^(?:credentials?|tokens?|secrets?)\.(?:json|ya?ml|toml|ini|conf|cfg)$/;
-const SERVICE_ACCOUNT_CONFIG_NAME =
-  /^service[-_]account(?:[-_][a-z0-9]+)*\.(?:json|ya?ml|toml|ini|conf|cfg)$/;
-
 /** capture 生命周期中的可选异步边界，不接收私有路径或源字节。 */
 export interface SourceAccessLifecycleHooks {
   /** 完整预检通过后、打开 candidate handle 前运行的可选协调回调。 */
@@ -391,38 +353,13 @@ export class PrivateSourceAccess {
     request: ReadSourceRequest,
     remainingSourceBytes: number,
   ): Promise<EvaluatedSource> {
-    if (
-      !Number.isSafeInteger(request.rootIndex) ||
-      request.rootIndex < 0 ||
-      request.rootIndex >= this.#scope.roots.length
-    ) {
-      return denied("invalid_root");
-    }
-    if (
-      !Number.isSafeInteger(request.startLine) ||
-      !Number.isSafeInteger(request.endLine) ||
-      request.startLine <= 0 ||
-      request.endLine < request.startLine
-    ) {
-      return denied("invalid_line_range");
-    }
-    if (
-      request.endLine - request.startLine + 1 >
-      MAX_SOURCE_LINE_WINDOW
-    ) {
-      return denied("line_range_too_large");
-    }
-    if (
-      !Number.isSafeInteger(remainingSourceBytes) ||
-      remainingSourceBytes < 0
-    ) {
-      return denied("source_budget_exceeded");
-    }
-    if (!isValidRelativeRequestPath(request.relativePath)) {
-      return denied("invalid_path");
-    }
-    if (request.relativePath.split("/").includes("..")) {
-      return denied("path_escape");
+    const requestDenial = sourceRequestDenial(
+      request,
+      this.#scope.roots.length,
+      remainingSourceBytes,
+    );
+    if (requestDenial !== undefined) {
+      return denied(requestDenial);
     }
 
     const approvedRoot = this.#scope.roots[request.rootIndex];
@@ -464,16 +401,22 @@ export class PrivateSourceAccess {
       return denied("symlink_escape");
     }
     const normalizedRelativePath = toPosixPath(rootRelative);
+    if (normalizedRelativePath !== request.relativePath) {
+      // requestHash 绑定调用方精确结构化参数，而成功 observation 只持久化这条
+      // canonical 相对路径。若大小写或 Unicode 拼写被文件系统改写，两者将无法
+      // 由 Journal 独立重算为同一请求，因此这里必须记录安全 denial 而非成功。
+      return denied("invalid_path");
+    }
 
-    if (isExcluded(normalizedRelativePath, this.#scope.exclusions)) {
+    if (isExcludedSourcePath(normalizedRelativePath, this.#scope.exclusions)) {
       return denied("excluded_path");
     }
     // Secret denylist 必须早于扩展名 allowlist；否则把 `.pem` 加入允许列表会
     // 意外授权私钥，`.env` 也可能因特殊扩展名语义得到不一致结论。
-    if (isSecretPath(normalizedRelativePath)) {
+    if (isSecretSourcePath(normalizedRelativePath)) {
       return denied("secret_path");
     }
-    if (!hasAllowedExtension(normalizedRelativePath, this.#scope.allowedExtensions)) {
+    if (!hasAllowedSourceExtension(normalizedRelativePath, this.#scope.allowedExtensions)) {
       return denied("extension_not_allowed");
     }
 
@@ -510,18 +453,6 @@ export class PrivateSourceAccess {
       },
     };
   }
-}
-
-function isValidRelativeRequestPath(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    !value.includes("\0") &&
-    !value.includes("\\") &&
-    !isAbsolute(value) &&
-    !posix.isAbsolute(value) &&
-    !win32.isAbsolute(value)
-  );
 }
 
 async function checkPathSegments(
@@ -656,87 +587,6 @@ function sameApprovedIdentity(
 
 function toPosixPath(value: string): string {
   return value.split(sep).join("/");
-}
-
-function isExcluded(
-  normalizedRelativePath: string,
-  exclusions: readonly string[],
-): boolean {
-  // Exclusion 是保守 denial 边界：path 与 pattern 在 glob 前统一做 NFC 与
-  // locale-independent lowercase，只会扩大“拒绝”集合，不会扩大 Source Scope
-  // 授权；因此 macOS 的 NFD 名称或大小写差异不能绕过已批准排除项。
-  const comparablePath = normalizeExclusionValue(normalizedRelativePath);
-  return exclusions.some((pattern) => {
-    try {
-      return matchesGlob(comparablePath, normalizeExclusionValue(pattern));
-    } catch {
-      // 未能解释批准 Scope 中的排除表达式时宁可拒绝，不能将解析失败当作扩权。
-      return true;
-    }
-  });
-}
-
-function isSecretPath(normalizedRelativePath: string): boolean {
-  // Secret basename 统一折叠为小写后 fail closed，避免大小写不同绕过 `.env*`。
-  const lowerPath = normalizedRelativePath.toLowerCase();
-  const segments = lowerPath.split("/");
-  const fileName = segments.at(-1) ?? "";
-
-  if (
-    fileName.startsWith(".env") ||
-    fileName.endsWith(".pem") ||
-    fileName.endsWith(".key")
-  ) {
-    return true;
-  }
-  if (
-    [
-      ".npmrc",
-      ".pypirc",
-      ".netrc",
-      ".dockercfg",
-      ".git-credentials",
-      ".yarnrc.yml",
-      "application_default_credentials.json",
-      "service-account-key.json",
-      "service_account_key.json",
-    ].includes(fileName)
-  ) {
-    return true;
-  }
-  if (
-    lowerPath === ".docker/config.json" ||
-    lowerPath.endsWith("/.docker/config.json") ||
-    lowerPath === ".config/gh/hosts.yml" ||
-    lowerPath.endsWith("/.config/gh/hosts.yml")
-  ) {
-    return true;
-  }
-  return (
-    CREDENTIAL_CONFIG_NAME.test(fileName) ||
-    SERVICE_ACCOUNT_CONFIG_NAME.test(fileName)
-  );
-}
-
-function normalizeExclusionValue(value: string): string {
-  return value.normalize("NFC").toLowerCase();
-}
-
-function hasAllowedExtension(
-  normalizedRelativePath: string,
-  allowedExtensions: readonly string[],
-): boolean {
-  const extension = extname(normalizedRelativePath);
-  // 大小写策略显式 fail closed：源文件扩展名和批准列表项都必须已经是小写，
-  // 不通过大小写折叠暗中扩大已批准的 Source Scope。
-  return (
-    extension.length > 0 &&
-    extension === extension.toLowerCase() &&
-    allowedExtensions.some(
-      (allowed) =>
-        allowed === allowed.toLowerCase() && allowed === extension,
-    )
-  );
 }
 
 function limitForSize(

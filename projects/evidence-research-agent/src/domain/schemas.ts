@@ -2,16 +2,22 @@ import { isAbsolute } from "node:path";
 
 import { z } from "zod";
 
-import { artifactReferenceHasMatchingContentIdentity } from "./integrity.js";
+import {
+  artifactReferenceHasMatchingContentIdentity,
+  sourceSnapshotHasMatchingContentIdentity,
+} from "./integrity.js";
 import type {
   PlanApprovalBinding,
   PlanApprovalReceipt,
+  ReadSourceRequest,
   ResearchPlan,
   ResearchRunEvent,
   RequestedSourceScope,
   RunBudget,
   RunProjection,
+  SourceReadObservation,
   SourceScope,
+  SourceSnapshotReference,
 } from "./types.js";
 
 const sourceScopePolicyFields = {
@@ -74,6 +80,16 @@ export const researchPlanSchema = z.object({
     .min(1),
 });
 
+export const readSourceRequestSchema = z
+  .object({
+    rootIndex: z.number().finite(),
+    relativePath: z.string(),
+    startLine: z.number().finite(),
+    endLine: z.number().finite(),
+  })
+  .strict()
+  .transform((request): ReadSourceRequest => request);
+
 const artifactReferenceSchema = z
   .object({
     artifactId: z.string().regex(/^sha256:[a-f0-9]{64}$/),
@@ -103,6 +119,94 @@ const runBudgetValueSchema = runBudgetSchema.transform(
 );
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+
+const sourceSnapshotReferenceSchema = z
+  .object({
+    snapshotId: z.string().regex(/^source-sha256:[a-f0-9]{64}$/),
+    sha256: sha256Schema,
+    mediaType: z.literal("text/plain; charset=utf-8"),
+    byteLength: z.number().int().nonnegative(),
+    relativePath: z.string().min(1),
+  })
+  .strict()
+  .superRefine((reference, context) => {
+    if (!sourceSnapshotHasMatchingContentIdentity(reference)) {
+      context.addIssue({
+        code: "custom",
+        path: ["snapshotId"],
+        message: "Source Snapshot identity、摘要或路径不一致",
+      });
+    }
+  })
+  .transform((reference): SourceSnapshotReference => reference);
+
+const sourceAccessDenialCodeSchema = z.enum([
+  "invalid_root",
+  "invalid_path",
+  "invalid_line_range",
+  "line_range_out_of_bounds",
+  "path_escape",
+  "symlink_escape",
+  "symlink_path",
+  "excluded_path",
+  "secret_path",
+  "extension_not_allowed",
+  "binary_file",
+  "file_too_large",
+  "source_budget_exceeded",
+  "line_range_too_large",
+]);
+
+const sourceAccessFailureCodeSchema = z.enum([
+  "root_changed",
+  "path_changed_during_read",
+  "source_changed_during_read",
+  "source_not_found",
+  "source_not_file",
+  "source_io_error",
+]);
+
+const sourceReadObservationFields = {
+  observationId: z.string().trim().min(1),
+  toolCallId: z.string().trim().min(1),
+  toolName: z.literal("read_source"),
+  requestHash: sha256Schema,
+  observedAt: z.iso.datetime(),
+};
+
+export const sourceReadObservationSchema = z
+  .discriminatedUnion("status", [
+    z
+      .object({
+        ...sourceReadObservationFields,
+        status: z.literal("succeeded"),
+        rootIndex: z.number().int().nonnegative(),
+        relativePath: z.string().min(1),
+        startLine: z.number().int().positive(),
+        endLine: z.number().int().positive(),
+        totalLines: z.number().int().positive(),
+        excerpt: z.string(),
+        excerptHash: sha256Schema,
+        sourceSnapshot: sourceSnapshotReferenceSchema,
+        byteLength: z.number().int().nonnegative(),
+      })
+      .strict(),
+    z
+      .object({
+        ...sourceReadObservationFields,
+        status: z.literal("denied"),
+        code: sourceAccessDenialCodeSchema,
+      })
+      .strict(),
+    z
+      .object({
+        ...sourceReadObservationFields,
+        status: z.literal("failed"),
+        code: sourceAccessFailureCodeSchema,
+      })
+      .strict(),
+  ])
+  .transform((observation): SourceReadObservation => observation);
 
 const planApprovalBindingSchema = z
   .object({
@@ -147,6 +251,8 @@ const runStateSchema = z.discriminatedUnion("type", [
     type: z.literal("researching"),
     planArtifact: artifactReferenceSchema,
     approvalReceipt: planApprovalReceiptSchema,
+    sourceReadObservations: z.array(sourceReadObservationSchema),
+    sourceBytesRead: z.number().int().nonnegative(),
   }),
 ]);
 
@@ -198,6 +304,17 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
       approvalReceipt: planApprovalReceiptSchema,
     }),
   }),
+  z
+    .object({
+      ...eventEnvelopeSchema,
+      type: z.literal("source_read_observed"),
+      payload: z
+        .object({
+          observation: sourceReadObservationSchema,
+        })
+        .strict(),
+    })
+    .strict(),
 ]);
 
 export function parseSourceScope(input: unknown): SourceScope {

@@ -36,6 +36,44 @@ export interface SourceScope {
   readonly maxTotalBytes: number;
 }
 
+/** 一次 `read_source` Research Tool 的完整结构化请求。 */
+export interface ReadSourceRequest {
+  /** 只选择已批准 `SourceScope.roots` 的零基索引。 */
+  readonly rootIndex: number;
+  /** 相对于所选批准根的 POSIX 文件路径。 */
+  readonly relativePath: string;
+  /** 请求摘录的首行，使用 1-based inclusive 语义。 */
+  readonly startLine: number;
+  /** 请求摘录的末行，使用 1-based inclusive 语义。 */
+  readonly endLine: number;
+}
+
+/** Source Scope 策略拒绝读取时公开的稳定代码。 */
+export type SourceAccessDenialCode =
+  | "invalid_root"
+  | "invalid_path"
+  | "invalid_line_range"
+  | "line_range_out_of_bounds"
+  | "path_escape"
+  | "symlink_escape"
+  | "symlink_path"
+  | "excluded_path"
+  | "secret_path"
+  | "extension_not_allowed"
+  | "binary_file"
+  | "file_too_large"
+  | "source_budget_exceeded"
+  | "line_range_too_large";
+
+/** 预期文件系统失败被归一化后公开的稳定代码。 */
+export type SourceAccessFailureCode =
+  | "root_changed"
+  | "path_changed_during_read"
+  | "source_changed_during_read"
+  | "source_not_found"
+  | "source_not_file"
+  | "source_io_error";
+
 /** 一个 Research Run 经用户批准后不可由模型抬高的多维限制。 */
 export interface RunBudget {
   /** 预算策略的非空稳定版本，变更任一限制时必须产生新版本。 */
@@ -158,6 +196,10 @@ export interface ResearchingRunState {
   readonly planArtifact: ArtifactReference;
   /** 对该计划、问题、Source Scope 与预算精确版本的完整审批凭据。 */
   readonly approvalReceipt: PlanApprovalReceipt;
+  /** 按 Journal 顺序保留的显式 `read_source` 结果，不包含绝对路径或原始错误。 */
+  readonly sourceReadObservations: readonly SourceReadObservation[];
+  /** 仅由成功 observation 的完整快照字节数确定性求和得到的累计值。 */
+  readonly sourceBytesRead: number;
 }
 
 /** 当前 planning slice 允许出现的最小 Run 状态联合。 */
@@ -211,6 +253,12 @@ export interface PlanApprovedPayload {
   readonly approvalReceipt: PlanApprovalReceipt;
 }
 
+/** `source_read_observed` 事件携带的完整、已消毒读取事实。 */
+export interface SourceReadObservedPayload {
+  /** 成功、策略拒绝或稳定失败中的一个结构化 observation。 */
+  readonly observation: SourceReadObservation;
+}
+
 /** 一个有顺序、可回放的 Run Journal 语义事件。 */
 export interface RunEvent<Type extends string, Payload> {
   /** 跨重试稳定的事件 identity。 */
@@ -232,7 +280,8 @@ export type ResearchRunEvent =
   | RunEvent<"run_created", RunCreatedPayload>
   | RunEvent<"planning_started", Record<never, never>>
   | RunEvent<"plan_proposed", PlanProposedPayload>
-  | RunEvent<"plan_approved", PlanApprovedPayload>;
+  | RunEvent<"plan_approved", PlanApprovedPayload>
+  | RunEvent<"source_read_observed", SourceReadObservedPayload>;
 
 /** 已写入 Artifact Store、等待登记到 SQLite 的元数据。 */
 export interface PersistedArtifact extends ArtifactReference {
@@ -260,6 +309,67 @@ export interface PersistedSourceSnapshot extends SourceSnapshotReference {
   readonly createdAt: string;
 }
 
+/** 每个 Source Read Observation 都必须携带的安全 lineage 字段。 */
+export interface SourceReadObservationFields {
+  /** 一次 observation 的稳定 identity，不与 event identity 混用。 */
+  readonly observationId: string;
+  /** Harness 内部生成的 Research Tool call identity。 */
+  readonly toolCallId: string;
+  /** 固定工具名，避免其他工具结果伪装成来源读取。 */
+  readonly toolName: "read_source";
+  /** 对调用方精确结构化请求做 canonical JSON SHA-256 得到的摘要。 */
+  readonly requestHash: string;
+  /** observation 成为 Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly observedAt: string;
+}
+
+/** 一次成功读取且已经关联独立 Source Snapshot 的 observation。 */
+export interface SucceededSourceReadObservation
+  extends SourceReadObservationFields {
+  /** 判别字段，表示显式读取、快照与 Journal 登记均成功。 */
+  readonly status: "succeeded";
+  /** 实际命中的已批准 Source Root 零基索引。 */
+  readonly rootIndex: number;
+  /** realpath containment 后相对于批准根的规范 POSIX 路径。 */
+  readonly relativePath: string;
+  /** 实际摘录首行，使用 1-based inclusive 语义。 */
+  readonly startLine: number;
+  /** 实际摘录末行，使用 1-based inclusive 语义。 */
+  readonly endLine: number;
+  /** 成功读取时完整 UTF-8 文件的逻辑行数。 */
+  readonly totalLines: number;
+  /** 从完整快照派生、用 LF 连接且不包含额外上下文的摘录。 */
+  readonly excerpt: string;
+  /** 对摘录原始 UTF-8 编码计算的 64 位小写十六进制 SHA-256。 */
+  readonly excerptHash: string;
+  /** 冻结本次显式读取所见完整源字节的独立私有快照引用。 */
+  readonly sourceSnapshot: SourceSnapshotReference;
+  /** 完整源文件的精确字节数，必须与快照引用一致。 */
+  readonly byteLength: number;
+}
+
+/** 一次被 Source Scope 或预算策略拒绝的安全 observation。 */
+export interface DeniedSourceReadObservation extends SourceReadObservationFields {
+  /** 判别字段，表示没有获得可发布的源内容。 */
+  readonly status: "denied";
+  /** 不包含请求路径、字节或系统消息的稳定策略代码。 */
+  readonly code: SourceAccessDenialCode;
+}
+
+/** 一次因稳定归一化文件系统结果而失败的安全 observation。 */
+export interface FailedSourceReadObservation extends SourceReadObservationFields {
+  /** 判别字段，表示策略允许评估但文件系统未返回内容。 */
+  readonly status: "failed";
+  /** 不包含绝对路径或原始 OS 错误的稳定失败代码。 */
+  readonly code: SourceAccessFailureCode;
+}
+
+/** Run Journal 可持久化的完整 Source Read Observation 联合。 */
+export type SourceReadObservation =
+  | SucceededSourceReadObservation
+  | DeniedSourceReadObservation
+  | FailedSourceReadObservation;
+
 /** Run Trace 中单个事件及其应用后的可解释状态。 */
 export interface RunTraceEvent {
   /** 原始 Run Journal 事件的连续序号。 */
@@ -272,6 +382,12 @@ export interface RunTraceEvent {
   readonly occurredAt: string;
   /** reducer 应用该事件后得到的状态判别值。 */
   readonly stateAfter: ResearchRunState["type"];
+  /** 仅 `source_read_observed` 暴露的安全 Research Tool call lineage。 */
+  readonly toolCallId?: string;
+  /** 仅 `source_read_observed` 暴露的成功、拒绝或失败状态。 */
+  readonly observationStatus?: SourceReadObservation["status"];
+  /** 仅成功来源读取暴露的私有 Source Snapshot identity。 */
+  readonly sourceSnapshotId?: string;
 }
 
 /** 面向人或机器读取、但不作为 canonical history 的 Run Trace。 */

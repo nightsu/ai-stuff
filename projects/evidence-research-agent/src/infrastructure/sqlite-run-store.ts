@@ -9,8 +9,10 @@ import {
   parseRunProjection,
 } from "../domain/schemas.js";
 import { reduceRunEvents } from "../domain/reducer.js";
+import { sourceSnapshotHasMatchingContentIdentity } from "../domain/integrity.js";
 import type {
   PersistedArtifact,
+  PersistedSourceSnapshot,
   ResearchRunEvent,
   RunProjection,
 } from "../domain/types.js";
@@ -38,9 +40,31 @@ interface LastSequenceRow {
   readonly last_sequence: number;
 }
 
+interface SourceSnapshotRow {
+  /** Source Snapshot 的内容寻址 identity。 */
+  readonly snapshot_id: string;
+  /** 完整原始源字节的 SHA-256 摘要。 */
+  readonly sha256: string;
+  /** 固定的 UTF-8 文本媒体类型。 */
+  readonly media_type: string;
+  /** 完整原始源文件的精确字节数。 */
+  readonly byte_length: number;
+  /** 相对于 canonical Runtime Home 的私有 CAS 路径。 */
+  readonly relative_path: string;
+  /** 该内容 identity 首次登记的 ISO 8601 UTC 时间。 */
+  readonly created_at: string;
+}
+
 export class RunNotFoundError extends Error {}
 
 export class ConcurrentRunWriteError extends Error {}
+
+export class SourceSnapshotRegistrationError extends Error {
+  public constructor() {
+    super("Source Snapshot registry 完整性校验失败");
+    this.name = "SourceSnapshotRegistrationError";
+  }
+}
 
 /** SQLite-backed Run Journal 与可丢弃的 Projection cache。 */
 export class SqliteRunStore {
@@ -59,6 +83,7 @@ export class SqliteRunStore {
     expectedLastSequence: number,
     events: readonly ResearchRunEvent[],
     artifacts: readonly PersistedArtifact[] = [],
+    sourceSnapshots: readonly PersistedSourceSnapshot[] = [],
   ): RunProjection {
     if (events.length === 0) {
       throw new Error("appendEvents 至少需要一个语义事件");
@@ -105,6 +130,10 @@ export class SqliteRunStore {
             artifact.relativePath,
             artifact.createdAt,
           );
+      }
+
+      for (const sourceSnapshot of sourceSnapshots) {
+        this.#registerSourceSnapshot(sourceSnapshot);
       }
 
       const insertEvent = this.#database.prepare(
@@ -229,6 +258,29 @@ export class SqliteRunStore {
     return transaction.immediate();
   }
 
+  public prepareSourceSnapshotRegistration(
+    snapshot: PersistedSourceSnapshot,
+  ): PersistedSourceSnapshot {
+    this.#validateSourceSnapshot(snapshot);
+    const row = this.#readSourceSnapshotRow(snapshot.snapshotId);
+    if (row === undefined) {
+      return snapshot;
+    }
+    if (!sourceSnapshotRowMatches(row, snapshot, false)) {
+      throw new SourceSnapshotRegistrationError();
+    }
+    // created_at 是 registry 的首次创建事实；相同内容稍后再次 capture 时沿用该
+    // 值，observation 自己的 observedAt 仍保留本次读取时间，两种时间语义不混淆。
+    return {
+      snapshotId: row.snapshot_id,
+      sha256: row.sha256,
+      mediaType: "text/plain; charset=utf-8",
+      byteLength: row.byte_length,
+      relativePath: row.relative_path,
+      createdAt: row.created_at,
+    };
+  }
+
   public close(): void {
     this.#database.close();
   }
@@ -240,6 +292,59 @@ export class SqliteRunStore {
       )
       .get(runId) as LastSequenceRow;
     return row.last_sequence;
+  }
+
+  #registerSourceSnapshot(snapshot: PersistedSourceSnapshot): void {
+    this.#validateSourceSnapshot(snapshot);
+
+    this.#database
+      .prepare(
+        `INSERT INTO source_snapshots
+          (snapshot_id, sha256, media_type, byte_length, relative_path, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT DO NOTHING`,
+      )
+      .run(
+        snapshot.snapshotId,
+        snapshot.sha256,
+        snapshot.mediaType,
+        snapshot.byteLength,
+        snapshot.relativePath,
+        snapshot.createdAt,
+      );
+
+    const row = this.#readSourceSnapshotRow(snapshot.snapshotId);
+    // ON CONFLICT 只能承担显式验证后的并发幂等，绝不能像 INSERT OR IGNORE 一样
+    // 把 identity/sha/path/media/bytes 冲突吞掉。跨 Run race 中 created_at 保留赢家
+    // 首次登记时间；输家的本次读取时间已经由它自己的 observation 记录。
+    if (
+      row === undefined ||
+      !sourceSnapshotRowMatches(row, snapshot, false)
+    ) {
+      throw new SourceSnapshotRegistrationError();
+    }
+  }
+
+  #validateSourceSnapshot(snapshot: PersistedSourceSnapshot): void {
+    if (
+      !sourceSnapshotHasMatchingContentIdentity(snapshot) ||
+      snapshot.mediaType !== "text/plain; charset=utf-8" ||
+      !Number.isSafeInteger(snapshot.byteLength) ||
+      snapshot.byteLength < 0 ||
+      !isIsoUtc(snapshot.createdAt)
+    ) {
+      throw new SourceSnapshotRegistrationError();
+    }
+  }
+
+  #readSourceSnapshotRow(snapshotId: string): SourceSnapshotRow | undefined {
+    return this.#database
+      .prepare(
+        `SELECT snapshot_id, sha256, media_type, byte_length, relative_path, created_at
+           FROM source_snapshots
+          WHERE snapshot_id = ?`,
+      )
+      .get(snapshotId) as SourceSnapshotRow | undefined;
   }
 
   #migrate(): void {
@@ -255,6 +360,15 @@ export class SqliteRunStore {
         media_type TEXT NOT NULL,
         byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
         relative_path TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS source_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        sha256 TEXT NOT NULL UNIQUE,
+        media_type TEXT NOT NULL,
+        byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+        relative_path TEXT NOT NULL UNIQUE,
         created_at TEXT NOT NULL
       );
 
@@ -286,6 +400,42 @@ export class SqliteRunStore {
       BEGIN
         SELECT RAISE(ABORT, 'run_events is append-only');
       END;
+
+      CREATE TRIGGER IF NOT EXISTS source_snapshots_are_immutable_on_update
+      BEFORE UPDATE ON source_snapshots
+      BEGIN
+        SELECT RAISE(ABORT, 'source_snapshots is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS source_snapshots_are_immutable_on_delete
+      BEFORE DELETE ON source_snapshots
+      BEGIN
+        SELECT RAISE(ABORT, 'source_snapshots is immutable');
+      END;
     `);
   }
+}
+
+function isIsoUtc(value: string): boolean {
+  try {
+    return new Date(value).toISOString() === value;
+  } catch {
+    return false;
+  }
+}
+
+function sourceSnapshotRowMatches(
+  row: SourceSnapshotRow,
+  snapshot: PersistedSourceSnapshot,
+  requireCreatedAtMatch: boolean,
+): boolean {
+  return (
+    row.snapshot_id === snapshot.snapshotId &&
+    row.sha256 === snapshot.sha256 &&
+    row.media_type === snapshot.mediaType &&
+    row.byte_length === snapshot.byteLength &&
+    row.relative_path === snapshot.relativePath &&
+    isIsoUtc(row.created_at) &&
+    (!requireCreatedAtMatch || row.created_at === snapshot.createdAt)
+  );
 }

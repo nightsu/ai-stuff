@@ -14,6 +14,10 @@ export interface IdGenerator {
   nextEventId(): string;
   /** 生成一个新的 durable Approval Receipt identity。 */
   nextApprovalId(): string;
+  /** 生成一个新的内部 Research Tool call identity。 */
+  nextToolCallId?(): string;
+  /** 生成一个新的 Source Read Observation identity。 */
+  nextObservationId?(): string;
 }
 
 /** 生成计划时提供给 Model Port 的 provider-neutral 输入。 */
