@@ -1,50 +1,50 @@
-# Evidence Research Agent 架构（Issue #3）
+# Evidence Research Agent 架构（Issue #4）
 
-本文描述可恢复的 planning 与精确计划审批 slice：创建 Research Run、生成计划、持久化版本绑定，并由独立用户命令追加 Approval Receipt。Research Loop、Research Tool 和发布仍不在本 ticket 中。
+当前 slice 已经能在 durable Plan Approval 之后，通过 `ResearchAgentRuntime.readSource` 明确读取一个批准范围内的本地 UTF-8 文件：受限摘录进入 observation，读取时看到的完整精确字节进入私有 Source Snapshot。这里仍没有 `search_sources`、模型驱动的多轮 Research Loop 或自动工具执行。
 
-## 组件与端口
+## 组件、端口与单向能力流
 
 ```mermaid
 flowchart LR
-  User["用户或自动化"] --> CLI["CLI Adapter\nrun / inspect / approve-plan / trace"]
+  Caller["TypeScript 调用方<br/>尚无 read-source CLI"] --> Runtime["ResearchAgentRuntime<br/>readSource"]
 
-  subgraph Application["Application"]
-    Runtime["ResearchAgentRuntime\ncommand-oriented seam"]
-    Trace["Run Trace Projection"]
+  subgraph SourceBoundary["Private source boundary"]
+    Policy["Shared Source policy<br/>canonical root + realpath preflight"]
+    Reader["Bounded UTF-8 capture"]
   end
 
-  subgraph Domain["Domain"]
-    Reducer["Pure Run Reducer"]
-    Events["Typed Semantic Events"]
+  subgraph RuntimeHome["Private Runtime Home"]
+    Snapshot["ContentAddressedArtifactStore<br/>private Source Snapshot"]
+    Registry["SqliteRunStore<br/>source_snapshots registry"]
+    Journal["Run Journal<br/>source_read_observed"]
+    Projection["Run Projection cache"]
   end
 
-  subgraph Ports["Injectable Ports"]
-    ModelPort["ModelPort"]
-    ClockPort["Clock"]
-    IdPort["IdGenerator"]
-  end
+  Trace["Run Trace projection"]
 
-  subgraph Adapters["Infrastructure and Test Adapters"]
-    Scripted["ScriptedModel"]
-    SQLite["SQLite Run Journal\n+ Projection Cache"]
-    Artifact["Content-addressed\nArtifact Store"]
-  end
-
-  CLI --> Runtime
-  Runtime --> ModelPort
-  Runtime --> ClockPort
-  Runtime --> IdPort
-  Scripted -. implements .-> ModelPort
-  Runtime --> Artifact
-  Runtime --> SQLite
-  SQLite --> Events
-  Events --> Reducer
-  Reducer --> SQLite
-  Events --> Trace
-  Runtime --> Trace
+  Runtime --> Policy
+  Policy -->|"approved explicit read"| Reader
+  Reader --> Snapshot
+  Snapshot --> Registry
+  Registry --> Journal
+  Policy -->|"denied or failed<br/>no snapshot"| Journal
+  Reader -->|"denied or failed<br/>no snapshot"| Journal
+  Journal --> Projection
+  Journal --> Trace
 ```
 
-关键边界：Model Port 只返回 provider-neutral 的完整计划；AI SDK 类型不得进入 runtime。SQLite 中的 Run Journal 是 canonical history，缓存 Projection 与 Trace 都只通过同一个纯 reducer 派生。
+图中的 `Policy` 是 `PrivateSourceAccess` 与 reducer 共同使用的 Source policy。它没有 Source Snapshot 写入能力：只有 `readSource` 的成功 capture 才把完整字节交给 `ContentAddressedArtifactStore`。成功时，`SqliteRunStore` 在同一 SQLite 事务中登记独立 `source_snapshots` 记录并追加 Journal 事件；`denied` 或 `failed` 只追加已消毒的 observation，不经过 Snapshot 或 registry。图中的 `Journal --> Projection` 表示由纯 reducer 回放派生，不表示 cache 是事实源。
+
+## 一次成功读取如何收窄权限
+
+1. 创建 Run 时，调用方请求的每个 root 会先解析为 canonical path，并把目录的 `device`/`inode` identity 冻结进 Source Scope；Plan Approval binding 因而绑定的不是一段可被事后重新解释的路径字符串。
+2. `readSource` 只接受 `runId` 与严格结构化的 `{ rootIndex, relativePath, startLine, endLine }`，并要求 Projection 为 `researching` 且已有 durable Approval Receipt。Receipt、actor、scope、budget、observation status 与 snapshot identity 均由调用方之外的边界决定。
+3. `PrivateSourceAccess` 重新验证批准 root identity、相对路径形状、逐段 symlink、realpath containment、exclusion、secret denylist、扩展名、文件类型、单文件大小、累计预算和固定行窗。它通过同一 file handle 做有界读取，并在读取前后复核文件与路径 identity。
+4. 完整字节必须通过 fatal UTF-8 解码且不含 NUL；1-based inclusive 行范围只决定返回的 LF 摘录，不改变即将冻结的完整原始字节。冻结全文可让以后 Evidence Record 引用同一个不随 live file 变化的版本，也保留请求范围之外的版本语境。
+5. CAS identity 为 `source-sha256:<64-lowercase-hex>`。相同完整字节跨路径、跨 Run 复用同一个 snapshot；live file 字节改变会产生新 identity，旧 snapshot 保持不变。计划 JSON 仍使用通用 `artifacts` namespace，Source Snapshot 元数据则进入独立、不可变的 `source_snapshots` registry。
+6. Journal 中的成功 observation（`status: "succeeded"`）保存 `observationId`、`toolCallId`、精确请求 hash、规范相对路径、行范围、摘录及其 hash、全文字节数和 `sourceSnapshot`。Run Trace 只投影安全 lineage：`toolCallId`、`observationStatus` 与 `sourceSnapshotId`，不包含源字节、绝对路径、OS 错误或 Runtime Home 路径。
+
+Snapshot 字节写入发生在 SQLite 短事务之外；registry 与成功事件必须随后以 `expectedLastSequence` 原子对应。若并发推进导致提交冲突，runtime 不会重读 live file 或声称 observation 已持久化；提前写入但未被 Journal 引用的 CAS 对象只可能成为待后续 GC 的 orphan。
 
 ## 当前 Run 状态机
 
@@ -54,19 +54,20 @@ stateDiagram-v2
   created --> planning: planning_started
   planning --> waiting_plan_approval: plan_proposed
   waiting_plan_approval --> researching: plan_approved with exact receipt
+  researching --> researching: source_read_observed
 
   note right of researching
-    这里只证明 durable approval
-    Issue 4 才会读取 Source Snapshot 或执行 Research Tool
+    succeeded / denied / failed
+    都保持 researching
+    不代表 completed
   end note
 ```
 
-`waiting_plan_approval` 不是终态。CLI 进程退出不会丢失它；新进程从同一 Runtime Home 读取缓存投影，缓存缺失时从追加式 Journal 重建。`approve-plan` 只接收用户从投影原样回显的 `bindingHash`，并把 runtime 内部构造的完整 Receipt 追加为第 4 个事件；它使用空 `ScriptedModel` 打开 runtime，所以恢复和审批不会重新生成计划。重复提交同一 hash 返回已持久化投影，不会追加第二个审批事件。
+每次 `source_read_observed` 都只更新 `state.sourceReadObservations`；仅 `succeeded` 的完整 snapshot 字节数计入由 reducer 重算的 `state.sourceBytesRead`。`denied` 表示策略不授权，`failed` 表示归一化后的文件系统失败；两者都不会自动扩大 Source Scope、改写原请求、创建 snapshot 或推进到 `completed`。
 
-## 追加与投影不变量
+## 恢复与安全边界
 
-1. `run_events` 只能 `INSERT`；SQLite trigger 拒绝 `UPDATE` 与 `DELETE`。
-2. 每个 Run 的 `sequence` 从 1 开始且严格连续，写入使用 expected-last-sequence 防止静默覆盖并发进展。
-3. 新事件与缓存 Projection 在同一短事务中提交；Model 调用与 Artifact 文件写入不持有 SQLite 写锁。
-4. Projection cache 可丢弃。`rebuildRunProjection` 只回放 Journal，不调用模型，也不重新生成计划。
-5. 计划正文进入内容寻址 Artifact Store；Journal 只持久化稳定引用和重建状态所需事实。
+- Run Journal 是 canonical history。Projection cache 和 Trace 都可丢弃并从 Journal 重建；重启、inspect、trace 或 `rebuildRunProjection` 不会重新读取 live source。
+- Runtime Home、snapshot namespace 目录会收紧为 `0700`，snapshot 文件为 `0600`。这依赖“同一 OS 用户不是 hostile writer”的本地运行假设；权限位不会阻止同用户进程并发改名。
+- Node.js 24 没有可移植的 `openat`/`openat2` 能力边界。逐段 symlink 拒绝、`O_NOFOLLOW`、handle `fstat` 和读取前后 path/root identity 复核会对稳定可观测的变化 fail closed，但不能承诺对 hostile same-user concurrent rename 的原子隔离。
+- preflight 或未来的路径发现没有 CAS/registry capability，因此路径被看见不等于内容被持久化。Issue #5 才加入 Evidence Record、Claim、最小 Evidence Gate 与发布成功路径；Issue #6 才加入真正的 `search_sources` 和有界多轮 Research Loop；Issue #7 处理错误分类与 retry；Issue #8 接入 live OpenAI-compatible Model Port。
