@@ -1,6 +1,8 @@
 export { ScriptedModel, ScriptedModelExhaustedError } from "./adapters/scripted-model.js";
 export {
   IllegalPlanApprovalStateError,
+  InvalidPlanApprovalCommandError,
+  PlanApprovalConflictError,
   ResearchAgentRuntime,
   StalePlanApprovalError,
 } from "./application/research-agent-runtime.js";

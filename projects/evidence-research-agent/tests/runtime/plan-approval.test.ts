@@ -25,7 +25,6 @@ import {
   reduceRunEvents,
 } from "../../src/domain/reducer.js";
 import { parseResearchRunEvent } from "../../src/domain/schemas.js";
-import { ConcurrentRunWriteError } from "../../src/infrastructure/sqlite-run-store.js";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -137,12 +136,47 @@ describe("ResearchAgentRuntime plan approval", () => {
     }
   });
 
-  it.each([HASH_B, "not-a-hash", ""])(
-    "rejects stale binding %j with a named payload-safe error before generating IDs",
-    async (submittedHash) => {
+  it("recovers the same Receipt across restarts, rebuild, duplicate approval, and cache tamper", async () => {
+    const runtimeHome = await createRuntimeHome();
+    const waiting = await createWaitingRun(runtimeHome);
+    const command = approvalCommandFor(waiting);
+    const approver = openApprovalRuntime(runtimeHome, createApprovalIds());
+    const approved = await approver.approvePlan(command);
+    approver.close();
+
+    const restarted = openApprovalRuntime(runtimeHome, throwingApprovalIds());
+    try {
+      await expect(restarted.inspectRun({ runId: waiting.runId })).resolves.toEqual(
+        approved,
+      );
+      await expect(
+        restarted.rebuildRunProjection({ runId: waiting.runId }),
+      ).resolves.toEqual(approved);
+      await expect(restarted.approvePlan(command)).resolves.toEqual(approved);
+    } finally {
+      restarted.close();
+    }
+
+    tamperResearchingReceiptCache(runtimeHome, waiting.runId);
+    const afterTamper = openApprovalRuntime(runtimeHome, throwingApprovalIds());
+    try {
+      await expect(afterTamper.inspectRun({ runId: waiting.runId })).resolves.toEqual(
+        approved,
+      );
+      await expect(afterTamper.approvePlan(command)).resolves.toEqual(approved);
+      expect(countEvents(runtimeHome, waiting.runId)).toBe(4);
+    } finally {
+      afterTamper.close();
+    }
+  });
+
+  it(
+    "rejects a stale but well-formed binding with a named payload-safe error before generating IDs",
+    async () => {
       const runtimeHome = await createRuntimeHome();
       const waiting = await createWaitingRun(runtimeHome);
       const restarted = openApprovalRuntime(runtimeHome, throwingApprovalIds());
+      const submittedHash = HASH_B;
 
       try {
         const approval = restarted.approvePlan({
@@ -159,6 +193,32 @@ describe("ResearchAgentRuntime plan approval", () => {
         await expect(approval).rejects.not.toThrow(
           waitingStateOf(waiting).approvalBinding.bindingHash,
         );
+        expect(countEvents(runtimeHome, waiting.runId)).toBe(3);
+      } finally {
+        restarted.close();
+      }
+    },
+  );
+
+  it.each(["", "not-a-hash", "A".repeat(64), "a".repeat(65)])(
+    "rejects malformed binding %j as a named application input error",
+    async (submittedHash) => {
+      const runtimeHome = await createRuntimeHome();
+      const waiting = await createWaitingRun(runtimeHome);
+      const restarted = openApprovalRuntime(runtimeHome, throwingApprovalIds());
+
+      try {
+        const approval = restarted.approvePlan({
+          runId: waiting.runId,
+          bindingHash: submittedHash,
+        });
+
+        await expect(approval).rejects.toMatchObject({
+          name: "InvalidPlanApprovalCommandError",
+        });
+        if (submittedHash !== "") {
+          await expect(approval).rejects.not.toThrow(submittedHash);
+        }
         expect(countEvents(runtimeHome, waiting.runId)).toBe(3);
       } finally {
         restarted.close();
@@ -255,7 +315,7 @@ describe("ResearchAgentRuntime plan approval", () => {
     }
   });
 
-  it.each(["approvedBy", "receipt", "model", "tool"] as const)(
+  it.each(["actor", "approvedBy", "receipt", "model", "tool"] as const)(
     "rejects an application command containing runtime-owned %s authority",
     async (field) => {
       const runtimeHome = await createRuntimeHome();
@@ -267,7 +327,9 @@ describe("ResearchAgentRuntime plan approval", () => {
       } as unknown as ApprovePlanCommand;
 
       try {
-        await expect(restarted.approvePlan(command)).rejects.toThrow();
+        await expect(restarted.approvePlan(command)).rejects.toMatchObject({
+          name: "InvalidPlanApprovalCommandError",
+        });
         expect(countEvents(runtimeHome, waiting.runId)).toBe(3);
       } finally {
         restarted.close();
@@ -291,7 +353,7 @@ describe("ResearchAgentRuntime plan approval", () => {
     }
   });
 
-  it("retains expected-last-sequence optimistic concurrency", async () => {
+  it("returns one persisted Projection to both concurrent same-binding approvals", async () => {
     const runtimeHome = await createRuntimeHome();
     const waiting = await createWaitingRun(runtimeHome);
     const command = approvalCommandFor(waiting);
@@ -304,7 +366,7 @@ describe("ResearchAgentRuntime plan approval", () => {
         winningApproval = winner.approvePlan(command);
       }
     };
-    const stale = ResearchAgentRuntime.open({
+    const contender = ResearchAgentRuntime.open({
       runtimeHome,
       model: new ScriptedModel([]),
       clock: { now: () => "2026-08-12T08:02:00.000Z" },
@@ -324,19 +386,64 @@ describe("ResearchAgentRuntime plan approval", () => {
     });
 
     try {
-      await expect(stale.approvePlan(command)).rejects.toBeInstanceOf(
-        ConcurrentRunWriteError,
-      );
+      const contenderApproval = contender.approvePlan(command);
       if (winningApproval === undefined) {
         throw new Error("测试要求竞争写入已发生");
       }
-      await expect(winningApproval).resolves.toMatchObject({
-        state: { type: "researching" },
-      });
+      const winnerProjection = await winningApproval;
+      const contenderProjection = await contenderApproval;
+      expect(contenderProjection).toEqual(winnerProjection);
       expect(countEvents(runtimeHome, waiting.runId)).toBe(4);
+      expect(
+        (await winner.traceRun({ runId: waiting.runId })).events.filter(
+          (event) => event.type === "plan_approved",
+        ),
+      ).toHaveLength(1);
     } finally {
-      stale.close();
+      contender.close();
       winner.close();
+    }
+  });
+
+  it("does not translate non-concurrency failures", async () => {
+    const runtimeHome = await createRuntimeHome();
+    const waiting = await createWaitingRun(runtimeHome);
+    const identityFailure = new Error("controlled identity boundary failure");
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: new ScriptedModel([]),
+      clock: { now: () => "2026-08-12T08:01:00.000Z" },
+      ids: {
+        nextRunId: () => "unused-run-id",
+        nextEventId: () => "unused-event-id",
+        nextApprovalId: () => {
+          throw identityFailure;
+        },
+      },
+    });
+
+    try {
+      await expect(
+        restarted.approvePlan(approvalCommandFor(waiting)),
+      ).rejects.toBe(identityFailure);
+      expect(countEvents(runtimeHome, waiting.runId)).toBe(3);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("does not translate Journal schema failures", async () => {
+    const runtimeHome = await createRuntimeHome();
+    const waiting = await createWaitingRun(runtimeHome);
+    corruptPlanProposedPayload(runtimeHome, waiting.runId);
+    const restarted = openApprovalRuntime(runtimeHome, throwingApprovalIds());
+
+    try {
+      await expect(
+        restarted.approvePlan(approvalCommandFor(waiting)),
+      ).rejects.toMatchObject({ name: "ZodError" });
+    } finally {
+      restarted.close();
     }
   });
 });
@@ -607,6 +714,60 @@ function readEventPayload(runtimeHome: string, sequence: number): unknown {
         payload_json: string;
       };
     return JSON.parse(result.payload_json) as unknown;
+  } finally {
+    database.close();
+  }
+}
+
+function tamperResearchingReceiptCache(
+  runtimeHome: string,
+  runId: string,
+): void {
+  const database = new Database(join(runtimeHome, "runtime.sqlite"));
+  try {
+    const row = database
+      .prepare(
+        "SELECT projection_json FROM run_projections WHERE run_id = ?",
+      )
+      .get(runId) as {
+        /** schema-valid researching Projection cache 的原始 JSON 文本。 */
+        projection_json: string;
+      };
+    const projection = JSON.parse(row.projection_json) as RunProjection;
+    if (projection.state.type !== "researching") {
+      throw new Error("测试要求篡改 researching Projection cache");
+    }
+    database
+      .prepare(
+        "UPDATE run_projections SET projection_json = ? WHERE run_id = ?",
+      )
+      .run(
+        JSON.stringify({
+          ...projection,
+          state: {
+            ...projection.state,
+            approvalReceipt: {
+              ...projection.state.approvalReceipt,
+              approvalId: "approval-cache-tampered",
+            },
+          },
+        }),
+        runId,
+      );
+  } finally {
+    database.close();
+  }
+}
+
+function corruptPlanProposedPayload(runtimeHome: string, runId: string): void {
+  const database = new Database(join(runtimeHome, "runtime.sqlite"));
+  try {
+    database.exec("DROP TRIGGER run_events_are_append_only_on_update");
+    database
+      .prepare(
+        "UPDATE run_events SET payload_json = ? WHERE run_id = ? AND sequence = 3",
+      )
+      .run("{}", runId);
   } finally {
     database.close();
   }

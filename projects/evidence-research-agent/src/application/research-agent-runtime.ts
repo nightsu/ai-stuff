@@ -16,7 +16,10 @@ import type {
   RunTrace,
 } from "../domain/types.js";
 import { ContentAddressedArtifactStore } from "../infrastructure/content-addressed-artifact-store.js";
-import { SqliteRunStore } from "../infrastructure/sqlite-run-store.js";
+import {
+  ConcurrentRunWriteError,
+  SqliteRunStore,
+} from "../infrastructure/sqlite-run-store.js";
 import type { Clock, IdGenerator, ModelPort } from "./ports.js";
 
 /** 打开一个 headless runtime 所需的基础设施与可控边界。 */
@@ -83,6 +86,22 @@ export class IllegalPlanApprovalStateError extends Error {
   }
 }
 
+/** 计划审批命令不满足公开输入契约时抛出的安全应用错误。 */
+export class InvalidPlanApprovalCommandError extends Error {
+  public constructor() {
+    super("计划审批命令格式无效");
+    this.name = "InvalidPlanApprovalCommandError";
+  }
+}
+
+/** 乐观冲突后无法确认同一审批结果时抛出的安全应用错误。 */
+export class PlanApprovalConflictError extends Error {
+  public constructor() {
+    super("计划审批与另一项 Run 更新发生冲突");
+    this.name = "PlanApprovalConflictError";
+  }
+}
+
 const createRunCommandSchema = z.object({
   question: z.string().trim().min(1),
   sourceScope: z.unknown(),
@@ -96,7 +115,7 @@ const runIdentityCommandSchema = z.object({
 const approvePlanCommandSchema = z
   .object({
     runId: z.string().trim().min(1),
-    bindingHash: z.string(),
+    bindingHash: z.string().regex(/^[a-f0-9]{64}$/),
   })
   .strict();
 
@@ -204,7 +223,11 @@ export class ResearchAgentRuntime {
   public async approvePlan(
     command: ApprovePlanCommand,
   ): Promise<RunProjection> {
-    const { runId, bindingHash } = approvePlanCommandSchema.parse(command);
+    const parsedCommand = approvePlanCommandSchema.safeParse(command);
+    if (!parsedCommand.success) {
+      throw new InvalidPlanApprovalCommandError();
+    }
+    const { runId, bindingHash } = parsedCommand.data;
     const current = this.#store.readProjection(runId);
 
     // 幂等判断必须发生在生成 Approval Receipt 或 event identity 之前；否则同一
@@ -244,11 +267,30 @@ export class ResearchAgentRuntime {
 
     // Approval 是独立用户命令，不接受模型输出、Research Tool 参数、环境变量或
     // 调用方自造 Receipt；这里使用读取时的 last sequence 保留乐观并发语义。
-    return this.#store.appendEvents(
-      runId,
-      current.lastEventSequence,
-      [event],
-    );
+    try {
+      return this.#store.appendEvents(
+        runId,
+        current.lastEventSequence,
+        [event],
+      );
+    } catch (error) {
+      if (!(error instanceof ConcurrentRunWriteError)) {
+        throw error;
+      }
+
+      const persisted = this.#store.readProjection(runId);
+      if (
+        persisted.state.type === "researching" &&
+        persisted.state.approvalReceipt.bindingHash === bindingHash
+      ) {
+        // 两个 process-like 命令都可能在竞争前消费 clock/ID，但只有赢家事件成为
+        // durable fact；输家重读同一 Receipt 即实现语义幂等。尝试态 identity 不写
+        // Journal，也不值得提前引入 Issue #10 的 durable operation 协议。
+        return persisted;
+      }
+
+      throw new PlanApprovalConflictError();
+    }
   }
 
   public async traceRun(command: TraceRunCommand): Promise<RunTrace> {
