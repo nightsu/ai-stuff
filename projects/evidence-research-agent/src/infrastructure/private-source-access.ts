@@ -386,13 +386,13 @@ function isExcluded(
 }
 
 function isSecretPath(normalizedRelativePath: string): boolean {
+  // Secret basename 统一折叠为小写后 fail closed，避免大小写不同绕过 `.env*`。
   const lowerPath = normalizedRelativePath.toLowerCase();
   const segments = lowerPath.split("/");
   const fileName = segments.at(-1) ?? "";
 
   if (
-    fileName === ".env" ||
-    fileName.startsWith(".env.") ||
+    fileName.startsWith(".env") ||
     fileName.endsWith(".pem") ||
     fileName.endsWith(".key")
   ) {

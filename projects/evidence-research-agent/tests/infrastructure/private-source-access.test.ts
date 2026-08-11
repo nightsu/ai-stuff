@@ -163,6 +163,66 @@ describe("PrivateSourceAccess", () => {
   });
 
   it.each([
+    ".envrc.md",
+    ".environment.md",
+    ".env-local.md",
+    "config/.envrc.md",
+    "config/.environment.md",
+    "config/.env-local.md",
+    "config/.ENVRC.md",
+  ])(
+    "denies the complete case-normalized .env* basename pattern for %s",
+    async (relativePath) => {
+      const fixture = await createFixture();
+      await writeFile(
+        join(fixture.approvedRoot, relativePath),
+        "TOKEN=secret\n",
+        "utf8",
+      );
+      const before = await snapshotFiles(fixture.runtimeHome);
+
+      await expect(
+        fixture.access.capture(
+          {
+            rootIndex: 0,
+            relativePath,
+            startLine: 1,
+            endLine: 1,
+          },
+          2_000,
+        ),
+      ).resolves.toEqual({ status: "denied", code: "secret_path" });
+      await expect(snapshotFiles(fixture.runtimeHome)).resolves.toEqual(before);
+    },
+  );
+
+  it("allows environment.md without the leading secret dot", async () => {
+    const fixture = await createFixture();
+    await writeFile(
+      join(fixture.approvedRoot, "environment.md"),
+      "ordinary environment documentation\n",
+      "utf8",
+    );
+
+    const captured = await fixture.access.capture(
+      {
+        rootIndex: 0,
+        relativePath: "environment.md",
+        startLine: 1,
+        endLine: 1,
+      },
+      2_000,
+    );
+
+    expect(captured).toMatchObject({
+      status: "captured",
+      relativePath: "environment.md",
+      excerpt: "ordinary environment documentation",
+    });
+    await expect(snapshotFiles(fixture.runtimeHome)).resolves.toEqual([]);
+  });
+
+  it.each([
     {
       name: "absolute path",
       path: (fixture: Fixture) => join(fixture.outsideRoot, "outside.md"),
