@@ -6,6 +6,7 @@
 node_modules/
 .pnpm-store/
 .runtime/
+.worktrees/
 dist/
 *.tmp
 *.swp
