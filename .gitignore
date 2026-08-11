@@ -1,0 +1,8 @@
+.DS_Store
+.obsidian/
+.trash/
+.env
+.env.*
+node_modules/
+*.tmp
+*.swp
