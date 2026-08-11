@@ -1,12 +1,12 @@
-# Evidence Research Agent 架构（Issue #2）
+# Evidence Research Agent 架构（Issue #3）
 
-本文只描述第一个可运行 planning slice：创建 Research Run、生成计划、追加语义事件，并持久停在 `waiting_plan_approval`。计划批准、Research Loop、Research Tool 和发布不在本 ticket 中。
+本文描述可恢复的 planning 与精确计划审批 slice：创建 Research Run、生成计划、持久化版本绑定，并由独立用户命令追加 Approval Receipt。Research Loop、Research Tool 和发布仍不在本 ticket 中。
 
 ## 组件与端口
 
 ```mermaid
 flowchart LR
-  User["用户或自动化"] --> CLI["CLI Adapter\nrun / inspect / trace"]
+  User["用户或自动化"] --> CLI["CLI Adapter\nrun / inspect / approve-plan / trace"]
 
   subgraph Application["Application"]
     Runtime["ResearchAgentRuntime\ncommand-oriented seam"]
@@ -53,14 +53,15 @@ stateDiagram-v2
   [*] --> created: run_created
   created --> planning: planning_started
   planning --> waiting_plan_approval: plan_proposed
+  waiting_plan_approval --> researching: plan_approved with exact receipt
 
-  note right of waiting_plan_approval
-    持久暂停状态
-    必须由后续 ticket 的精确计划审批命令推进
+  note right of researching
+    这里只证明 durable approval
+    Issue 4 才会读取 Source Snapshot 或执行 Research Tool
   end note
 ```
 
-`waiting_plan_approval` 不是终态。CLI 进程退出不会丢失它；新进程从同一 Runtime Home 读取缓存投影，缓存缺失时从追加式 Journal 重建。
+`waiting_plan_approval` 不是终态。CLI 进程退出不会丢失它；新进程从同一 Runtime Home 读取缓存投影，缓存缺失时从追加式 Journal 重建。`approve-plan` 只接收用户从投影原样回显的 `bindingHash`，并把 runtime 内部构造的完整 Receipt 追加为第 4 个事件；它使用空 `ScriptedModel` 打开 runtime，所以恢复和审批不会重新生成计划。重复提交同一 hash 返回已持久化投影，不会追加第二个审批事件。
 
 ## 追加与投影不变量
 

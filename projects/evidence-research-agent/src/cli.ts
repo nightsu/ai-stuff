@@ -46,6 +46,7 @@ export async function runCli(
       strict: true,
       options: {
         "allowed-extension": { type: "string", multiple: true },
+        "binding-hash": { type: "string" },
         "exclude": { type: "string", multiple: true },
         "json": { type: "boolean", default: false },
         "max-file-bytes": { type: "string" },
@@ -99,6 +100,30 @@ export async function runCli(
         });
         try {
           const projection = await runtime.inspectRun({ runId });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
+      case "approve-plan": {
+        const approvalRuntimeHome = resolve(
+          requireOption(values["runtime-home"], "--runtime-home"),
+        );
+        const runId = requireOption(values["run-id"], "--run-id");
+        const bindingHash = requireOption(
+          values["binding-hash"],
+          "--binding-hash",
+        );
+        // CLI 只承担显式用户命令边界：审批 authority 不得来自模型、Research
+        // Tool、环境变量或调用方拼装的 Receipt。空 ScriptedModel 进一步证明此命令
+        // 只恢复 durable waiting state，并不会重新采样计划。
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: approvalRuntimeHome,
+          model: new ScriptedModel([]),
+        });
+        try {
+          const projection = await runtime.approvePlan({ runId, bindingHash });
           io.stdout(formatProjection(projection, values.json));
         } finally {
           runtime.close();
@@ -188,6 +213,7 @@ function usage(): string {
     "Usage:",
     "  evidence-research-agent run --question <text> --source-root <absolute-path> [--runtime-home <path>] [--json]",
     "  evidence-research-agent inspect --run-id <id> [--runtime-home <path>] [--json]",
+    "  evidence-research-agent approve-plan --runtime-home <path> --run-id <id> --binding-hash <sha256> [--json]",
     "  evidence-research-agent trace --run-id <id> [--runtime-home <path>] [--json]",
   ].join("\n");
 }
