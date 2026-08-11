@@ -59,6 +59,30 @@ export interface RebuildRunProjectionCommand {
   readonly runId: string;
 }
 
+/** 用用户可见 binding hash 批准一个精确计划版本的应用命令。 */
+export interface ApprovePlanCommand {
+  /** 当前处于计划审批等待状态的 Research Run identity。 */
+  readonly runId: string;
+  /** 用户从等待投影提交回来的完整聚合审批摘要。 */
+  readonly bindingHash: string;
+}
+
+/** 提交的 binding 已不再对应当前等待计划时抛出的安全错误。 */
+export class StalePlanApprovalError extends Error {
+  public constructor() {
+    super("计划审批已过期或与当前等待版本不匹配");
+    this.name = "StalePlanApprovalError";
+  }
+}
+
+/** 非等待状态收到新的计划审批命令时抛出的领域错误。 */
+export class IllegalPlanApprovalStateError extends Error {
+  public constructor(state: RunProjection["state"]["type"]) {
+    super(`当前 ${state} 状态不能接受新的计划审批`);
+    this.name = "IllegalPlanApprovalStateError";
+  }
+}
+
 const createRunCommandSchema = z.object({
   question: z.string().trim().min(1),
   sourceScope: z.unknown(),
@@ -69,6 +93,13 @@ const runIdentityCommandSchema = z.object({
   runId: z.string().trim().min(1),
 });
 
+const approvePlanCommandSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+    bindingHash: z.string(),
+  })
+  .strict();
+
 const systemClock: Clock = {
   now: () => new Date().toISOString(),
 };
@@ -76,6 +107,7 @@ const systemClock: Clock = {
 const uuidGenerator: IdGenerator = {
   nextRunId: () => `run-${randomUUID()}`,
   nextEventId: () => `event-${randomUUID()}`,
+  nextApprovalId: () => `approval-${randomUUID()}`,
 };
 
 /** CLI 与未来 UI 共同依赖的 command-oriented application seam。 */
@@ -167,6 +199,56 @@ export class ResearchAgentRuntime {
   public async inspectRun(command: InspectRunCommand): Promise<RunProjection> {
     const { runId } = runIdentityCommandSchema.parse(command);
     return this.#store.readProjection(runId);
+  }
+
+  public async approvePlan(
+    command: ApprovePlanCommand,
+  ): Promise<RunProjection> {
+    const { runId, bindingHash } = approvePlanCommandSchema.parse(command);
+    const current = this.#store.readProjection(runId);
+
+    // 幂等判断必须发生在生成 Approval Receipt 或 event identity 之前；否则同一
+    // 用户命令的安全重试会消耗新 identity，并可能制造第二个授权事实。
+    if (
+      current.state.type === "researching" &&
+      current.state.approvalReceipt.bindingHash === bindingHash
+    ) {
+      return current;
+    }
+    if (current.state.type !== "waiting_plan_approval") {
+      throw new IllegalPlanApprovalStateError(current.state.type);
+    }
+
+    // stale hash 一律 fail closed；错误不回显期望值、提交值、计划内容或 Source
+    // Scope，避免把审批边界当作诊断 payload 泄露出去。
+    if (bindingHash !== current.state.approvalBinding.bindingHash) {
+      throw new StalePlanApprovalError();
+    }
+
+    const approvedAt = this.#clock.now();
+    const approvalReceipt = {
+      approvalId: this.#ids.nextApprovalId(),
+      kind: "plan",
+      approvedBy: "user-command",
+      approvedAt,
+      ...current.state.approvalBinding,
+    } as const;
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "plan_approved",
+      occurredAt: approvedAt,
+      payload: { approvalReceipt },
+    };
+
+    // Approval 是独立用户命令，不接受模型输出、Research Tool 参数、环境变量或
+    // 调用方自造 Receipt；这里使用读取时的 last sequence 保留乐观并发语义。
+    return this.#store.appendEvents(
+      runId,
+      current.lastEventSequence,
+      [event],
+    );
   }
 
   public async traceRun(command: TraceRunCommand): Promise<RunTrace> {

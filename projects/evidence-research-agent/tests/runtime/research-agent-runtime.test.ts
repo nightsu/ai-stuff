@@ -47,6 +47,9 @@ describe("ResearchAgentRuntime planning slice", () => {
       },
       ids: {
         nextRunId: () => "run-001",
+        nextApprovalId: () => {
+          throw new Error("planning slice 不得生成审批 ID");
+        },
         nextEventId: () => {
           const eventId = eventIds.shift();
           if (eventId === undefined) {
@@ -191,6 +194,9 @@ async function createCachedRun(runtimeHome: string): Promise<RunProjection> {
     clock: { now: () => "2026-08-12T08:00:00.000Z" },
     ids: {
       nextRunId: () => "run-001",
+      nextApprovalId: () => {
+        throw new Error("planning slice 不得生成审批 ID");
+      },
       nextEventId: () => {
         const eventId = eventIds.shift();
         if (eventId === undefined) {

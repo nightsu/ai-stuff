@@ -12,6 +12,8 @@ export interface IdGenerator {
   nextRunId(): string;
   /** 生成一个新的 Run Journal event identity。 */
   nextEventId(): string;
+  /** 生成一个新的 durable Approval Receipt identity。 */
+  nextApprovalId(): string;
 }
 
 /** 生成计划时提供给 Model Port 的 provider-neutral 输入。 */

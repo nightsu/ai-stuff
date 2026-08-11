@@ -5,6 +5,7 @@ import { z } from "zod";
 import { artifactReferenceHasMatchingContentIdentity } from "./integrity.js";
 import type {
   PlanApprovalBinding,
+  PlanApprovalReceipt,
   ResearchPlan,
   ResearchRunEvent,
   RunBudget,
@@ -87,6 +88,22 @@ const planApprovalBindingSchema = z
   })
   .transform((binding): PlanApprovalBinding => binding);
 
+const planApprovalReceiptSchema = z
+  .object({
+    approvalId: z.string().trim().min(1),
+    kind: z.literal("plan"),
+    approvedBy: z.literal("user-command"),
+    approvedAt: z.iso.datetime(),
+    bindingHash: sha256Schema,
+    questionHash: sha256Schema,
+    planHash: sha256Schema,
+    sourceScopeHash: sha256Schema,
+    budgetVersion: z.string().trim().min(1),
+    budgetHash: sha256Schema,
+  })
+  .strict()
+  .transform((receipt): PlanApprovalReceipt => receipt);
+
 const runStateSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("created") }),
   z.object({
@@ -98,6 +115,11 @@ const runStateSchema = z.discriminatedUnion("type", [
     planArtifact: artifactReferenceSchema,
     approvalBinding: planApprovalBindingSchema,
     proposedAt: z.iso.datetime(),
+  }),
+  z.object({
+    type: z.literal("researching"),
+    planArtifact: artifactReferenceSchema,
+    approvalReceipt: planApprovalReceiptSchema,
   }),
 ]);
 
@@ -140,6 +162,13 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     payload: z.object({
       planArtifact: artifactReferenceSchema,
       approvalBinding: planApprovalBindingSchema,
+    }),
+  }),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("plan_approved"),
+    payload: z.object({
+      approvalReceipt: planApprovalReceiptSchema,
     }),
   }),
 ]);

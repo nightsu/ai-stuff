@@ -144,6 +144,54 @@ function applyRunEvent(
         updatedAt: event.occurredAt,
       };
     }
+    case "plan_approved": {
+      if (current.state.type !== "waiting_plan_approval") {
+        throw new IllegalRunEventError(
+          "只有 waiting_plan_approval Run 可以批准计划",
+        );
+      }
+
+      const { approvalReceipt } = event.payload;
+      const expectedApprovalBinding = createPlanApprovalBinding({
+        question: current.question,
+        planHash: current.state.planArtifact.sha256,
+        sourceScope: current.sourceScope,
+        runBudget: current.runBudget,
+      });
+      // Receipt 是回放时唯一持久化的用户授权事实，因此既要重新确认等待状态的
+      // artifact/binding 不变量，也要逐字段匹配完整 Receipt；actor 或 kind 即使被
+      // 直接塞进类型化对象，也不能绕过 schema 后获得授权。
+      if (
+        !artifactReferenceHasMatchingContentIdentity(
+          current.state.planArtifact,
+        ) ||
+        !approvalBindingsEqual(
+          expectedApprovalBinding,
+          current.state.approvalBinding,
+        ) ||
+        approvalReceipt.kind !== "plan" ||
+        approvalReceipt.approvedBy !== "user-command" ||
+        approvalReceipt.approvalId.trim() === "" ||
+        approvalReceipt.approvedAt !== event.occurredAt ||
+        approvalReceipt.planHash !== current.state.planArtifact.sha256 ||
+        !approvalBindingsEqual(expectedApprovalBinding, approvalReceipt)
+      ) {
+        throw new IllegalRunEventError(
+          "plan_approved Receipt 与等待审批边界不一致",
+        );
+      }
+
+      return {
+        ...current,
+        state: {
+          type: "researching",
+          planArtifact: current.state.planArtifact,
+          approvalReceipt,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
   }
 }
 

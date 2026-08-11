@@ -44,6 +44,30 @@ export interface PlanApprovalBinding {
   readonly bindingHash: string;
 }
 
+/** 由独立用户命令签发、可随 Run Journal 精确回放的计划审批凭据。 */
+export interface PlanApprovalReceipt {
+  /** 本次审批事实的跨进程稳定 identity，不与事件 identity 混用。 */
+  readonly approvalId: string;
+  /** 审批种类；计划审批不得被解释为发布或其他授权。 */
+  readonly kind: "plan";
+  /** 唯一允许的审批主体来源，明确排除模型与 Research Tool。 */
+  readonly approvedBy: "user-command";
+  /** 用户命令被接受的 ISO 8601 UTC 时间。 */
+  readonly approvedAt: string;
+  /** 被用户提交并与当前等待状态精确匹配的聚合审批摘要。 */
+  readonly bindingHash: string;
+  /** Receipt 所授权原始技术问题的规范 JSON SHA-256 摘要。 */
+  readonly questionHash: string;
+  /** Receipt 所授权不可变计划 artifact 的内容 SHA-256 摘要。 */
+  readonly planHash: string;
+  /** Receipt 所授权完整 Source Scope 的规范 JSON SHA-256 摘要。 */
+  readonly sourceScopeHash: string;
+  /** Receipt 所授权 Run Budget 的稳定策略版本。 */
+  readonly budgetVersion: string;
+  /** Receipt 所授权完整 Run Budget 的规范 JSON SHA-256 摘要。 */
+  readonly budgetHash: string;
+}
+
 /** 研究计划中的一个有序步骤。 */
 export interface PlanStep {
   /** 在当前计划版本内稳定且唯一的步骤标识。 */
@@ -102,11 +126,22 @@ export interface WaitingPlanApprovalRunState {
   readonly proposedAt: string;
 }
 
+/** 精确计划已获用户批准、可以进入 Research Loop 的 Run 状态。 */
+export interface ResearchingRunState {
+  /** 判别字段；只允许由合法 `plan_approved` 事件产生。 */
+  readonly type: "researching";
+  /** 已获批准且继续保持内容寻址 identity 的计划 artifact。 */
+  readonly planArtifact: ArtifactReference;
+  /** 对该计划、问题、Source Scope 与预算精确版本的完整审批凭据。 */
+  readonly approvalReceipt: PlanApprovalReceipt;
+}
+
 /** 当前 planning slice 允许出现的最小 Run 状态联合。 */
 export type ResearchRunState =
   | CreatedRunState
   | PlanningRunState
-  | WaitingPlanApprovalRunState;
+  | WaitingPlanApprovalRunState
+  | ResearchingRunState;
 
 /** 从 Run Journal 确定性派生的当前 Run 视图。 */
 export interface RunProjection {
@@ -146,6 +181,12 @@ export interface PlanProposedPayload {
   readonly approvalBinding: PlanApprovalBinding;
 }
 
+/** `plan_approved` 事件携带且足以独立审计的用户审批事实。 */
+export interface PlanApprovedPayload {
+  /** 绑定全部组成摘要、审批主体、identity 与时间的完整 Receipt。 */
+  readonly approvalReceipt: PlanApprovalReceipt;
+}
+
 /** 一个有顺序、可回放的 Run Journal 语义事件。 */
 export interface RunEvent<Type extends string, Payload> {
   /** 跨重试稳定的事件 identity。 */
@@ -166,7 +207,8 @@ export interface RunEvent<Type extends string, Payload> {
 export type ResearchRunEvent =
   | RunEvent<"run_created", RunCreatedPayload>
   | RunEvent<"planning_started", Record<never, never>>
-  | RunEvent<"plan_proposed", PlanProposedPayload>;
+  | RunEvent<"plan_proposed", PlanProposedPayload>
+  | RunEvent<"plan_approved", PlanApprovedPayload>;
 
 /** 已写入 Artifact Store、等待登记到 SQLite 的元数据。 */
 export interface PersistedArtifact extends ArtifactReference {
