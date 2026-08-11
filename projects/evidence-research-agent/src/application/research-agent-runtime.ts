@@ -15,6 +15,8 @@ import {
   parseRunBudget,
 } from "../domain/schemas.js";
 import type {
+  Claim,
+  EvidenceRecord,
   ResearchRunEvent,
   PersistedSourceSnapshot,
   ReadSourceRequest,
@@ -92,6 +94,24 @@ export interface ReadSourceCommand {
   readonly runId: string;
   /** 唯一允许由调用方提供的结构化 Research Tool 参数。 */
   readonly request: ReadSourceRequest;
+}
+
+/** 从一个已持久化成功 observation 登记结构化 Evidence Record 的应用命令。 */
+export interface RecordEvidenceCommand {
+  /** 当前必须仍处于 researching 的 Research Run identity。 */
+  readonly runId: string;
+  /** 唯一允许调用方选择的成功 Source Read Observation identity。 */
+  readonly observationId: string;
+}
+
+/** 提交一个只能引用既有 Evidence Record 的最小 Claim 的应用命令。 */
+export interface RecordClaimCommand {
+  /** 当前必须仍处于 researching 的 Research Run identity。 */
+  readonly runId: string;
+  /** 不包含预渲染 citation 的简短、非空 Claim 文本。 */
+  readonly text: string;
+  /** 至少一个既有 Evidence identity，顺序是未来渲染的显式引用顺序。 */
+  readonly evidenceIds: readonly string[];
 }
 
 /** 提交的 binding 已不再对应当前等待计划时抛出的安全错误。 */
@@ -174,6 +194,62 @@ export class SourceReadPersistenceError extends Error {
   }
 }
 
+/** Evidence 命令不满足严格公开输入契约时抛出的安全错误。 */
+export class InvalidEvidenceCommandError extends Error {
+  public constructor() {
+    super("Evidence 命令格式无效");
+    this.name = "InvalidEvidenceCommandError";
+  }
+}
+
+/** 当前 Run 中不存在可登记的成功来源 observation 时抛出的安全错误。 */
+export class EvidenceObservationNotAvailableError extends Error {
+  public constructor() {
+    super("指定的来源 observation 不能登记为 Evidence");
+    this.name = "EvidenceObservationNotAvailableError";
+  }
+}
+
+/** 非 researching Run 收到 Evidence 或 Claim 命令时抛出的安全状态错误。 */
+export class IllegalEvidenceStateError extends Error {
+  public constructor() {
+    super("当前 Research Run 状态不能登记 Evidence 或 Claim");
+    this.name = "IllegalEvidenceStateError";
+  }
+}
+
+/** Claim 命令不满足严格公开输入契约时抛出的安全错误。 */
+export class InvalidClaimCommandError extends Error {
+  public constructor() {
+    super("Claim 命令格式无效");
+    this.name = "InvalidClaimCommandError";
+  }
+}
+
+/** Claim 试图引用当前 Run 中不存在的 Evidence 时抛出的安全错误。 */
+export class ClaimEvidenceNotAvailableError extends Error {
+  public constructor() {
+    super("Claim 必须引用当前 Run 中已有的 Evidence");
+    this.name = "ClaimEvidenceNotAvailableError";
+  }
+}
+
+/** Evidence/Claim 追加与另一项 Run 更新冲突时抛出的安全错误。 */
+export class EvidenceWriteConflictError extends Error {
+  public constructor() {
+    super("Evidence 或 Claim 与另一项 Run 更新发生冲突");
+    this.name = "EvidenceWriteConflictError";
+  }
+}
+
+/** Evidence/Claim 写入的内部领域或持久化错误被消毒后的公开错误。 */
+export class EvidencePersistenceError extends Error {
+  public constructor() {
+    super("Evidence 或 Claim 无法安全持久化");
+    this.name = "EvidencePersistenceError";
+  }
+}
+
 const createRunCommandSchema = z.object({
   question: z.string().trim().min(1),
   sourceScope: z.unknown(),
@@ -195,6 +271,21 @@ const readSourceCommandSchema = z
   .object({
     runId: z.string().trim().min(1),
     request: readSourceRequestSchema,
+  })
+  .strict();
+
+const recordEvidenceCommandSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+    observationId: z.string().trim().min(1),
+  })
+  .strict();
+
+const recordClaimCommandSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+    text: z.string().trim().min(1),
+    evidenceIds: z.array(z.string().trim().min(1)).min(1),
   })
   .strict();
 
@@ -512,6 +603,131 @@ export class ResearchAgentRuntime {
       // 基础设施、schema 或 reducer 诊断可能携带内部 identity；公开命令只给出
       // 稳定安全错误，不把 Runtime Home、hash、payload 或 SQLite 细节外泄。
       throw new SourceReadPersistenceError();
+    }
+  }
+
+  public async recordEvidence(
+    command: RecordEvidenceCommand,
+  ): Promise<RunProjection> {
+    const parsedCommand = recordEvidenceCommandSchema.safeParse(command);
+    if (!parsedCommand.success) {
+      throw new InvalidEvidenceCommandError();
+    }
+    const { runId, observationId } = parsedCommand.data;
+    let current: RunProjection;
+    try {
+      current = this.#store.readProjection(runId);
+    } catch {
+      throw new EvidencePersistenceError();
+    }
+    if (current.state.type !== "researching") {
+      throw new IllegalEvidenceStateError();
+    }
+    const researching = current.state;
+
+    const observation = researching.sourceReadObservations.find(
+      (candidate) => candidate.observationId === observationId,
+    );
+    if (observation?.status !== "succeeded") {
+      // 只有 Journal 已经承认、并成功绑定 Source Snapshot 的读取才能成为
+      // Evidence；调用方不能从路径、摘录或失败 observation 自造事实。
+      throw new EvidenceObservationNotAvailableError();
+    }
+    if (
+      researching.evidenceRecords.some(
+        (evidence) => evidence.observationId === observation.observationId,
+      )
+    ) {
+      throw new EvidenceObservationNotAvailableError();
+    }
+
+    const occurredAt = this.#clock.now();
+    const eventId = this.#ids.nextEventId();
+    const evidence: EvidenceRecord = {
+      // 与 event identity 一起生成可避免给注入 ID port 增加另一套可失配的计数器；
+      // event 本身仍是唯一持久化事实，Evidence ID 只是在该事实上的稳定引用。
+      evidenceId: `evidence-${eventId}`,
+      kind: "source_fact",
+      observationId: observation.observationId,
+      toolCallId: observation.toolCallId,
+      sourceSnapshotId: observation.sourceSnapshot.snapshotId,
+      rootIndex: observation.rootIndex,
+      relativePath: observation.relativePath,
+      startLine: observation.startLine,
+      endLine: observation.endLine,
+      excerptHash: observation.excerptHash,
+      recordedAt: occurredAt,
+    };
+    const event: ResearchRunEvent = {
+      eventId,
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "evidence_recorded",
+      occurredAt,
+      payload: { evidence },
+    };
+
+    try {
+      return this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+    } catch (error) {
+      if (error instanceof ConcurrentRunWriteError) {
+        throw new EvidenceWriteConflictError();
+      }
+      throw new EvidencePersistenceError();
+    }
+  }
+
+  public async recordClaim(command: RecordClaimCommand): Promise<RunProjection> {
+    const parsedCommand = recordClaimCommandSchema.safeParse(command);
+    if (!parsedCommand.success) {
+      throw new InvalidClaimCommandError();
+    }
+    const { runId, text, evidenceIds } = parsedCommand.data;
+    let current: RunProjection;
+    try {
+      current = this.#store.readProjection(runId);
+    } catch {
+      throw new EvidencePersistenceError();
+    }
+    if (current.state.type !== "researching") {
+      throw new IllegalEvidenceStateError();
+    }
+    const researching = current.state;
+    if (
+      new Set(evidenceIds).size !== evidenceIds.length ||
+      !evidenceIds.every((evidenceId) =>
+        researching.evidenceRecords.some(
+          (evidence) => evidence.evidenceId === evidenceId,
+        ),
+      )
+    ) {
+      throw new ClaimEvidenceNotAvailableError();
+    }
+
+    const occurredAt = this.#clock.now();
+    const eventId = this.#ids.nextEventId();
+    const claim: Claim = {
+      claimId: `claim-${eventId}`,
+      text,
+      evidenceIds,
+      recordedAt: occurredAt,
+    };
+    const event: ResearchRunEvent = {
+      eventId,
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "claim_recorded",
+      occurredAt,
+      payload: { claim },
+    };
+
+    try {
+      return this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+    } catch (error) {
+      if (error instanceof ConcurrentRunWriteError) {
+        throw new EvidenceWriteConflictError();
+      }
+      throw new EvidencePersistenceError();
     }
   }
 

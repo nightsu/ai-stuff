@@ -7,6 +7,8 @@ import {
   sourceSnapshotHasMatchingContentIdentity,
 } from "./integrity.js";
 import type {
+  Claim,
+  EvidenceRecord,
   PlanApprovalBinding,
   PlanApprovalReceipt,
   ReadSourceRequest,
@@ -208,6 +210,33 @@ export const sourceReadObservationSchema = z
   ])
   .transform((observation): SourceReadObservation => observation);
 
+const evidenceRecordSchema = z
+  .object({
+    evidenceId: z.string().trim().min(1),
+    kind: z.literal("source_fact"),
+    observationId: z.string().trim().min(1),
+    toolCallId: z.string().trim().min(1),
+    sourceSnapshotId: z.string().regex(/^source-sha256:[a-f0-9]{64}$/),
+    rootIndex: z.number().int().nonnegative(),
+    relativePath: z.string().min(1),
+    startLine: z.number().int().positive(),
+    endLine: z.number().int().positive(),
+    excerptHash: sha256Schema,
+    recordedAt: z.iso.datetime(),
+  })
+  .strict()
+  .transform((evidence): EvidenceRecord => evidence);
+
+const claimSchema = z
+  .object({
+    claimId: z.string().trim().min(1),
+    text: z.string().trim().min(1),
+    evidenceIds: z.array(z.string().trim().min(1)).min(1),
+    recordedAt: z.iso.datetime(),
+  })
+  .strict()
+  .transform((claim): Claim => claim);
+
 const planApprovalBindingSchema = z
   .object({
     questionHash: sha256Schema,
@@ -253,6 +282,8 @@ const runStateSchema = z.discriminatedUnion("type", [
     approvalReceipt: planApprovalReceiptSchema,
     sourceReadObservations: z.array(sourceReadObservationSchema),
     sourceBytesRead: z.number().int().nonnegative(),
+    evidenceRecords: z.array(evidenceRecordSchema),
+    claims: z.array(claimSchema),
   }),
 ]);
 
@@ -311,6 +342,28 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
       payload: z
         .object({
           observation: sourceReadObservationSchema,
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...eventEnvelopeSchema,
+      type: z.literal("evidence_recorded"),
+      payload: z
+        .object({
+          evidence: evidenceRecordSchema,
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...eventEnvelopeSchema,
+      type: z.literal("claim_recorded"),
+      payload: z
+        .object({
+          claim: claimSchema,
         })
         .strict(),
     })

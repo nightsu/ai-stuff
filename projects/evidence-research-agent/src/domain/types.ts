@@ -200,6 +200,10 @@ export interface ResearchingRunState {
   readonly sourceReadObservations: readonly SourceReadObservation[];
   /** 仅由成功 observation 的完整快照字节数确定性求和得到的累计值。 */
   readonly sourceBytesRead: number;
+  /** 按 Journal 顺序记录、且逐项绑定成功来源 observation 的可审计来源事实。 */
+  readonly evidenceRecords: readonly EvidenceRecord[];
+  /** 按 Journal 顺序记录、并只能引用已有 Evidence Record 的待发布主张。 */
+  readonly claims: readonly Claim[];
 }
 
 /** 当前 planning slice 允许出现的最小 Run 状态联合。 */
@@ -259,6 +263,56 @@ export interface SourceReadObservedPayload {
   readonly observation: SourceReadObservation;
 }
 
+/** 一个从成功来源读取事实派生、不可由模型伪造的最小 Evidence Record。 */
+export interface EvidenceRecord {
+  /** 由 Runtime 从本次 Journal event identity 派生的稳定 Evidence identity。 */
+  readonly evidenceId: string;
+  /** 当前切片仅允许把明确来源读取登记为可引用的 source fact。 */
+  readonly kind: "source_fact";
+  /** 该 Evidence 唯一绑定的成功 Source Read Observation identity。 */
+  readonly observationId: string;
+  /** Observation 内部生成的 Research Tool call identity，用于 Trace lineage。 */
+  readonly toolCallId: string;
+  /** Observation 冻结的完整私有 Source Snapshot identity。 */
+  readonly sourceSnapshotId: string;
+  /** Observation 实际命中的已批准 Source Root 零基索引。 */
+  readonly rootIndex: number;
+  /** Observation 的规范相对 POSIX 路径，不保存绝对来源路径。 */
+  readonly relativePath: string;
+  /** Evidence 绑定摘录的 1-based inclusive 首行。 */
+  readonly startLine: number;
+  /** Evidence 绑定摘录的 1-based inclusive 末行。 */
+  readonly endLine: number;
+  /** Evidence 绑定摘录原始 UTF-8 字节的 SHA-256 摘要。 */
+  readonly excerptHash: string;
+  /** Evidence 成为 Run Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly recordedAt: string;
+}
+
+/** 一个只能通过已有 Evidence Record 证明的最小可发布主张。 */
+export interface Claim {
+  /** 由 Runtime 从本次 Journal event identity 派生的稳定 Claim identity。 */
+  readonly claimId: string;
+  /** 面向 Learning Artifact 的简短主张文本，不能包含渲染后的 citation 字符串。 */
+  readonly text: string;
+  /** 去重且按调用方明确顺序保存的 Evidence identities。 */
+  readonly evidenceIds: readonly string[];
+  /** Claim 成为 Run Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly recordedAt: string;
+}
+
+/** `evidence_recorded` 事件携带的、已从成功 observation 派生的 Evidence 事实。 */
+export interface EvidenceRecordedPayload {
+  /** 只能由 Runtime 从 canonical Projection 生成的完整 Evidence Record。 */
+  readonly evidence: EvidenceRecord;
+}
+
+/** `claim_recorded` 事件携带的、仅引用既有 Evidence 的 Claim 事实。 */
+export interface ClaimRecordedPayload {
+  /** 待后续 Evidence Gate 审核的完整 Claim。 */
+  readonly claim: Claim;
+}
+
 /** 一个有顺序、可回放的 Run Journal 语义事件。 */
 export interface RunEvent<Type extends string, Payload> {
   /** 跨重试稳定的事件 identity。 */
@@ -281,7 +335,9 @@ export type ResearchRunEvent =
   | RunEvent<"planning_started", Record<never, never>>
   | RunEvent<"plan_proposed", PlanProposedPayload>
   | RunEvent<"plan_approved", PlanApprovedPayload>
-  | RunEvent<"source_read_observed", SourceReadObservedPayload>;
+  | RunEvent<"source_read_observed", SourceReadObservedPayload>
+  | RunEvent<"evidence_recorded", EvidenceRecordedPayload>
+  | RunEvent<"claim_recorded", ClaimRecordedPayload>;
 
 /** 已写入 Artifact Store、等待登记到 SQLite 的元数据。 */
 export interface PersistedArtifact extends ArtifactReference {
@@ -388,6 +444,10 @@ export interface RunTraceEvent {
   readonly observationStatus?: SourceReadObservation["status"];
   /** 仅成功来源读取暴露的私有 Source Snapshot identity。 */
   readonly sourceSnapshotId?: string;
+  /** 仅 `evidence_recorded` 暴露的结构化 Evidence identity。 */
+  readonly evidenceId?: string;
+  /** 仅 `claim_recorded` 暴露的结构化 Claim identity。 */
+  readonly claimId?: string;
 }
 
 /** 面向人或机器读取、但不作为 canonical history 的 Run Trace。 */

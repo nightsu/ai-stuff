@@ -10,6 +10,8 @@ import {
   sourceRequestDenial,
 } from "./source-policy.js";
 import type {
+  Claim,
+  EvidenceRecord,
   PlanApprovalBinding,
   ResearchRunEvent,
   RunProjection,
@@ -68,19 +70,7 @@ export function buildRunTrace(events: readonly ResearchRunEvent[]): RunTrace {
 
   for (const event of events) {
     projection = applyRunEvent(projection, event);
-    const lineage =
-      event.type === "source_read_observed"
-        ? {
-            toolCallId: event.payload.observation.toolCallId,
-            observationStatus: event.payload.observation.status,
-            ...(event.payload.observation.status === "succeeded"
-              ? {
-                  sourceSnapshotId:
-                    event.payload.observation.sourceSnapshot.snapshotId,
-                }
-              : {}),
-          }
-        : {};
+    const lineage = traceLineage(event);
     traceEvents.push({
       sequence: event.sequence,
       eventId: event.eventId,
@@ -237,6 +227,8 @@ function applyRunEvent(
           approvalReceipt,
           sourceReadObservations: [],
           sourceBytesRead: 0,
+          evidenceRecords: [],
+          claims: [],
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -289,7 +281,83 @@ function applyRunEvent(
         updatedAt: event.occurredAt,
       };
     }
+    case "evidence_recorded": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError(
+          "只有 researching Run 可以登记 Evidence Record",
+        );
+      }
+      validateEvidenceRecord(
+        current.state.sourceReadObservations,
+        current.state.evidenceRecords,
+        event.payload.evidence,
+        event.occurredAt,
+      );
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          evidenceRecords: [
+            ...current.state.evidenceRecords,
+            event.payload.evidence,
+          ],
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "claim_recorded": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError("只有 researching Run 可以登记 Claim");
+      }
+      validateClaim(
+        current.state.evidenceRecords,
+        current.state.claims,
+        event.payload.claim,
+        event.occurredAt,
+      );
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          claims: [...current.state.claims, event.payload.claim],
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
   }
+}
+
+function traceLineage(
+  event: ResearchRunEvent,
+): Pick<
+  RunTraceEvent,
+  | "toolCallId"
+  | "observationStatus"
+  | "sourceSnapshotId"
+  | "evidenceId"
+  | "claimId"
+> {
+  if (event.type === "source_read_observed") {
+    return {
+      toolCallId: event.payload.observation.toolCallId,
+      observationStatus: event.payload.observation.status,
+      ...(event.payload.observation.status === "succeeded"
+        ? {
+            sourceSnapshotId:
+              event.payload.observation.sourceSnapshot.snapshotId,
+          }
+        : {}),
+    };
+  }
+  if (event.type === "evidence_recorded") {
+    return { evidenceId: event.payload.evidence.evidenceId };
+  }
+  if (event.type === "claim_recorded") {
+    return { claimId: event.payload.claim.claimId };
+  }
+  return {};
 }
 
 function validateSourceReadObservation(
@@ -371,6 +439,81 @@ function validateSourceReadObservation(
       !stableSourceFailureCodes.has(observation.code))
   ) {
     throw new IllegalRunEventError("非成功来源读取 observation 形状无效");
+  }
+}
+
+function validateEvidenceRecord(
+  observations: readonly SourceReadObservation[],
+  evidenceRecords: readonly EvidenceRecord[],
+  evidence: EvidenceRecord,
+  occurredAt: string,
+): void {
+  if (
+    !hasExactKeys(evidence, [
+      "evidenceId",
+      "kind",
+      "observationId",
+      "toolCallId",
+      "sourceSnapshotId",
+      "rootIndex",
+      "relativePath",
+      "startLine",
+      "endLine",
+      "excerptHash",
+      "recordedAt",
+    ]) ||
+    evidence.kind !== "source_fact" ||
+    evidence.evidenceId.trim() === "" ||
+    evidence.recordedAt !== occurredAt ||
+    !isIsoUtc(evidence.recordedAt) ||
+    evidenceRecords.some((prior) => prior.evidenceId === evidence.evidenceId) ||
+    evidenceRecords.some(
+      (prior) => prior.observationId === evidence.observationId,
+    )
+  ) {
+    throw new IllegalRunEventError("Evidence Record 公共字段无效");
+  }
+
+  const observation = observations.find(
+    (candidate) => candidate.observationId === evidence.observationId,
+  );
+  if (
+    observation?.status !== "succeeded" ||
+    evidence.toolCallId !== observation.toolCallId ||
+    evidence.sourceSnapshotId !== observation.sourceSnapshot.snapshotId ||
+    evidence.rootIndex !== observation.rootIndex ||
+    evidence.relativePath !== observation.relativePath ||
+    evidence.startLine !== observation.startLine ||
+    evidence.endLine !== observation.endLine ||
+    evidence.excerptHash !== observation.excerptHash
+  ) {
+    // Evidence 不重复摘录正文；它把能由成功 observation 重算的 identity/range/hash
+    // 冻结成引用边界，回放时必须逐字段回指，不能接受模型或调用方拼出的近似引用。
+    throw new IllegalRunEventError("Evidence Record 未精确绑定成功来源 observation");
+  }
+}
+
+function validateClaim(
+  evidenceRecords: readonly EvidenceRecord[],
+  claims: readonly Claim[],
+  claim: Claim,
+  occurredAt: string,
+): void {
+  if (
+    !hasExactKeys(claim, ["claimId", "text", "evidenceIds", "recordedAt"]) ||
+    claim.claimId.trim() === "" ||
+    claim.text.trim() === "" ||
+    claim.recordedAt !== occurredAt ||
+    !isIsoUtc(claim.recordedAt) ||
+    claim.evidenceIds.length === 0 ||
+    !claim.evidenceIds.every((evidenceId) => evidenceId.trim() !== "") ||
+    new Set(claim.evidenceIds).size !== claim.evidenceIds.length ||
+    claims.some((prior) => prior.claimId === claim.claimId) ||
+    !claim.evidenceIds.every((evidenceId) =>
+      evidenceRecords.some((evidence) => evidence.evidenceId === evidenceId),
+    )
+  ) {
+    throw new IllegalRunEventError("Claim 必须精确引用已有 Evidence Record");
   }
 }
 
