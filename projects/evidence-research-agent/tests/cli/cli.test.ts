@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 
 import { runCli } from "../../src/cli.js";
+import type { RunProjection } from "../../src/index.js";
 
 const runtimeHomes: string[] = [];
 
@@ -41,16 +42,27 @@ it("creates, inspects, and traces one Run through the thin CLI adapter", async (
       io,
     ),
   ).toBe(0);
-  const created = JSON.parse(output.pop() ?? "null") as {
-    /** CLI 返回的稳定 Research Run identity。 */
-    runId: string;
-    /** CLI 返回的当前派生状态。 */
-    state: {
-      /** 状态机判别字段。 */
-      type: string;
-    };
-  };
+  const created = JSON.parse(output.pop() ?? "null") as RunProjection;
   expect(created.state.type).toBe("waiting_plan_approval");
+  expect(created.runBudget).toEqual({
+    version: "budget-v1",
+    maxModelTurns: 12,
+    maxToolCalls: 40,
+    maxDistinctSources: 24,
+    maxSourceBytes: 5_000_000,
+    maxWallTimeMs: 300_000,
+  });
+  if (created.state.type !== "waiting_plan_approval") {
+    throw new Error("测试要求 CLI 创建等待计划审批的 Run");
+  }
+  expect(created.state.approvalBinding).toMatchObject({
+    questionHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    planHash: created.state.planArtifact.sha256,
+    sourceScopeHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    budgetVersion: "budget-v1",
+    budgetHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    bindingHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+  });
 
   expect(
     await runCli(

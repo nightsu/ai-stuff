@@ -3,9 +3,11 @@ import { resolve } from "node:path";
 
 import { z } from "zod";
 
+import { createPlanApprovalBinding } from "../domain/integrity.js";
 import { buildRunTrace } from "../domain/reducer.js";
 import {
   parseResearchPlan,
+  parseRunBudget,
   parseSourceScope,
 } from "../domain/schemas.js";
 import type {
@@ -35,6 +37,8 @@ export interface CreateRunCommand {
   readonly question: string;
   /** 本次 Run 冻结记录的 Source Scope。 */
   readonly sourceScope: unknown;
+  /** 本次 Run 冻结记录且不可由模型修改的版本化 Run Budget。 */
+  readonly runBudget: unknown;
 }
 
 /** 通过 identity 读取当前 Run Projection 的应用命令。 */
@@ -58,6 +62,7 @@ export interface RebuildRunProjectionCommand {
 const createRunCommandSchema = z.object({
   question: z.string().trim().min(1),
   sourceScope: z.unknown(),
+  runBudget: z.unknown(),
 });
 
 const runIdentityCommandSchema = z.object({
@@ -102,6 +107,7 @@ export class ResearchAgentRuntime {
   public async createRun(command: CreateRunCommand): Promise<RunProjection> {
     const parsed = createRunCommandSchema.parse(command);
     const sourceScope = parseSourceScope(parsed.sourceScope);
+    const runBudget = parseRunBudget(parsed.runBudget);
     const runId = this.#ids.nextRunId();
     const createdAt = this.#clock.now();
 
@@ -112,7 +118,7 @@ export class ResearchAgentRuntime {
         sequence: 1,
         type: "run_created",
         occurredAt: createdAt,
-        payload: { question: parsed.question, sourceScope },
+        payload: { question: parsed.question, sourceScope, runBudget },
       },
       {
         eventId: this.#ids.nextEventId(),
@@ -140,13 +146,19 @@ export class ResearchAgentRuntime {
       "application/json",
       proposedAt,
     );
+    const approvalBinding = createPlanApprovalBinding({
+      question: parsed.question,
+      planHash: artifact.sha256,
+      sourceScope,
+      runBudget,
+    });
     const planProposed: ResearchRunEvent = {
       eventId: this.#ids.nextEventId(),
       runId,
       sequence: 3,
       type: "plan_proposed",
       occurredAt: proposedAt,
-      payload: { planArtifact: artifact },
+      payload: { planArtifact: artifact, approvalBinding },
     };
 
     return this.#store.appendEvents(runId, 2, [planProposed], [artifact]);

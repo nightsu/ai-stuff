@@ -12,6 +12,38 @@ export interface SourceScope {
   readonly maxTotalBytes: number;
 }
 
+/** 一个 Research Run 经用户批准后不可由模型抬高的多维限制。 */
+export interface RunBudget {
+  /** 预算策略的非空稳定版本，变更任一限制时必须产生新版本。 */
+  readonly version: string;
+  /** Research Loop 允许完成的最大 Model Turn 数。 */
+  readonly maxModelTurns: number;
+  /** Research Loop 允许提交的最大 Research Tool 调用数。 */
+  readonly maxToolCalls: number;
+  /** 一个 Run 允许纳入证据的最大不同 Source Snapshot 数。 */
+  readonly maxDistinctSources: number;
+  /** 一个 Run 允许读取并计入预算的累计源内容字节数。 */
+  readonly maxSourceBytes: number;
+  /** 一个 Run 从开始到预算暂停允许消耗的最大墙钟时间，单位为毫秒。 */
+  readonly maxWallTimeMs: number;
+}
+
+/** 用户批准计划时必须逐字段匹配的内容寻址边界。 */
+export interface PlanApprovalBinding {
+  /** 规范 JSON 编码后的精确技术问题 SHA-256 摘要。 */
+  readonly questionHash: string;
+  /** 已持久化计划 artifact 精确字节内容的 SHA-256 摘要。 */
+  readonly planHash: string;
+  /** 规范 JSON 编码后的完整 Source Scope SHA-256 摘要。 */
+  readonly sourceScopeHash: string;
+  /** 绑定时 Run Budget 的稳定策略版本。 */
+  readonly budgetVersion: string;
+  /** 规范 JSON 编码后的完整 Run Budget SHA-256 摘要。 */
+  readonly budgetHash: string;
+  /** 对前述五个组成字段再次规范哈希得到的聚合审批摘要。 */
+  readonly bindingHash: string;
+}
+
 /** 研究计划中的一个有序步骤。 */
 export interface PlanStep {
   /** 在当前计划版本内稳定且唯一的步骤标识。 */
@@ -64,11 +96,13 @@ export interface WaitingPlanApprovalRunState {
   readonly type: "waiting_plan_approval";
   /** 被提交给用户审批的不可变计划 artifact。 */
   readonly planArtifact: ArtifactReference;
+  /** 把计划与原始问题、Source Scope 和预算精确版本绑定的摘要集合。 */
+  readonly approvalBinding: PlanApprovalBinding;
   /** 计划被正式写入 Run Journal 的时间，ISO 8601 UTC 字符串。 */
   readonly proposedAt: string;
 }
 
-/** Issue #2 允许出现的最小 Run 状态联合。 */
+/** 当前 planning slice 允许出现的最小 Run 状态联合。 */
 export type ResearchRunState =
   | CreatedRunState
   | PlanningRunState
@@ -82,6 +116,8 @@ export interface RunProjection {
   readonly question: string;
   /** 创建 Run 时冻结的 Source Scope 值。 */
   readonly sourceScope: SourceScope;
+  /** 创建 Run 时冻结且只能通过新批准版本改变的 Run Budget。 */
+  readonly runBudget: RunBudget;
   /** 当前合法状态；不得由独立布尔标记拼装。 */
   readonly state: ResearchRunState;
   /** 已应用的最后一个连续事件序号，从 1 开始。 */
@@ -98,12 +134,16 @@ export interface RunCreatedPayload {
   readonly question: string;
   /** 创建时冻结的 Source Scope，后续扩权必须产生新版本。 */
   readonly sourceScope: SourceScope;
+  /** 创建时冻结的多维预算；模型输出不得选择或提高这些限制。 */
+  readonly runBudget: RunBudget;
 }
 
 /** `plan_proposed` 事件携带的计划事实。 */
 export interface PlanProposedPayload {
   /** 已先持久化并可按摘要验证的计划 artifact 引用。 */
   readonly planArtifact: ArtifactReference;
+  /** 该计划进入等待审批状态时计算并持久化的精确边界。 */
+  readonly approvalBinding: PlanApprovalBinding;
 }
 
 /** 一个有顺序、可回放的 Run Journal 语义事件。 */
@@ -122,7 +162,7 @@ export interface RunEvent<Type extends string, Payload> {
   readonly payload: Payload;
 }
 
-/** Issue #2 的完整 Run Journal 事件联合。 */
+/** 当前 planning slice 的完整 Run Journal 事件联合。 */
 export type ResearchRunEvent =
   | RunEvent<"run_created", RunCreatedPayload>
   | RunEvent<"planning_started", Record<never, never>>

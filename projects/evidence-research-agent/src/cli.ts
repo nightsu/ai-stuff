@@ -7,7 +7,11 @@ import { resolve } from "node:path";
 import { ScriptedModel } from "./adapters/scripted-model.js";
 import { ResearchAgentRuntime } from "./application/research-agent-runtime.js";
 import { formatRunTrace } from "./application/trace-format.js";
-import type { ResearchPlan, RunProjection } from "./domain/types.js";
+import type {
+  ResearchPlan,
+  RunBudget,
+  RunProjection,
+} from "./domain/types.js";
 
 /** 让 CLI 测试可以捕获输出而不替换全局 console。 */
 export interface CliIo {
@@ -21,6 +25,15 @@ const processIo: CliIo = {
   stdout: (message) => console.log(message),
   stderr: (message) => console.error(message),
 };
+
+const DEFAULT_RUN_BUDGET: RunBudget = Object.freeze({
+  version: "budget-v1",
+  maxModelTurns: 12,
+  maxToolCalls: 40,
+  maxDistinctSources: 24,
+  maxSourceBytes: 5_000_000,
+  maxWallTimeMs: 300_000,
+});
 
 export async function runCli(
   args: readonly string[],
@@ -70,6 +83,7 @@ export async function runCli(
                 "--max-total-bytes",
               ),
             },
+            runBudget: DEFAULT_RUN_BUDGET,
           });
           io.stdout(formatProjection(projection, values.json));
         } finally {

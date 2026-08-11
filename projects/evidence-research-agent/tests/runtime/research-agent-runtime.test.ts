@@ -55,6 +55,14 @@ describe("ResearchAgentRuntime planning slice", () => {
       },
     });
 
+    const runBudget = {
+      version: "budget-v1",
+      maxModelTurns: 8,
+      maxToolCalls: 24,
+      maxDistinctSources: 12,
+      maxSourceBytes: 2_000_000,
+      maxWallTimeMs: 300_000,
+    } as const;
     const created = await runtime.createRun({
       question: "追加式 Run Journal 如何驱动派生状态投影？",
       sourceScope: {
@@ -64,10 +72,29 @@ describe("ResearchAgentRuntime planning slice", () => {
         maxFileBytes: 256_000,
         maxTotalBytes: 2_000_000,
       },
+      runBudget,
     });
 
     expect(created.runId).toBe("run-001");
+    expect(created.runBudget).toEqual(runBudget);
     expect(created.state.type).toBe("waiting_plan_approval");
+    if (created.state.type !== "waiting_plan_approval") {
+      throw new Error("测试要求 Run 等待计划审批");
+    }
+    expect(created.state.approvalBinding.questionHash).toMatch(
+      /^[a-f0-9]{64}$/,
+    );
+    expect(created.state.approvalBinding.planHash).toBe(
+      created.state.planArtifact.sha256,
+    );
+    expect(created.state.approvalBinding.sourceScopeHash).toMatch(
+      /^[a-f0-9]{64}$/,
+    );
+    expect(created.state.approvalBinding.budgetVersion).toBe("budget-v1");
+    expect(created.state.approvalBinding.budgetHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(created.state.approvalBinding.bindingHash).toMatch(
+      /^[a-f0-9]{64}$/,
+    );
     expect(created.lastEventSequence).toBe(3);
     runtime.close();
 

@@ -3,8 +3,10 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 
 import type {
+  PlanApprovalBinding,
   ResearchPlan,
   ResearchRunEvent,
+  RunBudget,
   RunProjection,
   SourceScope,
 } from "./types.js";
@@ -19,6 +21,15 @@ export const sourceScopeSchema = z.object({
     .min(1),
   maxFileBytes: z.number().int().positive(),
   maxTotalBytes: z.number().int().positive(),
+});
+
+export const runBudgetSchema = z.object({
+  version: z.string().trim().min(1),
+  maxModelTurns: z.number().int().positive(),
+  maxToolCalls: z.number().int().positive(),
+  maxDistinctSources: z.number().int().positive(),
+  maxSourceBytes: z.number().int().positive(),
+  maxWallTimeMs: z.number().int().positive(),
 });
 
 export const researchPlanSchema = z.object({
@@ -46,6 +57,23 @@ const sourceScopeValueSchema = sourceScopeSchema.transform(
   (scope): SourceScope => scope,
 );
 
+const runBudgetValueSchema = runBudgetSchema.transform(
+  (budget): RunBudget => budget,
+);
+
+const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+
+const planApprovalBindingSchema = z
+  .object({
+    questionHash: sha256Schema,
+    planHash: sha256Schema,
+    sourceScopeHash: sha256Schema,
+    budgetVersion: z.string().trim().min(1),
+    budgetHash: sha256Schema,
+    bindingHash: sha256Schema,
+  })
+  .transform((binding): PlanApprovalBinding => binding);
+
 const runStateSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("created") }),
   z.object({
@@ -55,6 +83,7 @@ const runStateSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("waiting_plan_approval"),
     planArtifact: artifactReferenceSchema,
+    approvalBinding: planApprovalBindingSchema,
     proposedAt: z.iso.datetime(),
   }),
 ]);
@@ -63,6 +92,7 @@ const runProjectionSchema = z.object({
   runId: z.string().min(1),
   question: z.string().min(1),
   sourceScope: sourceScopeValueSchema,
+  runBudget: runBudgetValueSchema,
   state: runStateSchema,
   lastEventSequence: z.number().int().positive(),
   createdAt: z.iso.datetime(),
@@ -83,6 +113,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     payload: z.object({
       question: z.string().trim().min(1),
       sourceScope: sourceScopeValueSchema,
+      runBudget: runBudgetValueSchema,
     }),
   }),
   z.object({
@@ -93,7 +124,10 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
   z.object({
     ...eventEnvelopeSchema,
     type: z.literal("plan_proposed"),
-    payload: z.object({ planArtifact: artifactReferenceSchema }),
+    payload: z.object({
+      planArtifact: artifactReferenceSchema,
+      approvalBinding: planApprovalBindingSchema,
+    }),
   }),
 ]);
 
@@ -103,6 +137,10 @@ export function parseSourceScope(input: unknown): SourceScope {
 
 export function parseResearchPlan(input: unknown): ResearchPlan {
   return researchPlanSchema.parse(input);
+}
+
+export function parseRunBudget(input: unknown): RunBudget {
+  return runBudgetSchema.parse(input);
 }
 
 export function parseResearchRunEvent(input: unknown): ResearchRunEvent {

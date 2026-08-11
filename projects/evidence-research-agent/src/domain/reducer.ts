@@ -64,6 +64,7 @@ function applyRunEvent(
       runId: event.runId,
       question: event.payload.question,
       sourceScope: event.payload.sourceScope,
+      runBudget: event.payload.runBudget,
       state: { type: "created" },
       lastEventSequence: event.sequence,
       createdAt: event.occurredAt,
@@ -101,6 +102,7 @@ function applyRunEvent(
         state: {
           type: "waiting_plan_approval",
           planArtifact: event.payload.planArtifact,
+          approvalBinding: event.payload.approvalBinding,
           proposedAt: event.occurredAt,
         },
         lastEventSequence: event.sequence,

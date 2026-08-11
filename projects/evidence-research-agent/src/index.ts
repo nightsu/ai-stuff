@@ -2,6 +2,10 @@ export { ScriptedModel, ScriptedModelExhaustedError } from "./adapters/scripted-
 export { ResearchAgentRuntime } from "./application/research-agent-runtime.js";
 export { formatRunTrace } from "./application/trace-format.js";
 export { runCli } from "./cli.js";
+export {
+  createPlanApprovalBinding,
+  hashCanonicalJson,
+} from "./domain/integrity.js";
 export type { Clock, IdGenerator, ModelPort, PlanRequest } from "./application/ports.js";
 export type {
   CreateRunCommand,
@@ -12,9 +16,11 @@ export type {
 } from "./application/research-agent-runtime.js";
 export type {
   ArtifactReference,
+  PlanApprovalBinding,
   ResearchPlan,
   ResearchRunEvent,
   ResearchRunState,
+  RunBudget,
   RunProjection,
   RunTrace,
   RunTraceEvent,
