@@ -1,0 +1,35 @@
+{
+  "name": "@agent-learning/evidence-research-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A teaching-first, traceable Evidence Research Agent runtime.",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "evidence-research-agent": "./dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "pnpm typecheck && pnpm test && pnpm docs:check",
+    "docs:check": "vitest run tests/documentation",
+    "start": "node dist/src/cli.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "24.13.3",
+    "jsdom": "30.0.1",
+    "mermaid": "11.16.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  },
+  "packageManager": "pnpm@11.9.0"
+}
