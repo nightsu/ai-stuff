@@ -1,0 +1,3 @@
+# Freeze the MVP as a local-text single Agent
+
+The MVP is a local, text-only Evidence Research Agent that completes the approved plan, evidence, recovery, evaluation, trace, and publication path without web retrieval, non-text parsing, embeddings, long-term memory, multi-agent orchestration, browser or shell execution, arbitrary writes, rich UI, server deployment, schedulers, plugins, Git publication, or external effects beyond the approved local artifact write. Web sources, a trace viewer, and model-generated Context Digests remain separate post-MVP extensions so learning coverage does not become unbounded product scope.

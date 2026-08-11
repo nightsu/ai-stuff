@@ -1,0 +1,5 @@
+# Use a minimal Node and TypeScript stack
+
+The project targets Node.js 24 or newer with strict ESM TypeScript and pnpm, using Vercel AI SDK only through the Model Port, Zod at untrusted boundaries, `better-sqlite3` with handwritten SQL, Vitest, Node's built-in argument parser, and fixed-argument `rg` execution. It deliberately avoids an ORM, dependency-injection framework, CLI framework, and bundler so persistence, transactions, ports, and runtime control flow remain visible; CI targets Node 24 LTS even when local development uses a newer supported Node.
+
+This chooses a mature SQLite adapter while Node's built-in [`node:sqlite`](https://nodejs.org/api/sqlite.html) remains release-candidate stability, and follows the current [Node release guidance](https://nodejs.org/en/about/previous-releases), [`better-sqlite3` transaction API](https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md), [Zod package guidance](https://zod.dev/packages/zod), and [Vitest features](https://vitest.dev/guide/features).
