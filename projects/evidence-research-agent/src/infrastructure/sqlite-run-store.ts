@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
@@ -49,7 +49,8 @@ export class SqliteRunStore {
   readonly #database: Database.Database;
 
   public constructor(runtimeHome: string) {
-    mkdirSync(runtimeHome, { recursive: true });
+    mkdirSync(runtimeHome, { recursive: true, mode: 0o700 });
+    chmodSync(runtimeHome, 0o700);
     this.#database = new Database(join(runtimeHome, "runtime.sqlite"));
     this.#database.pragma("foreign_keys = ON");
     this.#database.pragma("journal_mode = WAL");

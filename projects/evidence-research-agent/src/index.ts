@@ -30,11 +30,13 @@ export type {
   ResearchRunEvent,
   ResearchRunState,
   ResearchingRunState,
+  PersistedSourceSnapshot,
   RunBudget,
   RunProjection,
   RunTrace,
   RunTraceEvent,
   RequestedSourceScope,
   SourceRootIdentity,
+  SourceSnapshotReference,
   SourceScope,
 } from "./domain/types.js";

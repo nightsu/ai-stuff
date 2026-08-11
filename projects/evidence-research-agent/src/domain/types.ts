@@ -240,6 +240,26 @@ export interface PersistedArtifact extends ArtifactReference {
   readonly createdAt: string;
 }
 
+/** 私有 Source Snapshot namespace 中不可变源字节的专用引用。 */
+export interface SourceSnapshotReference {
+  /** 与通用 artifact identity 隔离的 `source-sha256:<hex>` identity。 */
+  readonly snapshotId: string;
+  /** 完整源文件精确字节的 64 位小写十六进制 SHA-256 摘要。 */
+  readonly sha256: string;
+  /** 固定的 UTF-8 文本媒体类型，不接受调用方覆盖。 */
+  readonly mediaType: "text/plain; charset=utf-8";
+  /** 完整源文件的精确字节数，单位为 byte。 */
+  readonly byteLength: number;
+  /** 相对于 canonical Runtime Home 的私有 snapshot 路径。 */
+  readonly relativePath: string;
+}
+
+/** 已原子发布到私有 namespace、等待 Task 2 独立登记的 Source Snapshot。 */
+export interface PersistedSourceSnapshot extends SourceSnapshotReference {
+  /** snapshot 显式 capture 操作的 ISO 8601 UTC 时间。 */
+  readonly createdAt: string;
+}
+
 /** Run Trace 中单个事件及其应用后的可解释状态。 */
 export interface RunTraceEvent {
   /** 原始 Run Journal 事件的连续序号。 */

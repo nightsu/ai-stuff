@@ -4,12 +4,14 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   symlink,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -84,7 +86,7 @@ describe("PrivateSourceAccess", () => {
       createdAt,
     );
     expect(snapshot).toMatchObject({
-      artifactId: `sha256:${snapshot.sha256}`,
+      snapshotId: `source-sha256:${snapshot.sha256}`,
       mediaType: "text/plain; charset=utf-8",
       byteLength: original.byteLength,
       createdAt,
@@ -242,7 +244,7 @@ describe("PrivateSourceAccess", () => {
     {
       name: "symlink escape",
       path: () => "linked-outside.md",
-      expected: { status: "denied", code: "symlink_escape" },
+      expected: { status: "denied", code: "symlink_path" },
     },
     {
       name: "excluded directory",
@@ -252,7 +254,7 @@ describe("PrivateSourceAccess", () => {
     {
       name: "excluded canonical target through an in-root symlink",
       path: () => "hidden-alias.md",
-      expected: { status: "denied", code: "excluded_path" },
+      expected: { status: "denied", code: "symlink_path" },
     },
     {
       name: "dotenv secret",
@@ -491,6 +493,165 @@ describe("PrivateSourceAccess", () => {
       code: "extension_not_allowed",
     });
   });
+
+  it("enforces maxTotalBytes even when the caller passes a larger remaining budget", async () => {
+    const fixture = await createFixture();
+    const access = new PrivateSourceAccess({
+      ...fixture.scope,
+      maxTotalBytes: 4,
+    });
+
+    await expect(
+      access.capture(
+        {
+          rootIndex: 0,
+          relativePath: "notes.md",
+          startLine: 1,
+          endLine: 1,
+        },
+        2_000,
+      ),
+    ).resolves.toEqual({
+      status: "denied",
+      code: "source_budget_exceeded",
+    });
+  });
+
+  it.each([
+    ["start after EOF", "notes.md", 2, 2],
+    ["end after EOF", "notes.md", 1, 2],
+    ["empty file has no first line", "empty.md", 1, 1],
+  ])("denies an out-of-bounds line range for %s", async (_name, path, startLine, endLine) => {
+    const fixture = await createFixture();
+    await writeFile(join(fixture.approvedRoot, "empty.md"), Buffer.alloc(0));
+
+    await expect(
+      fixture.access.capture(
+        { rootIndex: 0, relativePath: path, startLine, endLine },
+        2_000,
+      ),
+    ).resolves.toEqual({
+      status: "denied",
+      code: "line_range_out_of_bounds",
+    });
+  });
+
+  it.each([
+    "application_default_credentials.json",
+    "nested/application_default_credentials.json",
+    ".docker/config.json",
+    "nested/.docker/config.json",
+    ".config/gh/hosts.yml",
+    "nested/.config/gh/hosts.yml",
+    ".yarnrc.yml",
+    "nested/.yarnrc.yml",
+    "service-account-key.json",
+    "nested/service-account-key.json",
+  ])("denies the credential configuration matrix for %s", async (relativePath) => {
+    const fixture = await createFixture();
+    const absolutePath = join(fixture.approvedRoot, relativePath);
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, "credential material\n", "utf8");
+
+    await expect(
+      fixture.access.capture(
+        { rootIndex: 0, relativePath, startLine: 1, endLine: 1 },
+        2_000,
+      ),
+    ).resolves.toEqual({ status: "denied", code: "secret_path" });
+    await expect(snapshotFiles(fixture.runtimeHome)).resolves.toEqual([]);
+  });
+
+  it.each(["tokens.md", "secrets.md", "nested/tokens.md", "nested/secrets.md"])(
+    "allows an ordinary teaching document named %s",
+    async (relativePath) => {
+      const fixture = await createFixture();
+      const absolutePath = join(fixture.approvedRoot, relativePath);
+      await mkdir(dirname(absolutePath), { recursive: true });
+      await writeFile(absolutePath, "teaching notes\n", "utf8");
+
+      await expect(
+        fixture.access.capture(
+          { rootIndex: 0, relativePath, startLine: 1, endLine: 1 },
+          2_000,
+        ),
+      ).resolves.toMatchObject({
+        status: "captured",
+        excerpt: "teaching notes",
+      });
+    },
+  );
+
+  it("rejects a root retarget between preflight and handle open", async () => {
+    const fixture = await createFixture();
+    const retiredRoot = join(fixture.baseDirectory, "retired-approved");
+    const attackerRoot = join(fixture.baseDirectory, "attacker-approved");
+    const access = new PrivateSourceAccess(fixture.scope, {
+      afterPreflight: async () => {
+        await rename(fixture.approvedRoot, retiredRoot);
+        await mkdir(attackerRoot);
+        await writeFile(join(attackerRoot, "notes.md"), "attacker\n", "utf8");
+        await symlink(attackerRoot, fixture.approvedRoot, "dir");
+      },
+    });
+
+    const result = await access.capture(
+      { rootIndex: 0, relativePath: "notes.md", startLine: 1, endLine: 1 },
+      2_000,
+    );
+
+    expect(result).toEqual({ status: "failed", code: "root_changed" });
+    expect(JSON.stringify(result)).not.toContain(attackerRoot);
+  });
+
+  it("rejects a parent directory changed to a symlink after preflight", async () => {
+    const fixture = await createFixture();
+    const parent = join(fixture.approvedRoot, "parent");
+    const retiredParent = join(fixture.approvedRoot, "parent-retired");
+    await mkdir(parent);
+    await writeFile(join(parent, "notes.md"), "approved parent\n", "utf8");
+    await writeFile(join(fixture.outsideRoot, "notes.md"), "attacker parent\n");
+    const access = new PrivateSourceAccess(fixture.scope, {
+      afterPreflight: async () => {
+        await rename(parent, retiredParent);
+        await symlink(fixture.outsideRoot, parent, "dir");
+      },
+    });
+
+    const result = await access.capture(
+      {
+        rootIndex: 0,
+        relativePath: "parent/notes.md",
+        startLine: 1,
+        endLine: 1,
+      },
+      2_000,
+    );
+
+    expect(result).toEqual({
+      status: "failed",
+      code: "path_changed_during_read",
+    });
+  });
+
+  it("rejects a file truncated after bytes are read from its handle", async () => {
+    const fixture = await createFixture();
+    const access = new PrivateSourceAccess(fixture.scope, {
+      afterRead: async () => {
+        await truncate(join(fixture.approvedRoot, "notes.md"), 1);
+      },
+    });
+
+    const result = await access.capture(
+      { rootIndex: 0, relativePath: "notes.md", startLine: 1, endLine: 1 },
+      2_000,
+    );
+
+    expect(result).toEqual({
+      status: "failed",
+      code: "source_changed_during_read",
+    });
+  });
 });
 
 interface Fixture {
@@ -552,7 +713,7 @@ async function createFixture(): Promise<Fixture> {
   const scope: SourceScope = await canonicalizeSourceScope({
     roots: [approvedRoot],
     exclusions: ["excluded/**"],
-    allowedExtensions: [".md", ".bin", ".json", ".pem"],
+    allowedExtensions: [".md", ".bin", ".json", ".pem", ".yml"],
     maxFileBytes: 256,
     maxTotalBytes: 2_000,
   });

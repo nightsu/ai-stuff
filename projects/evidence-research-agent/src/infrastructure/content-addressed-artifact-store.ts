@@ -1,18 +1,36 @@
-import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import {
+  chmod,
+  link,
+  lstat,
+  mkdir,
+  open,
+  realpath,
+  unlink,
+} from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 
-import type { PersistedArtifact } from "../domain/types.js";
+import type {
+  PersistedArtifact,
+  PersistedSourceSnapshot,
+} from "../domain/types.js";
 
-export class ArtifactIntegrityError extends Error {}
+export class ArtifactIntegrityError extends Error {
+  public constructor() {
+    super("私有内容寻址对象完整性校验失败");
+    this.name = "ArtifactIntegrityError";
+  }
+}
 
-/** 把不可变 JSON payload 存入 Runtime Home 内的内容寻址目录。 */
+/** 把不可变 payload 存入 Runtime Home 内的角色隔离内容寻址目录。 */
 export class ContentAddressedArtifactStore {
-  /** artifact 私有路径与相对引用共同使用的规范 Runtime Home。 */
+  /** 调用方提供并规范为绝对路径、每次写入仍会做 lstat/realpath 复核的 Runtime Home。 */
   readonly #runtimeHome: string;
 
   public constructor(runtimeHome: string) {
-    this.#runtimeHome = runtimeHome;
+    this.#runtimeHome = resolve(runtimeHome);
   }
 
   public async putJson(
@@ -22,75 +40,197 @@ export class ContentAddressedArtifactStore {
   ): Promise<PersistedArtifact> {
     const content = `${JSON.stringify(value, null, 2)}\n`;
     const bytes = Buffer.from(content, "utf8");
-    const sha256 = createHash("sha256").update(bytes).digest("hex");
-    const absolutePath = join(
-      this.#runtimeHome,
+    const sha256 = hashBytes(bytes);
+    const runtimeHome = await this.#prepareRuntimeHome();
+    const prefixDirectory = await preparePrivateDirectoryChain(runtimeHome, [
       "artifacts",
       "sha256",
       sha256.slice(0, 2),
-      `${sha256}.json`,
-    );
-    return this.#putExactBytes(bytes, absolutePath, mediaType, createdAt);
-  }
-
-  public async putSourceSnapshot(
-    sourceBytes: Uint8Array,
-    createdAt: string,
-  ): Promise<PersistedArtifact> {
-    // Source Snapshot 必须保存显式读取成功时得到的完整字节，不能保存摘录或
-    // UTF-8 重新编码结果；否则同一 Evidence range 无法回到当时检查的精确版本。
-    const bytes = Buffer.from(sourceBytes);
-    const sha256 = createHash("sha256").update(bytes).digest("hex");
-    const absolutePath = join(
-      this.#runtimeHome,
-      "source-snapshots",
-      "sha256",
-      sha256.slice(0, 2),
-      sha256,
-    );
-    return this.#putExactBytes(
-      bytes,
-      absolutePath,
-      "text/plain; charset=utf-8",
-      createdAt,
-    );
-  }
-
-  async #putExactBytes(
-    bytes: Buffer,
-    absolutePath: string,
-    mediaType: string,
-    createdAt: string,
-  ): Promise<PersistedArtifact> {
-    const sha256 = createHash("sha256").update(bytes).digest("hex");
-    await mkdir(dirname(absolutePath), { recursive: true });
-
-    try {
-      await writeFile(absolutePath, bytes, { flag: "wx" });
-    } catch (error) {
-      if (!isAlreadyExistsError(error)) {
-        throw error;
-      }
-
-      // 同一摘要应当永远映射到同一字节串；若磁盘内容不同，不能把损坏文件
-      // 当成一次成功的幂等写入。
-      const existing = await readFile(absolutePath);
-      if (!existing.equals(bytes)) {
-        throw new ArtifactIntegrityError(`artifact 内容与摘要冲突：${sha256}`);
-      }
-    }
+    ]);
+    const absolutePath = join(prefixDirectory, `${sha256}.json`);
+    await publishExactBytes(bytes, absolutePath);
 
     return {
       artifactId: `sha256:${sha256}`,
       sha256,
       mediaType,
       byteLength: bytes.byteLength,
-      relativePath: relative(this.#runtimeHome, absolutePath),
+      relativePath: relative(runtimeHome, absolutePath),
       createdAt,
     };
   }
+
+  public async putSourceSnapshot(
+    sourceBytes: Uint8Array,
+    createdAt: string,
+  ): Promise<PersistedSourceSnapshot> {
+    try {
+      // Source Snapshot 必须保存显式读取成功时得到的完整字节，不能保存摘录或
+      // UTF-8 重编码结果；独立 identity 也避免与同 hash 的 JSON artifact 混淆角色。
+      const bytes = Buffer.from(sourceBytes);
+      const sha256 = hashBytes(bytes);
+      const runtimeHome = await this.#prepareRuntimeHome();
+      const prefixDirectory = await preparePrivateDirectoryChain(runtimeHome, [
+        "source-snapshots",
+        "sha256",
+        sha256.slice(0, 2),
+      ]);
+      const absolutePath = join(prefixDirectory, sha256);
+      await publishExactBytes(bytes, absolutePath);
+
+      return {
+        snapshotId: `source-sha256:${sha256}`,
+        sha256,
+        mediaType: "text/plain; charset=utf-8",
+        byteLength: bytes.byteLength,
+        relativePath: relative(runtimeHome, absolutePath),
+        createdAt,
+      };
+    } catch (error) {
+      if (error instanceof ArtifactIntegrityError) {
+        throw error;
+      }
+      throw new ArtifactIntegrityError();
+    }
+  }
+
+  async #prepareRuntimeHome(): Promise<string> {
+    try {
+      await mkdir(this.#runtimeHome, { recursive: true, mode: 0o700 });
+      const metadata = await lstat(this.#runtimeHome);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        throw new ArtifactIntegrityError();
+      }
+      await chmod(this.#runtimeHome, 0o700);
+      return await realpath(this.#runtimeHome);
+    } catch (error) {
+      if (error instanceof ArtifactIntegrityError) {
+        throw error;
+      }
+      throw new ArtifactIntegrityError();
+    }
+  }
 }
 
-function isAlreadyExistsError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error && error.code === "EEXIST";
+async function preparePrivateDirectoryChain(
+  canonicalParent: string,
+  segments: readonly string[],
+): Promise<string> {
+  let parent = canonicalParent;
+  for (const segment of segments) {
+    const child = join(parent, segment);
+    try {
+      await mkdir(child, { mode: 0o700 });
+    } catch (error) {
+      if (!isErrorCode(error, "EEXIST")) {
+        throw new ArtifactIntegrityError();
+      }
+    }
+    const metadata = await lstat(child);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new ArtifactIntegrityError();
+    }
+    await chmod(child, 0o700);
+    const canonicalChild = await realpath(child);
+    if (relative(parent, canonicalChild) !== segment) {
+      throw new ArtifactIntegrityError();
+    }
+    parent = canonicalChild;
+  }
+  return parent;
+}
+
+async function publishExactBytes(
+  bytes: Buffer,
+  absolutePath: string,
+): Promise<void> {
+  const temporaryPath = join(
+    resolve(absolutePath, ".."),
+    `.snapshot-${randomUUID()}.tmp`,
+  );
+  let handle: FileHandle | undefined;
+
+  try {
+    handle = await open(
+      temporaryPath,
+      constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_WRONLY |
+        constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(bytes);
+    await handle.sync();
+    const temporaryMetadata = await handle.stat({ bigint: true });
+    if (
+      !temporaryMetadata.isFile() ||
+      temporaryMetadata.size !== BigInt(bytes.byteLength)
+    ) {
+      throw new ArtifactIntegrityError();
+    }
+    await handle.chmod(0o600);
+    await handle.close();
+    handle = undefined;
+
+    try {
+      // 同目录 hard-link 只在 final 不存在时原子发布；reader 看不到 temp 的半成品。
+      await link(temporaryPath, absolutePath);
+    } catch (error) {
+      if (!isErrorCode(error, "EEXIST")) {
+        throw new ArtifactIntegrityError();
+      }
+    }
+    await verifyExistingBytes(absolutePath, bytes);
+  } catch (error) {
+    if (error instanceof ArtifactIntegrityError) {
+      throw error;
+    }
+    throw new ArtifactIntegrityError();
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
+async function verifyExistingBytes(
+  absolutePath: string,
+  expected: Buffer,
+): Promise<void> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(
+      absolutePath,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    const metadata = await handle.stat({ bigint: true });
+    if (!metadata.isFile() || metadata.size !== BigInt(expected.byteLength)) {
+      throw new ArtifactIntegrityError();
+    }
+    const existing = await handle.readFile();
+    if (
+      !existing.equals(expected) ||
+      hashBytes(existing) !== hashBytes(expected)
+    ) {
+      throw new ArtifactIntegrityError();
+    }
+    await handle.chmod(0o600);
+  } catch (error) {
+    if (error instanceof ArtifactIntegrityError) {
+      throw error;
+    }
+    throw new ArtifactIntegrityError();
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function hashBytes(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function isErrorCode(
+  error: unknown,
+  code: NodeJS.ErrnoException["code"],
+): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
 }

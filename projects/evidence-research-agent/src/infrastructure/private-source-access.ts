@@ -39,8 +39,10 @@ export type SourceAccessDenialCode =
   | "invalid_root"
   | "invalid_path"
   | "invalid_line_range"
+  | "line_range_out_of_bounds"
   | "path_escape"
   | "symlink_escape"
+  | "symlink_path"
   | "excluded_path"
   | "secret_path"
   | "extension_not_allowed"
@@ -52,6 +54,8 @@ export type SourceAccessDenialCode =
 /** 预期文件系统失败被归一化后公开的稳定代码。 */
 export type SourceAccessFailureCode =
   | "root_changed"
+  | "path_changed_during_read"
+  | "source_changed_during_read"
   | "source_not_found"
   | "source_not_file"
   | "source_io_error";
@@ -126,6 +130,10 @@ interface ReadySource {
   readonly status: "ready";
   /** 仅用于紧随其后的 handle open，绝不能持久化或返回给调用方。 */
   readonly canonicalPath: string;
+  /** 预检时 candidate 设备号，用于发现 handle open 前的路径替换。 */
+  readonly candidateDevice: bigint;
+  /** 预检时 candidate inode，用于发现 handle open 前的路径替换。 */
+  readonly candidateInode: bigint;
   /** 对外可安全返回、且不含绝对路径的预检结果。 */
   readonly approved: SourceAccessApproved;
 }
@@ -134,6 +142,14 @@ interface ReadySource {
 type EvaluatedSource = ReadySource | SourceAccessDenied | SourceAccessFailed;
 
 const READ_CHUNK_BYTES = 64 * 1024;
+
+/** capture 生命周期中的可选异步边界，不接收私有路径或源字节。 */
+export interface SourceAccessLifecycleHooks {
+  /** 完整预检通过后、打开 candidate handle 前运行的可选协调回调。 */
+  readonly afterPreflight?: () => void | Promise<void>;
+  /** 完整字节读出后、最终版本与路径复核前运行的可选协调回调。 */
+  readonly afterRead?: () => void | Promise<void>;
+}
 
 /** 请求的 Source Root 无法安全绑定为 canonical identity。 */
 export class SourceScopeCanonicalizationError extends Error {
@@ -199,8 +215,13 @@ export async function canonicalizeSourceScope(
 export class PrivateSourceAccess {
   /** 创建组件时复制冻结、且已经应用层验证过的 Source Scope。 */
   readonly #scope: SourceScope;
+  /** 默认不执行任何动作的 capture 生命周期协调边界。 */
+  readonly #hooks: SourceAccessLifecycleHooks;
 
-  public constructor(scope: SourceScope) {
+  public constructor(
+    scope: SourceScope,
+    hooks: SourceAccessLifecycleHooks = {},
+  ) {
     this.#scope = Object.freeze({
       roots: Object.freeze(
         scope.roots.map((root) => Object.freeze({ ...root })),
@@ -210,6 +231,7 @@ export class PrivateSourceAccess {
       maxFileBytes: scope.maxFileBytes,
       maxTotalBytes: scope.maxTotalBytes,
     });
+    this.#hooks = Object.freeze({ ...hooks });
   }
 
   public async preflight(
@@ -224,12 +246,25 @@ export class PrivateSourceAccess {
     request: ReadSourceRequest,
     remainingSourceBytes: number,
   ): Promise<SourceAccessResult> {
-    // capture 重新执行完整预检，而不信任较早的 discovery/preflight 结果；两次
-    // realpath 之间仍可能发生 TOCTOU，因此真正的类型、大小和全部读取都绑定在
-    // 随后打开的同一个 handle 上。Node 的 realpath 与 open 无法组成原子操作，
+    // capture 重新执行完整预检，而不信任较早的 discovery/preflight 结果。
+    // Node 标准路径 API 没有 portable openat/openat2，不能对 hostile writer 提供
+    // 原子路径隔离；逐段拒绝 symlink、同一 handle 前后 fstat 与事后 realpath/
+    // identity 复核只会 fail closed 地发现稳定可观测变化，不声称消除了父目录竞态。
     const evaluated = await this.#evaluate(request, remainingSourceBytes);
     if (evaluated.status !== "ready") {
       return evaluated;
+    }
+    try {
+      await this.#hooks.afterPreflight?.();
+    } catch {
+      return failed("source_io_error");
+    }
+    const rootAfterPreflight = this.#scope.roots[request.rootIndex];
+    if (
+      rootAfterPreflight === undefined ||
+      !(await rootIdentityStillMatches(rootAfterPreflight))
+    ) {
+      return failed("root_changed");
     }
 
     let handle: FileHandle;
@@ -245,13 +280,20 @@ export class PrivateSourceAccess {
     }
 
     try {
-      const metadata = await handle.stat();
-      if (!metadata.isFile()) {
+      const beforeRead = await handle.stat({ bigint: true });
+      if (!beforeRead.isFile()) {
         return failed("source_not_file");
       }
+      if (
+        beforeRead.dev !== evaluated.candidateDevice ||
+        beforeRead.ino !== evaluated.candidateInode
+      ) {
+        return failed("path_changed_during_read");
+      }
       const preReadLimit = limitForSize(
-        metadata.size,
+        beforeRead.size,
         this.#scope.maxFileBytes,
+        this.#scope.maxTotalBytes,
         remainingSourceBytes,
       );
       if (preReadLimit !== undefined) {
@@ -260,16 +302,43 @@ export class PrivateSourceAccess {
 
       const maximumBytes = Math.min(
         this.#scope.maxFileBytes,
+        this.#scope.maxTotalBytes,
         remainingSourceBytes,
       );
       const fullBytes = await readAtMost(handle, maximumBytes);
+      await this.#hooks.afterRead?.();
+      const afterRead = await handle.stat({ bigint: true });
+      if (
+        BigInt(fullBytes.byteLength) !== beforeRead.size ||
+        !sameFileVersion(beforeRead, afterRead)
+      ) {
+        return failed("source_changed_during_read");
+      }
       const postReadLimit = limitForSize(
         fullBytes.byteLength,
         this.#scope.maxFileBytes,
+        this.#scope.maxTotalBytes,
         remainingSourceBytes,
       );
       if (postReadLimit !== undefined) {
         return postReadLimit;
+      }
+      const approvedRoot = this.#scope.roots[request.rootIndex];
+      if (
+        approvedRoot === undefined ||
+        !(await rootIdentityStillMatches(approvedRoot))
+      ) {
+        return failed("root_changed");
+      }
+      if (
+        !(await capturedPathStillMatches(
+          approvedRoot,
+          request.relativePath,
+          evaluated,
+          beforeRead,
+        ))
+      ) {
+        return failed("path_changed_during_read");
       }
 
       let text: string;
@@ -283,6 +352,12 @@ export class PrivateSourceAccess {
       }
 
       const lines = splitLogicalLines(text);
+      if (
+        evaluated.approved.startLine > lines.length ||
+        evaluated.approved.endLine > lines.length
+      ) {
+        return denied("line_range_out_of_bounds");
+      }
       return {
         status: "captured",
         rootIndex: evaluated.approved.rootIndex,
@@ -356,6 +431,20 @@ export class PrivateSourceAccess {
     }
     const canonicalRoot = approvedRoot.canonicalPath;
 
+    const segmentCheck = await checkPathSegments(
+      canonicalRoot,
+      request.relativePath,
+    );
+    if (segmentCheck === "symlink") {
+      return denied("symlink_path");
+    }
+    if (segmentCheck === "not_found") {
+      return failed("source_not_found");
+    }
+    if (segmentCheck === "io_error") {
+      return failed("source_io_error");
+    }
+
     let canonicalPath: string;
     try {
       canonicalPath = await realpath(resolve(canonicalRoot, request.relativePath));
@@ -386,7 +475,7 @@ export class PrivateSourceAccess {
 
     let metadata;
     try {
-      metadata = await stat(canonicalPath);
+      metadata = await stat(canonicalPath, { bigint: true });
     } catch (error) {
       return mapCandidateFailure(error);
     }
@@ -396,6 +485,7 @@ export class PrivateSourceAccess {
     const sizeLimit = limitForSize(
       metadata.size,
       this.#scope.maxFileBytes,
+      this.#scope.maxTotalBytes,
       remainingSourceBytes,
     );
     if (sizeLimit !== undefined) {
@@ -405,6 +495,8 @@ export class PrivateSourceAccess {
     return {
       status: "ready",
       canonicalPath,
+      candidateDevice: metadata.dev,
+      candidateInode: metadata.ino,
       approved: {
         status: "approved",
         rootIndex: request.rootIndex,
@@ -426,6 +518,74 @@ function isValidRelativeRequestPath(value: unknown): value is string {
     !posix.isAbsolute(value) &&
     !win32.isAbsolute(value)
   );
+}
+
+async function checkPathSegments(
+  canonicalRoot: string,
+  relativePath: string,
+): Promise<"safe" | "symlink" | "not_found" | "io_error"> {
+  const segments = relativePath
+    .split("/")
+    .filter((segment) => segment.length > 0 && segment !== ".");
+  let currentPath = canonicalRoot;
+
+  for (const [index, segment] of segments.entries()) {
+    currentPath = resolve(currentPath, segment);
+    try {
+      const metadata = await lstat(currentPath, { bigint: true });
+      if (metadata.isSymbolicLink()) {
+        return "symlink";
+      }
+      if (index < segments.length - 1 && !metadata.isDirectory()) {
+        return "not_found";
+      }
+    } catch (error) {
+      if (isErrorCode(error, "ENOENT") || isErrorCode(error, "ENOTDIR")) {
+        return "not_found";
+      }
+      return "io_error";
+    }
+  }
+  return "safe";
+}
+
+async function capturedPathStillMatches(
+  approvedRoot: SourceRootIdentity,
+  requestedRelativePath: string,
+  evaluated: ReadySource,
+  handleMetadata: BigIntStats,
+): Promise<boolean> {
+  if (
+    (await checkPathSegments(
+      approvedRoot.canonicalPath,
+      requestedRelativePath,
+    )) !== "safe"
+  ) {
+    return false;
+  }
+
+  try {
+    const currentPath = await realpath(
+      resolve(approvedRoot.canonicalPath, requestedRelativePath),
+    );
+    const rootRelative = relative(approvedRoot.canonicalPath, currentPath);
+    if (
+      isAbsolute(rootRelative) ||
+      rootRelative.split(sep)[0] === ".." ||
+      toPosixPath(rootRelative) !== evaluated.approved.relativePath
+    ) {
+      return false;
+    }
+    const pathMetadata = await lstat(currentPath, { bigint: true });
+    return (
+      pathMetadata.isFile() &&
+      !pathMetadata.isSymbolicLink() &&
+      pathMetadata.dev === handleMetadata.dev &&
+      pathMetadata.ino === handleMetadata.ino
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function rootIdentityStillMatches(
@@ -522,13 +682,29 @@ function isSecretPath(normalizedRelativePath: string): boolean {
     return true;
   }
   if (
-    [".npmrc", ".pypirc", ".netrc", ".dockercfg", ".git-credentials"].includes(
-      fileName,
-    )
+    [
+      ".npmrc",
+      ".pypirc",
+      ".netrc",
+      ".dockercfg",
+      ".git-credentials",
+      ".yarnrc.yml",
+      "application_default_credentials.json",
+      "service-account-key.json",
+      "service_account_key.json",
+    ].includes(fileName)
   ) {
     return true;
   }
-  return /^(?:credentials?|tokens?|secrets?|service[-_]account)(?:\.[^/]*)?$/.test(
+  if (
+    lowerPath === ".docker/config.json" ||
+    lowerPath.endsWith("/.docker/config.json") ||
+    lowerPath === ".config/gh/hosts.yml" ||
+    lowerPath.endsWith("/.config/gh/hosts.yml")
+  ) {
+    return true;
+  }
+  return /^(?:credentials?|tokens?|secrets?)(?:\.json|\.ya?ml|\.toml|\.ini)$/.test(
     fileName,
   );
 }
@@ -551,17 +727,32 @@ function hasAllowedExtension(
 }
 
 function limitForSize(
-  byteLength: number,
+  byteLength: number | bigint,
   maxFileBytes: number,
+  maxTotalBytes: number,
   remainingSourceBytes: number,
 ): SourceAccessDenied | undefined {
-  if (byteLength > maxFileBytes) {
+  const size = typeof byteLength === "bigint" ? byteLength : BigInt(byteLength);
+  if (size > BigInt(maxFileBytes)) {
     return denied("file_too_large");
   }
-  if (byteLength > remainingSourceBytes) {
+  if (
+    size > BigInt(maxTotalBytes) ||
+    size > BigInt(remainingSourceBytes)
+  ) {
     return denied("source_budget_exceeded");
   }
   return undefined;
+}
+
+function sameFileVersion(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
 }
 
 async function readAtMost(
