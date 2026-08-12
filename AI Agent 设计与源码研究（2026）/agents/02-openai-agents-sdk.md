@@ -134,7 +134,7 @@ async def run(starting_agent, user_input, session=None, previous_state=None):
 
 ```
 
-主循环的关键不是 `while`，而是 `NextStepFinalOutput / NextStepHandoff / NextStepRunAgain / NextStepInterruption` 这类状态让“下一步”可测试。
+**主循环的关键不是 `while`，而是 `NextStepFinalOutput / NextStepHandoff / NextStepRunAgain / NextStepInterruption` 这类状态让“下一步”可测试。**
 
 ### 2. Handoff 与 agent-as-tool 的所有权不同
 
@@ -186,13 +186,38 @@ def resume(serialized_state, approval_decisions):
 
 `generated_items` 与 `session_items` 分开很关键：handoff 可以过滤模型下一轮看到的历史，但审计 session 仍保留完整事实。
 
+#### 最小恢复闭包与持久化 schema 的区别
+
+“最小闭包”描述的是**恢复语义**：为了从中断点正确继续运行，必须保留哪些信息。缺少其中任意一项，都可能迫使 Runner 重新调用模型、重复已经完成的副作用，或猜测当前 Agent、未决审批和工具调用。
+
+“持久化 schema”描述的是**数据表示**：这些信息以哪些字段、类型、版本和序列化规则落盘。生产 schema 通常还会包含创建时间、SDK 版本、迁移元数据、完整性校验、trace 等非核心恢复信息。因此，若用 `C` 表示最小恢复闭包所需的信息，用 `S` 表示 schema 实际承载的信息，安全恢复要求：
+
+```text
+C ⊆ S
+```
+
+这里是信息包含关系，不要求字段一一对应。例如闭包要求保存“当前 Agent 身份”，schema 可以保存完整 `current_agent`，也可以只保存稳定的 `current_agent_id`，恢复时再通过 registry 解析。`schema_version` 也不是 schema 本身，而是标识这份快照采用哪一版 schema，供兼容性检查和数据迁移使用。
+
+| 概念 | 关注的问题 | 示例 |
+|---|---|---|
+| 最小恢复闭包 | 正确恢复必须知道什么 | 当前 Agent、原始模型响应、已解析步骤、未决审批、已完成副作用 |
+| RunState 字段模型 | 运行时如何组织这些状态 | `current_agent`、`current_step`、`last_processed_response` |
+| 持久化 schema | 状态如何编码、校验和演进 | Agent ID、嵌套 tool call、必填/可选字段、版本与迁移规则 |
+| RunState 快照 | 某次运行中字段的实际值 | `current_turn=2`、`current_agent_id="refund-agent-v2"` |
+
+判断某项信息是否属于最小闭包，可以问：删除它以后，恢复是否仍能在**不重新采样模型、不重复副作用、不猜测控制权**的前提下继续？如果不能，它就是恢复闭包的一部分；如果只是便于排障、统计或观察，则可以属于 schema 的扩展信息。
+
 ### 4. 工具先规划，再有界并发执行
 
 ```python
 def plan_tools(processed_response, approval_state):
+    # 这里的 planning 是 runtime 生成工具执行计划，而不是让模型再次规划任务。
+    # 去重依据是稳定的 invocation identity，不能把调用同一工具的不同参数误判为重复。
     calls = dedupe_by_invocation_identity(processed_response.tool_calls)
     return ToolExecutionPlan(
+        # 审批先于副作用执行，未决调用会使 Runner 保存状态并返回 interruption。
         pending_approvals=partition_pending_approvals(calls, approval_state),
+        # 普通函数、hosted 工具和未知工具因执行协议不同而进入不同队列。
         function_calls=approved_function_calls(calls),
         hosted_calls=approved_shell_patch_computer_calls(calls),
         missing_tools=unknown_calls(calls),
@@ -200,15 +225,18 @@ def plan_tools(processed_response, approval_state):
 
 
 async def execute_function_calls(plan, max_concurrency):
+    # Semaphore 限制同时运行的调用数，避免压垮数据库、外部 API 或本地资源。
     slots = Semaphore(max_concurrency)
 
     async def run(index, call):
         async with slots:
+            # 计划与执行之间权限可能变化，所以真正执行前要重新解析当前仍启用的工具。
             tool = resolve_currently_enabled_tool(call.name)
             if tool is None:
                 raise ModelBehaviorError("tool became unavailable")
             return index, await execute_with_input_and_output_guardrails(tool, call)
 
+    # 致命失败会取消并 drain 兄弟任务；结果仍按模型原始 call 顺序重建，但取消不能撤销已提交的外部副作用。
     completed = await gather_or_cancel_siblings(run(i, c) for i, c in enumerate(plan.function_calls))
     return [result for _, result in sorted(completed)]  # 对外顺序仍按模型原始 call 顺序。
 ```
