@@ -39,11 +39,13 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   expect(markdown).toContain("AiSdk --> Provider");
   expect(markdown).toContain("Model --> Loop");
   expect(markdown).toContain("Loop --> Scheduler");
-  expect(markdown).toContain("Scheduler --> Search");
-  expect(markdown).toContain("Scheduler --> Read");
-  expect(markdown).toContain("Scheduler --> RecordEvidence");
-  expect(markdown).toContain("Scheduler --> ProposeClaim");
-  expect(markdown).toContain("Scheduler --> CompleteResearch");
+  expect(markdown).toContain("Scheduler --> SafeBatch");
+  expect(markdown).toContain("Scheduler --> StateQueue");
+  expect(markdown).toContain("SafeBatch --> Search");
+  expect(markdown).toContain("SafeBatch --> Read");
+  expect(markdown).toContain("StateQueue --> RecordEvidence");
+  expect(markdown).toContain("StateQueue --> ProposeClaim");
+  expect(markdown).toContain("StateQueue --> CompleteResearch");
   expect(markdown).toContain('Search["search_sources"]');
   expect(markdown).toContain('Read["read_source"]');
   expect(markdown).toContain('RecordEvidence["record_evidence"]');

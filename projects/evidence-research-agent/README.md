@@ -1,8 +1,8 @@
 # Evidence Research Agent
 
-这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #10：除确定性的 Scripted Model、OpenAI-compatible live adapter 与 durable Run control 外，Harness 还用 per-run durable Run Operation lease 串行化 mutation，并提供 heartbeat、expiry 与独立 cancellation request。
+这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #11：除确定性的 Scripted Model、OpenAI-compatible live adapter 与 durable Run control 外，Harness 还用 per-run durable Run Operation lease 串行化 mutation，并让 replay-safe sibling reads 有界并发执行。
 
-当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。live adapter 只做单次 generation：工具没有 AI SDK `execute`，也不使用 `ToolLoopAgent`、`stopWhen`、自动多步执行、`useChat` 或 SDK history。并行 tool batch、`read-source` CLI、publication CLI 与 publication crash reconciliation 仍属于后续 tickets。
+当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。同一 Model Turn 开头连续、已通过顺序 preflight 的 `search_sources` / `read_source` 会按 `safeReadConcurrency` 有界并发；状态型工具仍严格顺序执行。live adapter 只做单次 generation：工具没有 AI SDK `execute`，也不使用 `ToolLoopAgent`、`stopWhen`、自动多步执行、`useChat` 或 SDK history。`read-source` CLI、publication CLI 与 publication crash reconciliation 仍属于后续 tickets。
 
 ## 快速开始：创建并批准计划
 
@@ -162,6 +162,20 @@ runtime.close();
 
 Model View 固定包含批准计划、approval binding、预算版本与余额、未决 evidence gaps、pending intents 和最新 steering。旧 observations 与 Evidence 按确定性顺序裁剪；若 pinned facts 本身仍放不下，Runtime 抛出 `ModelViewTooLargeError`，不会请求 LLM 自动摘要或静默删除约束。
 
+## 配置 safe read sibling 并发
+
+`safeReadConcurrency` 是 Harness 局部执行上限，默认 4、合法范围 1–32。Runtime 会先按模型原始 tool-call order 完成参数 schema、Source Root/Source Scope 与 source-byte、distinct-source 预算预留，再启动批准的 search/read。Journal 的 completion events 按 Artifact/Snapshot 已形成的真实完成先后提交；Projection 和下一轮 Model View 则按原始 intent order 重建，所以交换物理完成顺序不会改变模型输入。并发 Retry Attempts 会在 terminal transition 前全部闭合；若结算前崩溃，重启会先恢复未闭合 attempts，再结算已经 durable 的 terminal sibling，不会先 retry 或重跑 intent。retry backoff 返回后也会重新检查 cancellation，已取消 Run 不会启动下一次 Search。
+
+```ts
+const runtime = ResearchAgentRuntime.open({
+  runtimeHome: ".runtime",
+  model,
+  safeReadConcurrency: 4,
+});
+```
+
+一个 sibling 的普通失败只消费自己的 intent，其他已批准成功 observation 仍会提交。取消会阻止 worker 启动尚在队列中的调用；已经完整形成的结果仍可进入 cancelled snapshot 供审计，但不会触发后续 `record_evidence`、`propose_claim`、`complete_research`、Gate 或 publication。启用 Retry Policy 时，每个 sibling search 在外部 I/O 前分别提交 durable attempt，transient failure 只重试自己的 Retry Sequence，并继续复用同一个逻辑 `toolCallId`。
+
 ## 配置并观察有界 retry
 
 只有 adapter 显式抛出 `InfrastructureFailureError` 时，Harness 才把失败解释为可自动 retry 的基础设施瞬时错误；未知 Model 错误、Model Turn schema 错误和普通 Search 错误不会被偷偷重写成 transient。Retry Policy 在 `run_created` 时冻结并进入计划审批 binding，重启后从 Journal 恢复。
@@ -278,7 +292,7 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 
 ## 关键不变量
 
-- `advanceResearch` 每次都从 Run Journal、Projection 与批准 plan artifact 重建 Model View；Model View 不是 Journal，也不是完整 `messages[]`。完整 Model Turn 先 durable append，pending intents 再由 Harness 顺序消费，重启后不会要求模型猜测未决动作。
+- `advanceResearch` 每次都从 Run Journal、Projection 与批准 plan artifact 重建 Model View；Model View 不是 Journal，也不是完整 `messages[]`。完整 Model Turn 先 durable append；开头连续的 replay-safe search/read 经过模型顺序 preflight 后可并发，其余 pending intents 顺序消费，重启后不会要求模型猜测未决动作。
 - Model/search 外部 I/O 前必须先 durable 提交 `in_progress` attempt。重启看到未完成 attempt 时，会先持久化 `model_turn_interrupted` 或 `search_interrupted`，然后只在冻结 policy 允许时重试；已原子提交的成功 attempt/Model Turn/observation 不重新执行。Search 的多个物理 attempts 共享一个 `toolCallId`，因此 retry 不伪造成额外逻辑 Tool Call。
 - provider retry hint 是最短等待，不会被 Harness backoff cap 截短；等待和 attempt 都消耗 Research Loop wall time。等待若已经耗尽已批准 wall-time，Runtime 会在下一次外部 I/O 前进入 `budget_exhausted`。
 - Run Trace 对 Model contract、Model permanent、permission denial、stale state、ordinary tool execution、infrastructure transient 与 invariant violation 使用稳定、无秘密的 failure category/code；attempt 还暴露 Retry Sequence kind/identity、序号、结果、duration、policy version 和 retry delay。
@@ -322,5 +336,4 @@ Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE
 
 ## 尚未实现
 
-- Issue #11：安全 search/read sibling batch 的有界并发与模型原始顺序回填。
 - Issue #14：publication 外部 effect 的 durable operation、crash reconciliation 与精确恢复协议。

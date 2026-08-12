@@ -394,7 +394,7 @@ export interface ResearchToolObservation {
   readonly summary: string;
   /** 成功时的最小 typed output；失败或拒绝时省略。 */
   readonly output?: ResearchToolOutput | undefined;
-  /** observation 进入 Run Journal 的 ISO 8601 UTC 时间。 */
+  /** Harness 按模型 intent 顺序分配的 ISO 8601 UTC 逻辑时间；event 另记真实完成时间。 */
   readonly observedAt: string;
 }
 
@@ -1216,7 +1216,7 @@ export interface SourceReadObservationFields {
   readonly toolName: "read_source";
   /** 对调用方精确结构化请求做 canonical JSON SHA-256 得到的摘要。 */
   readonly requestHash: string;
-  /** observation 成为 Journal 事实的 ISO 8601 UTC 时间。 */
+  /** Harness 按模型 intent 顺序分配的 ISO 8601 UTC 逻辑时间；event 另记真实完成时间。 */
   readonly observedAt: string;
 }
 

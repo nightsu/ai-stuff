@@ -509,10 +509,10 @@ function applyRunEvent(
         current,
         {
           ...researching,
-          researchToolObservations: [
-            ...researching.researchToolObservations,
+          researchToolObservations: insertResearchObservationInIntentOrder(
+            researching,
             event.payload.observation,
-          ],
+          ),
           pendingToolIntents: pending,
           retryAttempts,
         },
@@ -590,10 +590,11 @@ function applyRunEvent(
         current,
         {
           ...researching,
-          sourceReadObservations: [
-            ...researching.sourceReadObservations,
+          sourceReadObservations: insertSourceReadObservationInIntentOrder(
+            researching,
             observation,
-          ],
+            event.payload.researchObservation,
+          ),
           sourceBytesRead,
           ...consumeEmbeddedResearchObservation(
             researching,
@@ -1113,8 +1114,16 @@ function validateStartedAttempt(
     (candidate) => candidate.retrySequenceId === attempt.retrySequenceId,
   );
   const previousAttempt = sameSequence.at(-1);
-  const latestAttempt = state.retryAttempts.at(-1);
   const newSequence = previousAttempt === undefined;
+  const safeBatchPrefix = leadingSafeIntentCount(state.pendingToolIntents);
+  const searchIntentIndex = state.pendingToolIntents.findIndex(
+    (intent) => intent.intentId === attempt.intentId,
+  );
+  const openSiblingSearchAttempts = state.retryAttempts.filter((candidate) =>
+    candidate.outcome === "in_progress" &&
+    candidate.retrySequenceKind === "search_sources"
+  );
+  const latestAttempt = state.retryAttempts.at(-1);
   const latestSequenceClosed = latestAttempt === undefined ||
     latestAttempt.outcome === "succeeded" ||
     (latestAttempt.retrySequenceKind === "model_turn" &&
@@ -1126,10 +1135,19 @@ function validateStartedAttempt(
       state.researchToolObservations.some(
         (observation) => observation.toolCallId === latestAttempt.toolCallId,
       ));
+  const startsSiblingSearch =
+    attempt.retrySequenceKind === "search_sources" &&
+    searchIntentIndex >= 0 &&
+    searchIntentIndex < safeBatchPrefix &&
+    openSiblingSearchAttempts.every((candidate) => {
+      const candidateIndex = state.pendingToolIntents.findIndex(
+        (intent) => intent.intentId === candidate.intentId,
+      );
+      return candidateIndex >= 0 && candidateIndex < searchIntentIndex;
+    });
   const validSequenceIdentity = newSequence
-    ? attempt.attemptNumber === 1 && latestSequenceClosed
-    : previousAttempt === latestAttempt &&
-      previousAttempt.outcome === "retryable_failure" &&
+    ? attempt.attemptNumber === 1 && (latestSequenceClosed || startsSiblingSearch)
+    : previousAttempt?.outcome === "retryable_failure" &&
       attempt.attemptNumber === previousAttempt.attemptNumber + 1 &&
       attempt.retrySequenceKind === previousAttempt.retrySequenceKind &&
       retryPoliciesEqual(attempt.retryPolicy, previousAttempt.retryPolicy) &&
@@ -1141,7 +1159,7 @@ function validateStartedAttempt(
     attempt.toolCallId === undefined &&
     attempt.intentId === undefined &&
     state.pendingToolIntents.length === 0;
-  const searchIntent = state.pendingToolIntents[0];
+  const searchIntent = state.pendingToolIntents[searchIntentIndex];
   const searchShape =
     attempt.retrySequenceKind === "search_sources" &&
     attempt.toolCallId !== undefined &&
@@ -1169,8 +1187,12 @@ function completePendingAttempt(
   completed: CompletedRetryAttempt,
   occurredAt: string,
 ): readonly RetryAttempt[] {
-  const latestIndex = attempts.length - 1;
-  const started = attempts[latestIndex];
+  const startedIndex = attempts.findIndex(
+    (candidate) =>
+      candidate.attemptId === completed.attemptId &&
+      candidate.outcome === "in_progress",
+  );
+  const started = attempts[startedIndex];
   if (started?.outcome !== "in_progress") {
     throw new IllegalRunEventError("Retry Attempt completion 与 pending attempt 不一致");
   }
@@ -1211,7 +1233,9 @@ function completePendingAttempt(
   ) {
     throw new IllegalRunEventError("Retry Attempt completion 与 pending attempt 不一致");
   }
-  return [...attempts.slice(0, latestIndex), completed];
+  return attempts.map((attempt, index) =>
+    index === startedIndex ? completed : attempt
+  );
 }
 
 function retryDelayFromPolicy(
@@ -1253,13 +1277,18 @@ function validateTerminalAttemptTransition(
   attemptsUsed: number | undefined,
   failure: import("./types.js").NormalizedFailure,
 ): void {
-  const latest = attempts.at(-1);
   const retryAttempts = attempts.filter(
     (attempt) => attempt.retrySequenceId === retrySequenceId,
   );
+  // terminal event 绑定自己的 Retry Sequence，而不是全局最后完成的 sibling；但
+  // 任何 sibling 仍为 in_progress 时都拒绝终态，避免把未决外部 I/O 藏进终态。
+  const latest = retryAttempts.findLast(
+    (attempt): attempt is CompletedRetryAttempt =>
+      attempt.outcome !== "in_progress",
+  );
   if (
     latest === undefined ||
-    latest.outcome === "in_progress" ||
+    attempts.some((attempt) => attempt.outcome === "in_progress") ||
     latest.retrySequenceId !== retrySequenceId ||
     latest.retrySequenceKind !== retrySequenceKind ||
     latest.failure?.category !== failure.category ||
@@ -1411,7 +1440,10 @@ function consumeEmbeddedResearchObservation(
     };
   }
   return {
-    researchToolObservations: [...state.researchToolObservations, observation],
+    researchToolObservations: insertResearchObservationInIntentOrder(
+      state,
+      observation,
+    ),
     pendingToolIntents: validateResearchObservation(
       state.pendingToolIntents,
       state.researchToolObservations,
@@ -1505,15 +1537,19 @@ function validateResearchObservation(
   observation: ResearchToolObservation,
   occurredAt: string,
 ): readonly ResearchToolIntent[] {
-  const intent = pendingIntents[0];
+  const leadingSafeCount = leadingSafeIntentCount(pendingIntents);
+  const candidateIndex = pendingIntents.findIndex(
+    (candidate) => candidate.intentId === observation.intentId,
+  );
+  const intent = candidateIndex === -1 ? undefined : pendingIntents[candidateIndex];
   if (
     intent === undefined ||
-    observation.intentId !== intent.intentId ||
+    (candidateIndex !== 0 && candidateIndex >= leadingSafeCount) ||
     observation.toolName !== intent.name ||
     observation.observationId.trim() === "" ||
     observation.toolCallId.trim() === "" ||
     observation.summary.trim() === "" ||
-    observation.observedAt !== occurredAt ||
+    Date.parse(observation.observedAt) > Date.parse(occurredAt) ||
     !isIsoUtc(observation.observedAt) ||
     priorObservations.some(
       (prior) =>
@@ -1532,7 +1568,100 @@ function validateResearchObservation(
   ) {
     throw new IllegalRunEventError("Research Tool observation 未精确消费 pending intent");
   }
-  return pendingIntents.slice(1);
+  return pendingIntents.filter((_, index) => index !== candidateIndex);
+}
+
+function leadingSafeIntentCount(
+  pendingIntents: readonly ResearchToolIntent[],
+): number {
+  let count = 0;
+  for (const intent of pendingIntents) {
+    if (intent.name !== "search_sources" && intent.name !== "read_source") break;
+    count += 1;
+  }
+  return count;
+}
+
+function insertResearchObservationInIntentOrder(
+  state: ResearchingRunState,
+  observation: ResearchToolObservation,
+): readonly ResearchToolObservation[] {
+  const turn = state.modelTurns.at(-1);
+  if (turn === undefined) {
+    throw new IllegalRunEventError("Research Tool observation 缺少来源 Model Turn");
+  }
+  const completedFromTurn = turn.toolIntents.length -
+    state.pendingToolIntents.length;
+  const prefixLength = state.researchToolObservations.length - completedFromTurn;
+  if (prefixLength < 0) {
+    throw new IllegalRunEventError("Research Tool observation 与 Model Turn 数量不一致");
+  }
+  const prefix = state.researchToolObservations.slice(0, prefixLength);
+  const currentTurn = [
+    ...state.researchToolObservations.slice(prefixLength),
+    observation,
+  ].sort((left, right) =>
+    intentOrdinal(turn.toolIntents, left.intentId) -
+    intentOrdinal(turn.toolIntents, right.intentId)
+  );
+  return [...prefix, ...currentTurn];
+}
+
+function insertSourceReadObservationInIntentOrder(
+  state: ResearchingRunState,
+  observation: SourceReadObservation,
+  researchObservation: ResearchToolObservation | undefined,
+): readonly SourceReadObservation[] {
+  if (researchObservation === undefined) {
+    return [...state.sourceReadObservations, observation];
+  }
+  const turn = state.modelTurns.at(-1);
+  if (turn === undefined) {
+    throw new IllegalRunEventError("read_source observation 缺少来源 Model Turn");
+  }
+  const completedFromTurn = turn.toolIntents.length -
+    state.pendingToolIntents.length;
+  const currentTurnPrefix = state.researchToolObservations.length -
+    completedFromTurn;
+  if (currentTurnPrefix < 0) {
+    throw new IllegalRunEventError("read_source observation 与 Model Turn 数量不一致");
+  }
+  const currentTurnObservations = [
+    ...state.researchToolObservations.slice(currentTurnPrefix),
+    researchObservation,
+  ];
+  const intentByToolCall = new Map(
+    currentTurnObservations.map((candidate) => [
+      candidate.toolCallId,
+      candidate.intentId,
+    ]),
+  );
+  const currentToolCallIds = new Set(intentByToolCall.keys());
+  const prefix: SourceReadObservation[] = [];
+  const current: SourceReadObservation[] = [];
+  for (const candidate of [...state.sourceReadObservations, observation]) {
+    if (currentToolCallIds.has(candidate.toolCallId)) {
+      current.push(candidate);
+    } else {
+      prefix.push(candidate);
+    }
+  }
+  current.sort((left, right) =>
+    intentOrdinal(turn.toolIntents, intentByToolCall.get(left.toolCallId) ?? "") -
+    intentOrdinal(turn.toolIntents, intentByToolCall.get(right.toolCallId) ?? "")
+  );
+  return [...prefix, ...current];
+}
+
+function intentOrdinal(
+  intents: readonly ResearchToolIntent[],
+  intentId: string,
+): number {
+  const index = intents.findIndex((intent) => intent.intentId === intentId);
+  if (index === -1) {
+    throw new IllegalRunEventError("Research Tool observation 找不到原始 intent 顺序");
+  }
+  return index;
 }
 
 function expectedObservationFailureCategory(
@@ -1556,7 +1685,7 @@ function validateSourceReadObservation(
     observation.toolCallId.trim() === "" ||
     observation.toolName !== "read_source" ||
     !isSha256(observation.requestHash) ||
-    observation.observedAt !== occurredAt ||
+    Date.parse(observation.observedAt) > Date.parse(occurredAt) ||
     !isIsoUtc(observation.observedAt) ||
     observations.some(
       (prior) => prior.observationId === observation.observationId,

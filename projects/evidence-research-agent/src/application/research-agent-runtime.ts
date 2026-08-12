@@ -67,12 +67,16 @@ import type {
   RunOperationLease,
   RunOperationView,
   RunCancellationRequest,
+  SourceAccessDenialCode,
+  SourceAccessFailureCode,
 } from "../domain/types.js";
 import { ContentAddressedArtifactStore } from "../infrastructure/content-addressed-artifact-store.js";
 import {
   canonicalizeSourceScope,
   PrivateSourceAccess,
+  type SourceAccessLifecycleHooks,
   SourceScopeCanonicalizationError,
+  sourceRootIdentityStillMatches,
 } from "../infrastructure/private-source-access.js";
 import {
   type AppendEventsControl,
@@ -130,6 +134,10 @@ export interface OpenRuntimeOptions {
   readonly operationLeaseDurationMs?: number;
   /** active operation 自动 heartbeat 与 cancellation poll 的间隔毫秒。 */
   readonly operationHeartbeatIntervalMs?: number;
+  /** 同一 Model Turn 内 replay-safe search/read 最多同时运行的调用数。 */
+  readonly safeReadConcurrency?: number;
+  /** Source Access 的可选测试边界；生产默认不注入协调行为。 */
+  readonly sourceAccessHooks?: SourceAccessLifecycleHooks;
   /** Run Operation durable seam 的可选命名中断点。 */
   readonly runOperationHooks?: RunOperationLifecycleHooks;
 }
@@ -749,6 +757,67 @@ interface StartedAttemptResult {
   readonly attempt: InProgressRetryAttempt;
 }
 
+/** 完成外部 search 后、等待按真实完成顺序写入 Journal 的结果。 */
+interface PreparedSearchResult {
+  /** 已按模型 intent 顺序预分配的 observation；retryable attempt 尚不消费 intent。 */
+  readonly observation?: ResearchToolObservation | undefined;
+  /** 外部 I/O 与 CAS 完成、结果可提交 Journal 的真实完成时间。 */
+  readonly completedAt: string;
+  /** 成功 search 的私有匹配列表 artifact；非成功结果省略。 */
+  readonly artifact?: PersistedArtifact | undefined;
+  /** 启用 Retry Policy 时需要闭合的 durable attempt。 */
+  readonly attempt?: CompletedRetryAttempt | undefined;
+}
+
+/** 完成 source capture/CAS 后、等待按真实完成顺序写入 Journal 的结果。 */
+interface PreparedReadResult {
+  /** 完整领域 Source Read Observation；不包含原始绝对路径或异常。 */
+  readonly observation: SourceReadObservation;
+  /** 与领域 observation 一致的模型可见安全结果。 */
+  readonly researchObservation: ResearchToolObservation;
+  /** capture 与 CAS 完成、结果可提交 Journal 的真实完成时间。 */
+  readonly completedAt: string;
+  /** 成功 capture 的私有 Source Snapshot registry 候选；非成功时省略。 */
+  readonly sourceSnapshot?: PersistedSourceSnapshot | undefined;
+}
+
+/** safe batch 中已通过预检的单个 search candidate。 */
+interface ApprovedBatchSearch {
+  /** 判别字段，选择 Search Port 执行路径。 */
+  readonly kind: "search";
+  /** 模型原始 Research Tool intent。 */
+  readonly intent: ResearchToolIntent;
+  /** 通过严格 schema 与 Source Root identity 检查的 search 请求。 */
+  readonly input: z.infer<typeof searchSourcesInputSchema>;
+  /** 按 preflight 顺序预分配的 observation identity。 */
+  readonly observationId: string;
+  /** 按 preflight 顺序预分配的逻辑 tool call identity。 */
+  readonly toolCallId: string;
+  /** 按模型顺序分配、与物理完成顺序无关的 observation 逻辑时间。 */
+  readonly observedAt: string;
+}
+
+/** safe batch 中已通过预检的单个 read candidate。 */
+interface ApprovedBatchRead {
+  /** 判别字段，选择 Source Access capture 路径。 */
+  readonly kind: "read";
+  /** 模型原始 Research Tool intent。 */
+  readonly intent: ResearchToolIntent;
+  /** 通过严格 schema 与 Source Scope 预检的 read 请求。 */
+  readonly input: ReadSourceRequest;
+  /** capture 重新验证时允许消耗的已预留完整字节数。 */
+  readonly reservedSourceBytes: number;
+  /** 按 preflight 顺序预分配的 observation identity。 */
+  readonly observationId: string;
+  /** 按 preflight 顺序预分配的逻辑 tool call identity。 */
+  readonly toolCallId: string;
+  /** 按模型顺序分配、与物理完成顺序无关的 observation 逻辑时间。 */
+  readonly observedAt: string;
+}
+
+/** 已按模型顺序通过 preflight、可以进入并发 I/O 的 safe sibling。 */
+type ApprovedSafeRead = ApprovedBatchSearch | ApprovedBatchRead;
+
 /** 去除 registry-only 时间字段，保证 Journal artifact 引用只保存可回放身份与内容元数据。 */
 function stripArtifactCreatedAt(artifact: PersistedArtifact): ArtifactReference {
   const { createdAt: _createdAt, ...reference } = artifact;
@@ -789,6 +858,10 @@ export class ResearchAgentRuntime {
   readonly #operationLeaseDurationMs: number;
   /** active operation 的 heartbeat 与 cancellation poll 周期。 */
   readonly #operationHeartbeatIntervalMs: number;
+  /** replay-safe sibling I/O 的 Harness-owned 最大并发数。 */
+  readonly #safeReadConcurrency: number;
+  /** Source Access capture 生命周期的可选协调边界。 */
+  readonly #sourceAccessHooks: SourceAccessLifecycleHooks;
   /** durable control-plane seam 的可选命名中断点。 */
   readonly #runOperationHooks: RunOperationLifecycleHooks;
   /** 只允许同一异步 command chain 的嵌套 mutation 复用当前 lease。 */
@@ -820,6 +893,12 @@ export class ResearchAgentRuntime {
       ),
       this.#operationLeaseDurationMs,
     );
+    this.#safeReadConcurrency = parseSafeReadConcurrency(
+      options.safeReadConcurrency ?? 4,
+    );
+    this.#sourceAccessHooks = Object.freeze({
+      ...(options.sourceAccessHooks ?? {}),
+    });
     this.#artifacts = new ContentAddressedArtifactStore(runtimeHome);
     this.#store = new SqliteRunStore(
       runtimeHome,
@@ -1149,6 +1228,14 @@ export class ResearchAgentRuntime {
         this.#commitFailedAttempt(current, recovered);
         continue;
       }
+      const deferredTerminalAttempt = this.#deferredBatchTerminalAttempt(current);
+      if (deferredTerminalAttempt !== undefined) {
+        // batch 可能在较早 sibling 已形成 terminal attempt、较后 sibling 尚未闭合
+        // 时崩溃。重启必须先结算已 durable 的终态，不能先 retry sibling 或重跑
+        // 已 terminal 的原 intent。
+        this.#commitBatchTerminalAttempt(current, deferredTerminalAttempt);
+        continue;
+      }
       const now = this.#clock.now();
       const remainingBudget = this.#remainingBudget(current, now);
       const exhausted = firstExhaustedRunBudgetDimension(
@@ -1162,7 +1249,7 @@ export class ResearchAgentRuntime {
         );
       }
       if (current.state.pendingToolIntents.length !== 0) {
-        await this.#executePendingResearchIntent(current);
+        await this.#executePendingResearchIntent(current, operationSignal);
         continue;
       }
 
@@ -1426,10 +1513,46 @@ export class ResearchAgentRuntime {
     return candidate;
   }
 
-  async #executePendingResearchIntent(current: RunProjection): Promise<void> {
+  async #executePendingResearchIntent(
+    current: RunProjection,
+    operationSignal: AbortSignal,
+  ): Promise<void> {
     if (current.state.type !== "researching") throw new ResearchLoopError();
+    const retryableBatchSearch = current.state.retryAttempts.find(
+      (attempt): attempt is CompletedRetryAttempt =>
+        attempt.retrySequenceKind === "search_sources" &&
+        attempt.outcome === "retryable_failure" &&
+        current.state.type === "researching" &&
+        current.state.pendingToolIntents.some(
+          (intent) => intent.intentId === attempt.intentId,
+        ),
+    );
+    if (retryableBatchSearch !== undefined) {
+      const intent = current.state.pendingToolIntents.find(
+        (candidate) => candidate.intentId === retryableBatchSearch.intentId,
+      );
+      if (intent?.name !== "search_sources") throw new ResearchLoopError();
+      await this.#executeBatchSearchRetry(
+        current,
+        intent,
+        retryableBatchSearch,
+        operationSignal,
+      );
+      return;
+    }
     const intent = current.state.pendingToolIntents[0];
     if (intent === undefined) return;
+    const leadingSafeReads = leadingSafeReadIntents(
+      current.state.pendingToolIntents,
+    );
+    if (leadingSafeReads.length > 1) {
+      await this.#executeSafeReadBatch(
+        current,
+        leadingSafeReads,
+        operationSignal,
+      );
+      return;
+    }
     switch (intent.name) {
       case "search_sources":
         await this.#executeSearchIntent(current, intent);
@@ -1447,6 +1570,696 @@ export class ResearchAgentRuntime {
         await this.#executeCompletionIntent(current, intent);
         return;
     }
+  }
+
+  async #executeBatchSearchRetry(
+    current: RunProjection,
+    intent: ResearchToolIntent,
+    previousAttempt: CompletedRetryAttempt,
+    operationSignal: AbortSignal,
+  ): Promise<void> {
+    if (
+      current.state.type !== "researching" ||
+      previousAttempt.retryDelayMs === undefined ||
+      previousAttempt.toolCallId === undefined
+    ) {
+      throw new ResearchLoopError();
+    }
+    const parsed = searchSourcesInputSchema.parse(intent.input);
+    const waited = await this.#waitBeforeRetry(
+      current,
+      previousAttempt.retryDelayMs,
+      "tool",
+    );
+    if (waited !== undefined) return;
+    // backoff 是一个可取消的调度边界；durable cancellation 会先 abort 当前
+    // operation。等待返回后必须重新检查，不能再为 terminal Run 启动 attempt。
+    if (operationSignal.aborted) return;
+    const startedAt = this.#clock.now();
+    const eventId = this.#ids.nextEventId();
+    const attempt: InProgressRetryAttempt = {
+      attemptId: `attempt-${eventId}`,
+      retrySequenceId: previousAttempt.retrySequenceId,
+      retrySequenceKind: "search_sources",
+      attemptNumber: previousAttempt.attemptNumber + 1,
+      retryPolicy: previousAttempt.retryPolicy,
+      startedAt,
+      outcome: "in_progress",
+      toolCallId: previousAttempt.toolCallId,
+      intentId: intent.intentId,
+    };
+    this.#appendEvents(current.runId, current.lastEventSequence, [{
+      eventId,
+      runId: current.runId,
+      sequence: current.lastEventSequence + 1,
+      type: "retry_attempt_started",
+      occurredAt: startedAt,
+      payload: { attempt },
+    }]);
+    await this.#runResearchLoopHook(
+      this.#researchLoopHooks.afterRetryAttemptStarted,
+    );
+    const prepared = await this.#prepareSearchResult(
+      current,
+      intent,
+      parsed,
+      this.#ids.nextObservationId(),
+      previousAttempt.toolCallId,
+      this.#clock.now(),
+      attempt,
+    );
+    this.#commitPreparedSearchResult(current.runId, prepared);
+    if (
+      prepared.attempt?.outcome === "retry_exhausted" ||
+      (prepared.attempt?.outcome === "permanent_failure" &&
+        prepared.attempt.failure?.category === "invariant_violation")
+    ) {
+      this.#commitBatchTerminalAttempt(
+        this.#store.readProjection(current.runId),
+        prepared.attempt,
+      );
+    }
+  }
+
+  async #executeSafeReadBatch(
+    current: RunProjection,
+    intents: readonly ResearchToolIntent[],
+    operationSignal: AbortSignal,
+  ): Promise<void> {
+    const remaining = this.#remainingBudget(current, this.#clock.now());
+    const approved: ApprovedSafeRead[] = [];
+    let reservableSourceBytes = remaining.sourceBytes;
+    let reservableDistinctSources = remaining.distinctSources;
+
+    for (const intent of intents.slice(0, remaining.toolCalls)) {
+      if (operationSignal.aborted) break;
+      const observationId = this.#ids.nextObservationId();
+      const toolCallId = this.#ids.nextToolCallId();
+      const observedAt = this.#clock.now();
+      if (intent.name === "search_sources") {
+        const parsed = searchSourcesInputSchema.safeParse(intent.input);
+        if (!parsed.success) {
+          this.#commitPreparedSearchResult(current.runId, {
+            observation: this.#createResearchObservation(
+              intent,
+              "invalid",
+              "invalid_tool_schema",
+              "search_sources invalid: invalid_tool_schema",
+              undefined,
+              observedAt,
+              toolCallId,
+              undefined,
+              observationId,
+            ),
+            completedAt: observedAt,
+          });
+          continue;
+        }
+        let rootsMatch = true;
+        for (const root of current.sourceScope.roots) {
+          if (!(await sourceRootIdentityStillMatches(root))) {
+            rootsMatch = false;
+            break;
+          }
+        }
+        if (!rootsMatch) {
+          this.#commitPreparedSearchResult(current.runId, {
+            observation: this.#createResearchObservation(
+              intent,
+              "failed",
+              "search_failed",
+              "search_sources failed: search_failed",
+              undefined,
+              observedAt,
+              toolCallId,
+              undefined,
+              observationId,
+            ),
+            completedAt: observedAt,
+          });
+          continue;
+        }
+        approved.push({
+          kind: "search",
+          intent,
+          input: parsed.data,
+          observationId,
+          toolCallId,
+          observedAt,
+        });
+        continue;
+      }
+      const parsed = readSourceRequestSchema.safeParse(intent.input);
+      if (!parsed.success) {
+        this.#commitPreparedSearchResult(current.runId, {
+          observation: this.#createResearchObservation(
+            intent,
+            "invalid",
+            "invalid_tool_schema",
+            "read_source invalid: invalid_tool_schema",
+            undefined,
+            observedAt,
+            toolCallId,
+            undefined,
+            observationId,
+          ),
+          completedAt: observedAt,
+        });
+        continue;
+      }
+      const preflight = await new PrivateSourceAccess(current.sourceScope)
+        .preflight(parsed.data, reservableSourceBytes);
+      if (preflight.status !== "approved") {
+        this.#commitPreparedReadResult(current.runId, this.#failedPreparedRead(
+          intent,
+          preflight.status,
+          preflight.code,
+          parsed.data,
+          observationId,
+          toolCallId,
+          observedAt,
+        ));
+        continue;
+      }
+      if (reservableDistinctSources === 0) {
+        this.#commitPreparedReadResult(current.runId, this.#failedPreparedRead(
+          intent,
+          "denied",
+          "source_budget_exceeded",
+          parsed.data,
+          observationId,
+          toolCallId,
+          observedAt,
+        ));
+        continue;
+      }
+      reservableDistinctSources -= 1;
+      reservableSourceBytes -= preflight.byteLength;
+      approved.push({
+        kind: "read",
+        intent,
+        input: parsed.data,
+        reservedSourceBytes: preflight.byteLength,
+        observationId,
+        toolCallId,
+        observedAt,
+      });
+    }
+
+    // preflight 全部按模型顺序完成后才启动外部 I/O；completion mutex 只包
+    // CAS 已形成后的短 Journal commit，绝不把 SQLite transaction 跨 search。
+    let commitTail = Promise.resolve();
+    await runWithConcurrency(
+      approved,
+      this.#safeReadConcurrency,
+      operationSignal,
+      async (candidate) => {
+        let attempt: InProgressRetryAttempt | undefined;
+        if (candidate.kind === "search" && current.retryPolicy !== undefined) {
+          const started = await this.#startBatchSearchAttempt(
+            current.runId,
+            candidate.intent,
+            candidate.toolCallId,
+            current.retryPolicy,
+          );
+          attempt = started.attempt;
+        }
+        const prepared = candidate.kind === "search"
+          ? operationSignal.aborted && attempt !== undefined
+            ? {
+                completedAt: this.#clock.now(),
+                attempt: this.#completeFailedAttempt(
+                  attempt,
+                  {
+                    category: "infrastructure_transient",
+                    code: "search_interrupted",
+                  },
+                ),
+              }
+            : await this.#prepareSearchResult(
+              current,
+              candidate.intent,
+              candidate.input,
+              candidate.observationId,
+              candidate.toolCallId,
+              candidate.observedAt,
+              attempt,
+            )
+          : await this.#prepareReadResult(
+              current,
+              candidate,
+            );
+        const priorCommit = commitTail;
+        let releaseCommit: () => void = () => undefined;
+        commitTail = new Promise<void>((resolve) => {
+          releaseCommit = resolve;
+        });
+        await priorCommit;
+        try {
+          if (candidate.kind === "search") {
+            this.#commitPreparedSearchResult(
+              current.runId,
+              prepared as PreparedSearchResult,
+            );
+            await this.#runResearchLoopHook(
+              this.#researchLoopHooks.afterSearchObservationJournalAppend,
+            );
+          } else {
+            this.#commitPreparedReadResult(
+              current.runId,
+              prepared as PreparedReadResult,
+            );
+            await this.#runResearchLoopHook(
+              this.#researchLoopHooks.afterReadObservationJournalAppend,
+            );
+          }
+        } finally {
+          releaseCommit();
+        }
+      },
+    );
+    const afterBatch = this.#store.readProjection(current.runId);
+    if (afterBatch.state.type !== "researching") return;
+    const terminalAttempt = this.#deferredBatchTerminalAttempt(afterBatch);
+    if (terminalAttempt?.outcome === "retry_exhausted") {
+      this.#commitBatchTerminalAttempt(afterBatch, terminalAttempt);
+    } else if (terminalAttempt?.outcome === "permanent_failure") {
+      this.#commitBatchTerminalAttempt(afterBatch, terminalAttempt);
+    }
+  }
+
+  async #prepareReadResult(
+    current: RunProjection,
+    candidate: ApprovedBatchRead,
+  ): Promise<PreparedReadResult> {
+    const result = await new PrivateSourceAccess(
+      current.sourceScope,
+      this.#sourceAccessHooks,
+    ).capture(candidate.input, candidate.reservedSourceBytes);
+    if (result.status !== "captured") {
+      const completedAt = this.#clock.now();
+      return this.#failedPreparedRead(
+        candidate.intent,
+        result.status,
+        result.code,
+        candidate.input,
+        candidate.observationId,
+        candidate.toolCallId,
+        candidate.observedAt,
+        completedAt,
+      );
+    }
+    let sourceSnapshot: PersistedSourceSnapshot;
+    try {
+      const snapshotCreatedAt = this.#clock.now();
+      sourceSnapshot = this.#store.prepareSourceSnapshotRegistration(
+        await this.#artifacts.putSourceSnapshot(
+          result.fullBytes,
+          snapshotCreatedAt,
+        ),
+      );
+      await this.#runResearchLoopHook(
+        this.#researchLoopHooks.afterReadSourceSnapshotWrite,
+      );
+    } catch (error) {
+      if (error instanceof ResearchLoopError) throw error;
+      const completedAt = this.#clock.now();
+      return this.#failedPreparedRead(
+        candidate.intent,
+        "failed",
+        "source_io_error",
+        candidate.input,
+        candidate.observationId,
+        candidate.toolCallId,
+        candidate.observedAt,
+        completedAt,
+      );
+    }
+    const completedAt = this.#clock.now();
+    const { createdAt: _createdAt, ...sourceSnapshotReference } = sourceSnapshot;
+    const observation: SourceReadObservation = {
+      observationId: candidate.observationId,
+      toolCallId: candidate.toolCallId,
+      toolName: "read_source",
+      requestHash: hashReadSourceRequest(candidate.input),
+      observedAt: candidate.observedAt,
+      status: "succeeded",
+      rootIndex: result.rootIndex,
+      relativePath: result.relativePath,
+      startLine: result.startLine,
+      endLine: result.endLine,
+      totalLines: result.totalLines,
+      excerpt: result.excerpt,
+      excerptHash: hashUtf8Text(result.excerpt),
+      sourceSnapshot: sourceSnapshotReference,
+      byteLength: result.byteLength,
+    };
+    return {
+      observation,
+      researchObservation: {
+        observationId: candidate.observationId,
+        toolCallId: candidate.toolCallId,
+        intentId: candidate.intent.intentId,
+        toolName: "read_source",
+        status: "succeeded",
+        summary: `读取 ${result.relativePath}:${result.startLine}-${result.endLine} 成功`,
+        output: { sourceObservationId: candidate.observationId },
+        observedAt: candidate.observedAt,
+      },
+      completedAt,
+      sourceSnapshot,
+    };
+  }
+
+  #failedPreparedRead(
+    intent: ResearchToolIntent,
+    status: "invalid" | "denied" | "failed",
+    code: string,
+    request: ReadSourceRequest,
+    observationId: string,
+    toolCallId: string,
+    observedAt = this.#clock.now(),
+    completedAt = observedAt,
+  ): PreparedReadResult {
+    const observation: SourceReadObservation = status === "failed"
+      ? {
+          observationId,
+          toolCallId,
+          toolName: "read_source",
+          requestHash: hashReadSourceRequest(request),
+          observedAt,
+          status: "failed",
+          code: code as SourceAccessFailureCode,
+        }
+      : {
+          observationId,
+          toolCallId,
+          toolName: "read_source",
+          requestHash: hashReadSourceRequest(request),
+          observedAt,
+          status: "denied",
+          code: status === "invalid"
+            ? "invalid_path"
+            : code as SourceAccessDenialCode,
+        };
+    return {
+      observation,
+      researchObservation: this.#createResearchObservation(
+        intent,
+        status,
+        code,
+        `read_source ${status}: ${code}`,
+        undefined,
+        observedAt,
+        toolCallId,
+        undefined,
+        observationId,
+      ),
+      completedAt,
+    };
+  }
+
+  #commitPreparedReadResult(
+    runId: string,
+    prepared: PreparedReadResult,
+  ): void {
+    const current = this.#store.readProjection(runId);
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "source_read_observed",
+      occurredAt: prepared.completedAt,
+      payload: {
+        observation: prepared.observation,
+        researchObservation: prepared.researchObservation,
+      },
+    };
+    this.#appendCompletedResearchResults(
+      current,
+      [event],
+      [],
+      prepared.sourceSnapshot === undefined ? [] : [prepared.sourceSnapshot],
+    );
+  }
+
+  async #prepareSearchResult(
+    current: RunProjection,
+    intent: ResearchToolIntent,
+    input: z.infer<typeof searchSourcesInputSchema>,
+    observationId: string,
+    toolCallId: string,
+    observedAt: string,
+    attempt?: InProgressRetryAttempt,
+  ): Promise<PreparedSearchResult> {
+    let matches: readonly SourceSearchMatch[];
+    try {
+      matches = await this.#sourceSearch.search(current.sourceScope, input);
+    } catch (error) {
+      const completedAt = this.#clock.now();
+      if (attempt !== undefined && error instanceof InfrastructureFailureError) {
+        return {
+          completedAt,
+          attempt: this.#completeFailedAttempt(
+            attempt,
+            this.#normalizeInfrastructureFailure(error),
+            completedAt,
+          ),
+        };
+      }
+      return {
+        observation: this.#createResearchObservation(
+          intent,
+          "failed",
+          "search_failed",
+          "search_sources failed: search_failed",
+          undefined,
+          observedAt,
+          toolCallId,
+          undefined,
+          observationId,
+        ),
+        completedAt,
+        ...(attempt === undefined ? {} : {
+          attempt: this.#completeFailedAttempt(
+            attempt,
+            { category: "tool_execution", code: "search_failed" },
+            completedAt,
+          ),
+        }),
+      };
+    }
+    try {
+      matches = parseSourceSearchMatches(matches);
+      if (matches.length > input.maxResults) throw new ResearchLoopError();
+    } catch {
+      const completedAt = this.#clock.now();
+      return attempt === undefined
+        ? {
+            observation: this.#createResearchObservation(
+              intent,
+              "failed",
+              "search_failed",
+              "search_sources failed: search_failed",
+              undefined,
+              observedAt,
+              toolCallId,
+              undefined,
+              observationId,
+            ),
+            completedAt,
+          }
+        : {
+            completedAt,
+            attempt: this.#completeFailedAttempt(
+              attempt,
+              { category: "invariant_violation", code: "invalid_search_result" },
+              completedAt,
+            ),
+          };
+    }
+    let artifact: PersistedArtifact;
+    try {
+      const artifactCreatedAt = this.#clock.now();
+      artifact = await this.#artifacts.putJson(
+        matches,
+        "application/json",
+        artifactCreatedAt,
+      );
+    } catch {
+      const completedAt = this.#clock.now();
+      return {
+        observation: this.#createResearchObservation(
+          intent,
+          "failed",
+          "search_failed",
+          "search_sources failed: search_failed",
+          undefined,
+          observedAt,
+          toolCallId,
+          undefined,
+          observationId,
+        ),
+        completedAt,
+        ...(attempt === undefined ? {} : {
+          attempt: this.#completeFailedAttempt(
+            attempt,
+            {
+              category: "tool_execution",
+              code: "search_result_persistence_failed",
+            },
+            completedAt,
+          ),
+        }),
+      };
+    }
+    await this.#runResearchLoopHook(
+      this.#researchLoopHooks.afterSearchResultArtifactWrite,
+    );
+    const completedAt = this.#clock.now();
+    return {
+      observation: this.#createResearchObservation(
+        intent,
+        "succeeded",
+        undefined,
+        `找到 ${matches.length} 个批准来源命中`,
+        {
+          searchResultArtifact: stripArtifactCreatedAt(artifact),
+          matchCount: matches.length,
+        },
+        observedAt,
+        toolCallId,
+        undefined,
+        observationId,
+      ),
+      completedAt,
+      artifact,
+      ...(attempt === undefined
+        ? {}
+        : {
+            attempt: this.#completeSucceededAttempt(
+              attempt,
+              completedAt,
+            ),
+          }),
+    };
+  }
+
+  #commitPreparedSearchResult(
+    runId: string,
+    prepared: PreparedSearchResult,
+  ): void {
+    const current = this.#store.readProjection(runId);
+    if (prepared.observation === undefined) {
+      if (prepared.attempt?.failure === undefined) throw new ResearchLoopError();
+      this.#appendCompletedResearchResults(current, [{
+        eventId: this.#ids.nextEventId(),
+        runId,
+        sequence: current.lastEventSequence + 1,
+        type: "retry_attempt_failed",
+        occurredAt: prepared.completedAt,
+        payload: { attempt: prepared.attempt },
+      }]);
+      return;
+    }
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "research_tool_observed",
+      occurredAt: prepared.completedAt,
+      payload: {
+        observation: prepared.observation,
+        ...(prepared.attempt === undefined ? {} : { attempt: prepared.attempt }),
+      },
+    };
+    this.#appendCompletedResearchResults(
+      current,
+      [event],
+      prepared.artifact === undefined ? [] : [prepared.artifact],
+    );
+  }
+
+  async #startBatchSearchAttempt(
+    runId: string,
+    intent: ResearchToolIntent,
+    toolCallId: string,
+    retryPolicy: RetryPolicy,
+  ): Promise<StartedAttemptResult> {
+    const current = this.#store.readProjection(runId);
+    const startedAt = this.#clock.now();
+    const eventId = this.#ids.nextEventId();
+    const attempt: InProgressRetryAttempt = {
+      attemptId: `attempt-${eventId}`,
+      retrySequenceId: `retry-sequence-${eventId}`,
+      retrySequenceKind: "search_sources",
+      attemptNumber: 1,
+      retryPolicy,
+      startedAt,
+      outcome: "in_progress",
+      toolCallId,
+      intentId: intent.intentId,
+    };
+    const projection = this.#appendEvents(
+      runId,
+      current.lastEventSequence,
+      [{
+        eventId,
+        runId,
+        sequence: current.lastEventSequence + 1,
+        type: "retry_attempt_started",
+        occurredAt: startedAt,
+        payload: { attempt },
+      }],
+    );
+    await this.#runResearchLoopHook(
+      this.#researchLoopHooks.afterRetryAttemptStarted,
+    );
+    return { projection, attempt };
+  }
+
+  #commitBatchTerminalAttempt(
+    current: RunProjection,
+    attempt: CompletedRetryAttempt,
+  ): void {
+    if (attempt.failure === undefined) throw new ResearchLoopError();
+    this.#appendCompletedResearchResults(current, [{
+      eventId: this.#ids.nextEventId(),
+      runId: current.runId,
+      sequence: current.lastEventSequence + 1,
+      type: attempt.outcome === "retry_exhausted"
+        ? "run_retry_exhausted"
+        : "run_failed",
+      occurredAt: attempt.completedAt,
+      payload: attempt.outcome === "retry_exhausted"
+        ? {
+            retrySequenceId: attempt.retrySequenceId,
+            retrySequenceKind: attempt.retrySequenceKind,
+            attemptsUsed: attempt.attemptNumber,
+            failure: attempt.failure,
+          }
+        : {
+            retrySequenceId: attempt.retrySequenceId,
+            retrySequenceKind: attempt.retrySequenceKind,
+            failure: attempt.failure,
+          },
+    } as ResearchRunEvent]);
+  }
+
+  #deferredBatchTerminalAttempt(
+    current: RunProjection,
+  ): CompletedRetryAttempt | undefined {
+    if (
+      current.state.type !== "researching" ||
+      current.state.retryAttempts.some((attempt) => attempt.outcome === "in_progress")
+    ) {
+      return undefined;
+    }
+    return current.state.retryAttempts.find((attempt): attempt is CompletedRetryAttempt =>
+      attempt.outcome === "retry_exhausted" ||
+      (attempt.outcome === "permanent_failure" &&
+        attempt.failure?.category === "invariant_violation")
+    );
   }
 
   async #executeSearchIntent(
@@ -1810,9 +2623,10 @@ export class ResearchAgentRuntime {
     failure = code === undefined
       ? undefined
       : this.#classifyResearchObservationFailure(status, code),
+    observationId = this.#ids.nextObservationId(),
   ): ResearchToolObservation {
     return {
-      observationId: this.#ids.nextObservationId(),
+      observationId,
       toolCallId,
       intentId: intent.intentId,
       toolName: intent.name,
@@ -1930,15 +2744,18 @@ export class ResearchAgentRuntime {
     current: RunProjection,
   ): CompletedRetryAttempt | undefined {
     if (current.state.type !== "researching") return undefined;
-    const latest = current.state.retryAttempts.at(-1);
-    if (latest?.outcome !== "in_progress") return undefined;
+    const pending = current.state.retryAttempts.find(
+      (attempt): attempt is InProgressRetryAttempt =>
+        attempt.outcome === "in_progress",
+    );
+    if (pending === undefined) return undefined;
     const failure: NormalizedFailure = {
       category: "infrastructure_transient",
-      code: latest.retrySequenceKind === "model_turn"
+      code: pending.retrySequenceKind === "model_turn"
         ? "model_turn_interrupted"
         : "search_interrupted",
     };
-    return this.#completeFailedAttempt(latest, failure);
+    return this.#completeFailedAttempt(pending, failure);
   }
 
   #completeSucceededAttempt(
@@ -1956,8 +2773,8 @@ export class ResearchAgentRuntime {
   #completeFailedAttempt(
     attempt: InProgressRetryAttempt,
     failure: NormalizedFailure,
+    completedAt = this.#clock.now(),
   ): CompletedRetryAttempt {
-    const completedAt = this.#clock.now();
     const retryable = failure.category === "infrastructure_transient";
     const maxAttempts = attempt.retrySequenceKind === "model_turn"
       ? attempt.retryPolicy.modelMaxAttempts
@@ -1993,7 +2810,12 @@ export class ResearchAgentRuntime {
       payload: { attempt },
     };
     const events: ResearchRunEvent[] = [failureEvent];
-    if (attempt.retryDelayMs === undefined) {
+    const hasOtherInProgressAttempt = current.state.type === "researching" &&
+      current.state.retryAttempts.some((candidate) =>
+        candidate.outcome === "in_progress" &&
+        candidate.attemptId !== attempt.attemptId
+      );
+    if (attempt.retryDelayMs === undefined && !hasOtherInProgressAttempt) {
       events.push({
         eventId: this.#ids.nextEventId(),
         runId: current.runId,
@@ -2299,7 +3121,10 @@ export class ResearchAgentRuntime {
       approvedByteLimit - current.state.sourceBytesRead,
     );
     const requestHash = hashReadSourceRequest(request);
-    const access = new PrivateSourceAccess(current.sourceScope);
+    const access = new PrivateSourceAccess(
+      current.sourceScope,
+      this.#sourceAccessHooks,
+    );
     const result = await access.capture(request, remainingSourceBytes);
     const observedAt = this.#clock.now();
     const lineage = {
@@ -3341,6 +4166,46 @@ function parseOperationHeartbeatInterval(
     throw new Error("operationHeartbeatIntervalMs 必须小于 lease duration 的正整数");
   }
   return value;
+}
+
+function parseSafeReadConcurrency(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 32) {
+    throw new Error("safeReadConcurrency 必须是 1 到 32 的整数");
+  }
+  return value;
+}
+
+function leadingSafeReadIntents(
+  pendingIntents: readonly ResearchToolIntent[],
+): readonly ResearchToolIntent[] {
+  const result: ResearchToolIntent[] = [];
+  for (const intent of pendingIntents) {
+    if (intent.name !== "search_sources" && intent.name !== "read_source") break;
+    result.push(intent);
+  }
+  return result;
+}
+
+async function runWithConcurrency<T>(
+  values: readonly T[],
+  concurrency: number,
+  abortSignal: AbortSignal,
+  worker: (value: T) => Promise<void>,
+): Promise<void> {
+  let nextIndex = 0;
+  const runners = Array.from(
+    { length: Math.min(concurrency, values.length) },
+    async () => {
+      while (!abortSignal.aborted) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const value = values[index];
+        if (value === undefined) return;
+        await worker(value);
+      }
+    },
+  );
+  await Promise.all(runners);
 }
 
 function addMilliseconds(isoUtc: string, durationMs: number): string {

@@ -61,6 +61,7 @@ describe("PrivateSourceAccess", () => {
       relativePath: "notes.md",
       startLine: 2,
       endLine: 3,
+      byteLength: original.byteLength,
     });
     await expect(snapshotFiles(fixture.runtimeHome)).resolves.toEqual([]);
 

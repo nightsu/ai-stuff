@@ -1,8 +1,8 @@
-# Evidence Research Agent 架构（Issue #10）
+# Evidence Research Agent 架构（Issue #11）
 
-当前 slice 在 durable Run control 上补齐 per-run Run Operation lease、heartbeat、expiry 与独立 cancellation request。Harness 继续拥有单步 Research Loop、Research Tool 调度、retry、Journal、审批和 publication；control plane 只保护 command ownership，永远不能替代 canonical Run Journal。
+当前 slice 在 durable Run control 上补齐 safe read sibling batch：Harness 先按模型顺序完成 schema、Source Scope、source bytes 与 distinct sources 预算 preflight，再让 replay-safe search/read 有界并发。Journal 保留真实 completion 顺序；Projection 与 Model View 恢复模型原始 intent 顺序。并发 Retry Attempts 必须全部闭合后才能提交其中一个 terminal transition；若此前崩溃，重启先闭合 interrupted attempts，再结算已 durable 的 terminal sibling。retry backoff 后也必须重新检查 cancellation。Run Operation control plane 仍只保护 command ownership，永远不能替代 canonical Run Journal。
 
-外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。当前仍没有并行 tool batch 或 publication crash reconciliation；这些分别属于后续 tickets。
+外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。只有开头连续的 `search_sources` / `read_source` sibling batch 可以并发；Evidence、Claim、completion 与 publication crash reconciliation 分别保持顺序或留给后续 ticket。
 
 ## 组件、端口与单向能力流
 
@@ -28,7 +28,9 @@ flowchart LR
   Retry --> Attempts
   Attempts -->|"failure / exhaustion / failed"| Journal
   Attempts -->|"atomic success + Model Turn"| Journal
-  Loop --> Scheduler["Research Tool Scheduler<br/>sequential in Issue #6"]
+  Loop --> Scheduler["Research Tool Scheduler<br/>source-ordered preflight"]
+  Scheduler --> SafeBatch["Safe read batch<br/>bounded concurrency"]
+  Scheduler --> StateQueue["State tool queue<br/>strict sequence"]
 
   subgraph ResearchTools["Exactly five model-visible Research Tools"]
     Search["search_sources"]
@@ -38,11 +40,11 @@ flowchart LR
     CompleteResearch["complete_research"]
   end
 
-  Scheduler --> Search
-  Scheduler --> Read
-  Scheduler --> RecordEvidence
-  Scheduler --> ProposeClaim
-  Scheduler --> CompleteResearch
+  SafeBatch --> Search
+  SafeBatch --> Read
+  StateQueue --> RecordEvidence
+  StateQueue --> ProposeClaim
+  StateQueue --> CompleteResearch
 
   subgraph SourceBoundary["Private source boundary"]
     Policy["Shared Source policy<br/>canonical root + realpath preflight"]
@@ -61,7 +63,7 @@ flowchart LR
   end
 
   Search --> Policy
-  Scheduler --> Attempts
+  SafeBatch --> Attempts
   Policy --> Searcher
   Searcher -->|"bounded matches"| SearchArtifact
   SearchArtifact --> Registry
@@ -107,7 +109,9 @@ Model generation 与 `search_sources` 都遵循同一个 attempt protocol：外�
 
 provider hint 是服务端最短等待，不能被本地 backoff 上限截短；本地指数 backoff 本身受 `maxDelayMs` 限制。attempt start 初始化 Research Loop wall-time，等待也消耗该时间；每次等待后、下一外部 I/O 前重新计算批准预算，耗尽则先 durable 进入 `budget_exhausted`。因此 retry 同时受 attempt policy 与 wall-time policy 约束。
 
-Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_turn_completed`。该事件同时把有序 tool intents 变为 durable pending work；重启后的 `advanceResearch` 会先消费这些 pending intents，而不是再次 generation。`ResearchLoopLifecycleHooks` 为测试暴露 Model Turn 以及五个 Research Tool 的命名 Fault Injection Points：Model Turn 有 Journal append 前/后；search/read 有私有 CAS 写入后与 Journal/registry 原子提交后；Evidence、Claim 和 completion 有 Journal commit 前/后。commit 前中断时 pending intent 仍是 canonical work，重启会重试；commit 后中断时 Journal 已消费 intent，重启不会重复工具。search/read 的孤立 CAS 对象不能冒充 Journal 事实。Issue #6 的 scheduler 刻意顺序执行全部 intents；safe sibling search/read 的并发和原始顺序回填留给 Issue #11。
+Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_turn_completed`。该事件同时把有序 tool intents 变为 durable pending work；重启后的 `advanceResearch` 会先消费这些 pending intents，而不是再次 generation。scheduler 只取开头连续的 safe read intents：schema、root identity、Source Scope 与 read-byte reservation 按模型顺序执行，批准的外部 I/O 再受 `safeReadConcurrency` 限制。Artifact/Snapshot 完成后通过短 commit queue 按真实完成先后进入 Journal；reducer 只在当前 Model Turn 内按 intent ordinal 重排 observations，因而历史 turn 不漂移，下一 Model View 也不受调度影响。后续 Evidence、Claim 与 completion 继续严格顺序。
+
+`ResearchLoopLifecycleHooks` 为测试暴露 Model Turn 以及五个 Research Tool 的命名 Fault Injection Points：Model Turn 有 Journal append 前/后；search/read 有私有 CAS 写入后与 Journal/registry 原子提交后；Evidence、Claim 和 completion 有 Journal commit 前/后。commit 前中断时 pending intent 仍是 canonical work，重启会重试；commit 后中断时 Journal 已消费 intent，重启不会重复工具。search/read 的孤立 CAS 对象不能冒充 Journal 事实。启用 Retry Policy 时 sibling searches 各自先 durable start attempt，completion 可乱序闭合；transient retry 只推进对应 Retry Sequence，并复用原逻辑 `toolCallId`。
 
 `search_sources` 与 `read_source` 共享 Source Scope 权限边界。搜索通过可注入 `SourceSearchPort` 调用默认的固定参数 `rg` adapter，下推 extension、exclusion、secret 与 file-size 过滤，启动前复核批准 root identity，每个命中再过 realpath preflight。完整命中列表写入私有 JSON Artifact；Journal observation 只保存 artifact 引用和 `matchCount`，下一轮 Model View 再按需校验并展开最近结果。搜索仍不创建 Source Snapshot。只有成功 explicit read 才冻结完整原始 UTF-8 字节；`invalid`、`denied`、`stale` 与 `failed` 都只落安全 observation。Evidence Record 也没有读取 live file 的能力，只能由 Runtime 从已持久化的成功 observation 逐字段派生。
 
@@ -263,5 +267,4 @@ Trace 先暴露非秘密 Experiment Identity，再依次暴露不含秘密的 li
 
 ## 当前边界与后续 ticket
 
-- Issue #11 才加入 safe search/read sibling batch 的有界并发与模型原始顺序回填。
 - Issue #14 才把 publication 外部 effect 的 crash reconciliation 做成 durable protocol。

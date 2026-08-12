@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  InfrastructureFailureError,
   IllegalSourceReadStateError,
   ModelViewTooLargeError,
   ResearchAgentRuntime,
@@ -36,6 +37,1237 @@ afterEach(async () => {
 });
 
 describe("ResearchAgentRuntime bounded Research Loop", () => {
+  it("runs sibling safe searches concurrently while restoring model intent order", async () => {
+    const firstStarted = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const secondStarted = deferred<void>();
+    const secondCommitted = deferred<void>();
+    const completionOrder: string[] = [];
+    const sourceSearch: SourceSearchPort = {
+      search: async (_scope, request) => {
+        if (request.query === "first") {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+          completionOrder.push("first");
+          return [];
+        }
+        secondStarted.resolve();
+        completionOrder.push("second");
+        return [];
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [
+        {
+          text: "并发检查两个批准来源查询。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [
+            {
+              intentId: "search-first",
+              name: "search_sources",
+              input: { query: "first", maxResults: 1 },
+            },
+            {
+              intentId: "search-second",
+              name: "search_sources",
+              input: { query: "second", maxResults: 1 },
+            },
+          ],
+        },
+        turn("complete", "complete_research", { unresolvedQuestions: [] }),
+      ],
+      {},
+      {
+        clock: tickingClock(),
+        sourceSearch,
+        researchLoopHooks: {
+          afterSearchObservationJournalAppend: () => {
+            secondCommitted.resolve();
+          },
+        },
+      },
+    );
+
+    try {
+      const advancing = fixture.runtime.advanceResearch({ runId: fixture.runId });
+      await firstStarted.promise;
+      await expect(Promise.race([
+        secondStarted.promise.then(() => "started"),
+        delay(100).then(() => "timeout"),
+      ])).resolves.toBe("started");
+      await secondCommitted.promise;
+      releaseFirst.resolve();
+
+      const completed = await advancing;
+      expect(completionOrder).toEqual(["second", "first"]);
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        researchToolObservations: [
+          expect.objectContaining({ intentId: "search-first" }),
+          expect.objectContaining({ intentId: "search-second" }),
+          expect.objectContaining({ toolName: "complete_research" }),
+        ],
+      });
+      expect(fixture.model.researchViews[1]?.recentObservations).toMatchObject([
+        { intentId: "search-first" },
+        { intentId: "search-second" },
+      ]);
+
+      const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+      const searchCompletions = trace.events.filter((event) =>
+        event.type === "research_tool_observed"
+      );
+      expect(searchCompletions.map((event) => event.observationId)).toEqual([
+        "observation-002",
+        "observation-001",
+      ]);
+      expect(Date.parse(searchCompletions[0]!.occurredAt)).toBeLessThan(
+        Date.parse(searchCompletions[1]!.occurredAt),
+      );
+    } finally {
+      releaseFirst.resolve();
+      fixture.runtime.close();
+    }
+  });
+
+  it("keeps sibling safe searches concurrent under an approved Retry Policy", async () => {
+    const firstStarted = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const secondStarted = deferred<void>();
+    const sourceSearch: SourceSearchPort = {
+      search: async (_scope, request) => {
+        if (request.query === "first") {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        } else {
+          secondStarted.resolve();
+        }
+        return [];
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [
+        {
+          text: "启用 retry 时仍并发执行两个安全 search。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [
+            {
+              intentId: "search-first",
+              name: "search_sources",
+              input: { query: "first", maxResults: 1 },
+            },
+            {
+              intentId: "search-second",
+              name: "search_sources",
+              input: { query: "second", maxResults: 1 },
+            },
+          ],
+        },
+        turn("complete", "complete_research", { unresolvedQuestions: [] }),
+      ],
+      {},
+      {
+        sourceSearch,
+        retryPolicy: {
+          version: "retry-v1",
+          modelMaxAttempts: 2,
+          toolMaxAttempts: 2,
+          baseDelayMs: 1,
+          maxDelayMs: 2,
+        },
+      },
+    );
+
+    try {
+      const advancing = fixture.runtime.advanceResearch({ runId: fixture.runId });
+      await firstStarted.promise;
+      await expect(Promise.race([
+        secondStarted.promise.then(() => "started"),
+        delay(100).then(() => "timeout"),
+      ])).resolves.toBe("started");
+      releaseFirst.resolve();
+
+      const completed = await advancing;
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        researchToolObservations: [
+          expect.objectContaining({ intentId: "search-first", status: "succeeded" }),
+          expect.objectContaining({ intentId: "search-second", status: "succeeded" }),
+          expect.objectContaining({ toolName: "complete_research" }),
+        ],
+      });
+      if (completed.state.type !== "research_complete") {
+        throw new Error("测试要求 Research Loop 完成");
+      }
+      expect(completed.state.retryAttempts.filter(
+        (attempt) => attempt.retrySequenceKind === "search_sources",
+      )).toMatchObject([
+        { intentId: "search-first", outcome: "succeeded" },
+        { intentId: "search-second", outcome: "succeeded" },
+      ]);
+    } finally {
+      releaseFirst.resolve();
+      fixture.runtime.close();
+    }
+  });
+
+  it("retries one transient sibling search without rerunning its successful sibling", async () => {
+    const calls = new Map<string, number>();
+    const sourceSearch: SourceSearchPort = {
+      search: async (_scope, request) => {
+        const count = (calls.get(request.query) ?? 0) + 1;
+        calls.set(request.query, count);
+        if (request.query === "retry" && count === 1) {
+          throw new InfrastructureFailureError("service_unavailable");
+        }
+        return [];
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [
+        {
+          text: "一个 sibling transient 时只重试该逻辑调用。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [
+            {
+              intentId: "search-retry",
+              name: "search_sources",
+              input: { query: "retry", maxResults: 1 },
+            },
+            {
+              intentId: "search-once",
+              name: "search_sources",
+              input: { query: "once", maxResults: 1 },
+            },
+          ],
+        },
+        turn("complete", "complete_research", { unresolvedQuestions: [] }),
+      ],
+      {},
+      {
+        sourceSearch,
+        retryPolicy: {
+          version: "retry-v1",
+          modelMaxAttempts: 2,
+          toolMaxAttempts: 2,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+        },
+      },
+    );
+
+    try {
+      const completed = await fixture.runtime.advanceResearch({ runId: fixture.runId });
+      expect(Object.fromEntries(calls)).toEqual({ retry: 2, once: 1 });
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        researchToolObservations: [
+          expect.objectContaining({ intentId: "search-retry", status: "succeeded" }),
+          expect.objectContaining({ intentId: "search-once", status: "succeeded" }),
+          expect.objectContaining({ toolName: "complete_research" }),
+        ],
+      });
+      if (completed.state.type !== "research_complete") {
+        throw new Error("测试要求 Research Loop 完成");
+      }
+      const searchAttempts = completed.state.retryAttempts.filter(
+        (attempt) => attempt.retrySequenceKind === "search_sources",
+      );
+      expect(searchAttempts.map((attempt) => ({
+        intentId: attempt.intentId,
+        attemptNumber: attempt.attemptNumber,
+        outcome: attempt.outcome,
+      }))).toEqual([
+        { intentId: "search-retry", attemptNumber: 1, outcome: "retryable_failure" },
+        { intentId: "search-once", attemptNumber: 1, outcome: "succeeded" },
+        { intentId: "search-retry", attemptNumber: 2, outcome: "succeeded" },
+      ]);
+      expect(new Set(
+        searchAttempts
+          .filter((attempt) => attempt.intentId === "search-retry")
+          .map((attempt) => attempt.toolCallId),
+      ).size).toBe(1);
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("fails deterministically when an earlier sibling search violates the port contract", async () => {
+    const sourceSearch: SourceSearchPort = {
+      search: async (_scope, request) =>
+        request.query === "invalid"
+          ? [{
+              rootIndex: -1,
+              relativePath: "journal.md",
+              lineNumber: 0,
+              lineText: "invalid",
+            }]
+          : [],
+    };
+    const fixture = await createApprovedLoopRun(
+      [{
+        text: "较早 sibling 的 invariant failure 必须稳定终止 Run。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [
+          {
+            intentId: "search-invalid",
+            name: "search_sources",
+            input: { query: "invalid", maxResults: 1 },
+          },
+          {
+            intentId: "search-valid",
+            name: "search_sources",
+            input: { query: "valid", maxResults: 1 },
+          },
+        ],
+      }],
+      {},
+      {
+        sourceSearch,
+        retryPolicy: {
+          version: "retry-v1",
+          modelMaxAttempts: 2,
+          toolMaxAttempts: 1,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+        },
+      },
+    );
+
+    try {
+      const failed = await fixture.runtime.advanceResearch({ runId: fixture.runId });
+      expect(failed.state).toMatchObject({
+        type: "failed",
+        retrySequenceKind: "search_sources",
+        failure: {
+          category: "invariant_violation",
+          code: "invalid_search_result",
+        },
+        researchToolObservations: [
+          expect.objectContaining({ intentId: "search-valid", status: "succeeded" }),
+        ],
+      });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("recovers every interrupted sibling attempt before settling retry exhaustion", async () => {
+    const bothSearchAttemptsStarted = deferred<void>();
+    let retryHookCalls = 0;
+    let searchAttemptStarts = 0;
+    let searchCalls = 0;
+    const sourceSearch: SourceSearchPort = {
+      search: async () => {
+        searchCalls += 1;
+        return [];
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [{
+        text: "两个 sibling attempt started 后模拟进程同时中断。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [
+          {
+            intentId: "search-first",
+            name: "search_sources",
+            input: { query: "first", maxResults: 1 },
+          },
+          {
+            intentId: "search-second",
+            name: "search_sources",
+            input: { query: "second", maxResults: 1 },
+          },
+        ],
+      }],
+      {},
+      {
+        sourceSearch,
+        retryPolicy: {
+          version: "retry-v1",
+          modelMaxAttempts: 2,
+          toolMaxAttempts: 1,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+        },
+        researchLoopHooks: {
+          afterRetryAttemptStarted: async () => {
+            retryHookCalls += 1;
+            if (retryHookCalls === 1) return;
+            searchAttemptStarts += 1;
+            if (searchAttemptStarts === 2) bothSearchAttemptsStarted.resolve();
+            await bothSearchAttemptsStarted.promise;
+            throw new Error("模拟 sibling search I/O 前进程中断");
+          },
+        },
+      },
+    );
+
+    try {
+      await expect(fixture.runtime.advanceResearch({ runId: fixture.runId }))
+        .rejects.toBeInstanceOf(ResearchLoopError);
+      const interrupted = await fixture.runtime.inspectRun({ runId: fixture.runId });
+      expect(interrupted.state).toMatchObject({
+        type: "researching",
+        retryAttempts: [
+          expect.objectContaining({ retrySequenceKind: "model_turn", outcome: "succeeded" }),
+          expect.objectContaining({ intentId: "search-first", outcome: "in_progress" }),
+          expect.objectContaining({ intentId: "search-second", outcome: "in_progress" }),
+        ],
+      });
+      fixture.runtime.close();
+
+      const restarted = ResearchAgentRuntime.open({
+        runtimeHome: fixture.runtimeHome,
+        outputRoot: fixture.outputRoot,
+        model: fixture.model,
+        sourceSearch,
+        clock: fixedClock(),
+      });
+      try {
+        const exhausted = await restarted.advanceResearch({ runId: fixture.runId });
+        expect(exhausted.state).toMatchObject({
+          type: "retry_exhausted",
+          retrySequenceKind: "search_sources",
+          retryAttempts: [
+            expect.objectContaining({ retrySequenceKind: "model_turn", outcome: "succeeded" }),
+            expect.objectContaining({ intentId: "search-first", outcome: "retry_exhausted" }),
+            expect.objectContaining({ intentId: "search-second", outcome: "retry_exhausted" }),
+          ],
+        });
+        if (exhausted.state.type !== "retry_exhausted") {
+          throw new Error("测试要求 retry_exhausted 状态");
+        }
+        expect(exhausted.state.retryAttempts.some(
+          (attempt) => attempt.outcome === "in_progress",
+        )).toBe(false);
+        expect(searchCalls).toBe(0);
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("settles an earlier terminal sibling after restart before retrying an interrupted sibling", async () => {
+    const terminalCommitted = deferred<void>();
+    let retryHookCalls = 0;
+    const calls = new Map<string, number>();
+    const sourceSearch: SourceSearchPort = {
+      search: async (_scope, request) => {
+        calls.set(request.query, (calls.get(request.query) ?? 0) + 1);
+        return request.query === "invalid"
+          ? [{
+              rootIndex: -1,
+              relativePath: "journal.md",
+              lineNumber: 0,
+              lineText: "invalid",
+            }]
+          : [];
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [{
+        text: "较早 sibling terminal 后，较后 sibling 在 I/O 前中断。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [
+          {
+            intentId: "search-invalid",
+            name: "search_sources",
+            input: { query: "invalid", maxResults: 1 },
+          },
+          {
+            intentId: "search-interrupted",
+            name: "search_sources",
+            input: { query: "interrupted", maxResults: 1 },
+          },
+        ],
+      }],
+      {},
+      {
+        sourceSearch,
+        retryPolicy: {
+          version: "retry-v1",
+          modelMaxAttempts: 2,
+          toolMaxAttempts: 2,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+        },
+        researchLoopHooks: {
+          afterRetryAttemptStarted: async () => {
+            retryHookCalls += 1;
+            if (retryHookCalls !== 3) return;
+            await terminalCommitted.promise;
+            throw new Error("模拟较后 sibling I/O 前进程中断");
+          },
+          afterSearchObservationJournalAppend: () => {
+            terminalCommitted.resolve();
+          },
+        },
+      },
+    );
+
+    try {
+      await expect(fixture.runtime.advanceResearch({ runId: fixture.runId }))
+        .rejects.toBeInstanceOf(ResearchLoopError);
+      const interrupted = await fixture.runtime.inspectRun({ runId: fixture.runId });
+      expect(interrupted.state).toMatchObject({
+        type: "researching",
+        retryAttempts: [
+          expect.objectContaining({ retrySequenceKind: "model_turn", outcome: "succeeded" }),
+          expect.objectContaining({
+            intentId: "search-invalid",
+            outcome: "permanent_failure",
+            failure: expect.objectContaining({ category: "invariant_violation" }),
+          }),
+          expect.objectContaining({
+            intentId: "search-interrupted",
+            outcome: "in_progress",
+          }),
+        ],
+      });
+      fixture.runtime.close();
+
+      const restarted = ResearchAgentRuntime.open({
+        runtimeHome: fixture.runtimeHome,
+        outputRoot: fixture.outputRoot,
+        model: fixture.model,
+        sourceSearch,
+        clock: fixedClock(),
+      });
+      try {
+        const failed = await restarted.advanceResearch({ runId: fixture.runId });
+        expect(failed.state).toMatchObject({
+          type: "failed",
+          retrySequenceKind: "search_sources",
+          failure: {
+            category: "invariant_violation",
+            code: "invalid_search_result",
+          },
+        });
+        if (failed.state.type !== "failed") throw new Error("测试要求 failed 状态");
+        expect(failed.state.retryAttempts).toHaveLength(3);
+        expect(failed.state.retryAttempts).toEqual(expect.arrayContaining([
+          expect.objectContaining({ intentId: "search-invalid", outcome: "permanent_failure" }),
+          expect.objectContaining({
+            intentId: "search-interrupted",
+            outcome: "retryable_failure",
+          }),
+        ]));
+        expect(Object.fromEntries(calls)).toEqual({ invalid: 1 });
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      terminalCommitted.resolve();
+      fixture.runtime.close();
+    }
+  });
+
+  it("runs sibling source reads concurrently and keeps Projection in model order", async () => {
+    const firstReadStarted = deferred<void>();
+    const releaseFirstRead = deferred<void>();
+    const secondReadStarted = deferred<void>();
+    const secondReadCommitted = deferred<void>();
+    const hookStarts: string[] = [];
+    const fixture = await createApprovedLoopRun(
+      [
+        {
+          text: "并发读取两个已批准来源。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [
+            {
+              intentId: "read-first",
+              name: "read_source",
+              input: {
+                rootIndex: 0,
+                relativePath: "journal.md",
+                startLine: 1,
+                endLine: 1,
+              },
+            },
+            {
+              intentId: "read-second",
+              name: "read_source",
+              input: {
+                rootIndex: 0,
+                relativePath: "other.md",
+                startLine: 1,
+                endLine: 1,
+              },
+            },
+          ],
+        },
+        turn("complete", "complete_research", { unresolvedQuestions: [] }),
+      ],
+      {},
+      {
+        clock: tickingClock(),
+        sourceAccessHooks: {
+          afterPreflight: async (approved) => {
+            hookStarts.push(approved.relativePath);
+            if (approved.relativePath === "journal.md") {
+              firstReadStarted.resolve();
+              await releaseFirstRead.promise;
+            } else {
+              secondReadStarted.resolve();
+            }
+          },
+        },
+        researchLoopHooks: {
+          afterReadObservationJournalAppend: () => {
+            secondReadCommitted.resolve();
+          },
+        },
+      },
+    );
+
+    try {
+      const advancing = fixture.runtime.advanceResearch({ runId: fixture.runId });
+      await firstReadStarted.promise;
+      await expect(Promise.race([
+        secondReadStarted.promise.then(() => "started"),
+        delay(100).then(() => "timeout"),
+      ])).resolves.toBe("started");
+      await secondReadCommitted.promise;
+      releaseFirstRead.resolve();
+
+      const completed = await advancing;
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        sourceReadObservations: [
+          expect.objectContaining({ relativePath: "journal.md" }),
+          expect.objectContaining({ relativePath: "other.md" }),
+        ],
+        researchToolObservations: [
+          expect.objectContaining({ intentId: "read-first" }),
+          expect.objectContaining({ intentId: "read-second" }),
+          expect.objectContaining({ toolName: "complete_research" }),
+        ],
+      });
+      expect(fixture.model.researchViews[1]?.recentObservations).toMatchObject([
+        { intentId: "read-first" },
+        { intentId: "read-second" },
+      ]);
+      const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+      const readCompletions = trace.events.filter((event) =>
+        event.type === "source_read_observed"
+      );
+      expect(readCompletions.map((event) => event.observationId)).toEqual([
+        "observation-002",
+        "observation-001",
+      ]);
+      expect(Date.parse(readCompletions[0]!.occurredAt)).toBeLessThan(
+        Date.parse(readCompletions[1]!.occurredAt),
+      );
+    } finally {
+      releaseFirstRead.resolve();
+      fixture.runtime.close();
+    }
+  });
+
+  it("reserves sibling read bytes in model order before any capture starts", async () => {
+    const captureStarts: string[] = [];
+    const fixture = await createApprovedLoopRun(
+      [
+        {
+          text: "按顺序预留只够一个来源的读取预算。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [
+            {
+              intentId: "read-first",
+              name: "read_source",
+              input: {
+                rootIndex: 0,
+                relativePath: "journal.md",
+                startLine: 1,
+                endLine: 1,
+              },
+            },
+            {
+              intentId: "read-second",
+              name: "read_source",
+              input: {
+                rootIndex: 0,
+                relativePath: "other.md",
+                startLine: 1,
+                endLine: 1,
+              },
+            },
+          ],
+        },
+        turn("complete", "complete_research", { unresolvedQuestions: [] }),
+      ],
+      { maxSourceBytes: 40 },
+      {
+        sourceAccessHooks: {
+          afterPreflight: (approved) => {
+            captureStarts.push(approved.relativePath);
+          },
+        },
+      },
+    );
+
+    try {
+      const completed = await fixture.runtime.advanceResearch({ runId: fixture.runId });
+      expect(captureStarts).toEqual(["journal.md"]);
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        sourceReadObservations: [
+          expect.objectContaining({ status: "succeeded", relativePath: "journal.md" }),
+          expect.objectContaining({ status: "denied", code: "source_budget_exceeded" }),
+        ],
+        researchToolObservations: [
+          expect.objectContaining({ intentId: "read-first", status: "succeeded" }),
+          expect.objectContaining({
+            intentId: "read-second",
+            status: "denied",
+            code: "source_budget_exceeded",
+          }),
+          expect.objectContaining({ toolName: "complete_research" }),
+        ],
+      });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("reserves sibling distinct-source slots in model order before capture", async () => {
+    const captureStarts: string[] = [];
+    const fixture = await createApprovedLoopRun(
+      [{
+        text: "只批准一个 distinct source 时只启动模型顺序中的首个 read。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [
+          {
+            intentId: "read-first",
+            name: "read_source",
+            input: {
+              rootIndex: 0,
+              relativePath: "journal.md",
+              startLine: 1,
+              endLine: 1,
+            },
+          },
+          {
+            intentId: "read-second",
+            name: "read_source",
+            input: {
+              rootIndex: 0,
+              relativePath: "other.md",
+              startLine: 1,
+              endLine: 1,
+            },
+          },
+        ],
+      }],
+      { maxDistinctSources: 1 },
+      {
+        sourceAccessHooks: {
+          afterPreflight: (approved) => {
+            captureStarts.push(approved.relativePath);
+          },
+        },
+      },
+    );
+
+    try {
+      const suspended = await fixture.runtime.advanceResearch({ runId: fixture.runId });
+      expect(captureStarts).toEqual(["journal.md"]);
+      expect(suspended.state).toMatchObject({
+        type: "budget_exhausted",
+        exhaustedDimension: "distinct_sources",
+        sourceReadObservations: [
+          expect.objectContaining({ status: "succeeded", relativePath: "journal.md" }),
+          expect.objectContaining({
+            status: "denied",
+            code: "source_budget_exceeded",
+          }),
+        ],
+        researchToolObservations: [
+          expect.objectContaining({ intentId: "read-first", status: "succeeded" }),
+          expect.objectContaining({
+            intentId: "read-second",
+            status: "denied",
+            code: "source_budget_exceeded",
+          }),
+        ],
+      });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("keeps a successful sibling search when another sibling fails", async () => {
+    const sourceSearch: SourceSearchPort = {
+      search: async (_scope, request) => {
+        if (request.query === "fails") throw new Error("private detail");
+        return [{
+          rootIndex: 0,
+          relativePath: "journal.md",
+          lineNumber: 1,
+          lineText: "Run Journal 是 canonical history。",
+        }];
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [
+        {
+          text: "一个只读 sibling 失败时保留另一个成功结果。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [
+            {
+              intentId: "search-fails",
+              name: "search_sources",
+              input: { query: "fails", maxResults: 1 },
+            },
+            {
+              intentId: "search-succeeds",
+              name: "search_sources",
+              input: { query: "succeeds", maxResults: 1 },
+            },
+          ],
+        },
+        turn("complete", "complete_research", {
+          unresolvedQuestions: ["第一个 search 不可用"],
+        }),
+      ],
+      {},
+      { sourceSearch },
+    );
+
+    try {
+      const completed = await fixture.runtime.advanceResearch({ runId: fixture.runId });
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        researchToolObservations: [
+          expect.objectContaining({
+            intentId: "search-fails",
+            status: "failed",
+            code: "search_failed",
+          }),
+          expect.objectContaining({
+            intentId: "search-succeeds",
+            status: "succeeded",
+          }),
+          expect.objectContaining({ toolName: "complete_research" }),
+        ],
+      });
+      expect(fixture.model.researchViews[1]?.recentObservations).toMatchObject([
+        { intentId: "search-fails", status: "failed" },
+        {
+          intentId: "search-succeeds",
+          status: "succeeded",
+          output: { matches: [expect.objectContaining({ relativePath: "journal.md" })] },
+        },
+      ]);
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("builds the same Projection and next Model View for either sibling completion order", async () => {
+    const sharedSourceRoot = await createTemporaryDirectory(
+      "research-loop-deterministic-source-",
+    );
+
+    const runWithBlockedQuery = async (blockedQuery: "first" | "second") => {
+      const firstStarted = deferred<void>();
+      const secondStarted = deferred<void>();
+      const releaseBlocked = deferred<void>();
+      const firstCommitted = deferred<void>();
+      let committed = false;
+      const sourceSearch: SourceSearchPort = {
+        search: async (_scope, request) => {
+          (request.query === "first" ? firstStarted : secondStarted).resolve();
+          if (request.query === blockedQuery) await releaseBlocked.promise;
+          return [{
+            rootIndex: 0,
+            relativePath: `${request.query}.md`,
+            lineNumber: 1,
+            lineText: request.query,
+          }];
+        },
+      };
+      const fixture = await createApprovedLoopRun(
+        [
+          {
+            text: "以任意物理完成顺序执行两个 search。",
+            evidenceGaps: [],
+            finishReason: "tool_calls",
+            toolIntents: [
+              {
+                intentId: "search-first",
+                name: "search_sources",
+                input: { query: "first", maxResults: 1 },
+              },
+              {
+                intentId: "search-second",
+                name: "search_sources",
+                input: { query: "second", maxResults: 1 },
+              },
+            ],
+          },
+          turn("complete", "complete_research", { unresolvedQuestions: [] }),
+        ],
+        {},
+        {
+          fixtureSourceRoot: sharedSourceRoot,
+          sourceSearch,
+          researchLoopHooks: {
+            afterSearchObservationJournalAppend: () => {
+              if (!committed) {
+                committed = true;
+                firstCommitted.resolve();
+              }
+            },
+          },
+        },
+      );
+
+      try {
+        const advancing = fixture.runtime.advanceResearch({ runId: fixture.runId });
+        await Promise.all([firstStarted.promise, secondStarted.promise]);
+        await firstCommitted.promise;
+        releaseBlocked.resolve();
+        const projection = await advancing;
+        const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+        return {
+          projection,
+          nextView: fixture.model.researchViews[1],
+          journalOrder: trace.events
+            .filter((event) => event.type === "research_tool_observed")
+            .map((event) => event.observationId),
+        };
+      } finally {
+        releaseBlocked.resolve();
+        fixture.runtime.close();
+      }
+    };
+
+    const secondFinishesFirst = await runWithBlockedQuery("first");
+    const firstFinishesFirst = await runWithBlockedQuery("second");
+
+    expect(secondFinishesFirst.journalOrder).toEqual([
+      "observation-002",
+      "observation-001",
+    ]);
+    expect(firstFinishesFirst.journalOrder).toEqual([
+      "observation-001",
+      "observation-002",
+    ]);
+    expect(secondFinishesFirst.projection).toEqual(firstFinishesFirst.projection);
+    expect(secondFinishesFirst.nextView).toEqual(firstFinishesFirst.nextView);
+  });
+
+  it("does not reorder historical source reads when a later turn reuses an intent ID", async () => {
+    const fixture = await createApprovedLoopRun([
+      {
+        text: "第一轮读取两个来源。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [
+          {
+            intentId: "shared-read",
+            name: "read_source",
+            input: {
+              rootIndex: 0,
+              relativePath: "journal.md",
+              startLine: 1,
+              endLine: 1,
+            },
+          },
+          {
+            intentId: "old-other",
+            name: "read_source",
+            input: {
+              rootIndex: 0,
+              relativePath: "other.md",
+              startLine: 1,
+              endLine: 1,
+            },
+          },
+        ],
+      },
+      {
+        text: "第二轮复用一个 intent identity。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [
+          {
+            intentId: "current-first",
+            name: "read_source",
+            input: {
+              rootIndex: 0,
+              relativePath: "tiny.md",
+              startLine: 1,
+              endLine: 1,
+            },
+          },
+          {
+            intentId: "shared-read",
+            name: "read_source",
+            input: {
+              rootIndex: 0,
+              relativePath: "journal.md",
+              startLine: 1,
+              endLine: 1,
+            },
+          },
+        ],
+      },
+      turn("complete", "complete_research", { unresolvedQuestions: [] }),
+    ], { maxDistinctSources: 8, maxToolCalls: 12 });
+
+    try {
+      const completed = await fixture.runtime.advanceResearch({ runId: fixture.runId });
+      expect(completed.state).toMatchObject({ type: "research_complete" });
+      if (completed.state.type !== "research_complete") {
+        throw new Error("测试要求 Research Loop 完成");
+      }
+      expect(completed.state.sourceReadObservations.map(
+        (observation) => observation.status === "succeeded"
+          ? observation.relativePath
+          : observation.code,
+      )).toEqual([
+        "journal.md",
+        "other.md",
+        "tiny.md",
+        "journal.md",
+      ]);
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("executes state-changing intents sequentially after a safe sibling batch", async () => {
+    const fixture = await createApprovedLoopRun([
+      {
+        text: "读取后按模型顺序登记 Evidence、Claim 并完成。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [
+          {
+            intentId: "read-first",
+            name: "read_source",
+            input: {
+              rootIndex: 0,
+              relativePath: "journal.md",
+              startLine: 1,
+              endLine: 1,
+            },
+          },
+          {
+            intentId: "read-second",
+            name: "read_source",
+            input: {
+              rootIndex: 0,
+              relativePath: "other.md",
+              startLine: 1,
+              endLine: 1,
+            },
+          },
+          {
+            intentId: "evidence",
+            name: "record_evidence",
+            input: { observationId: "observation-001" },
+          },
+          {
+            intentId: "claim",
+            name: "propose_claim",
+            input: {
+              kind: "source_fact",
+              text: "Run Journal 是 canonical history。",
+              evidenceIds: ["evidence-event-008"],
+            },
+          },
+          {
+            intentId: "complete",
+            name: "complete_research",
+            input: { unresolvedQuestions: [] },
+          },
+        ],
+      },
+    ]);
+
+    try {
+      const completed = await fixture.runtime.advanceResearch({ runId: fixture.runId });
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        researchToolObservations: [
+          expect.objectContaining({ intentId: "read-first" }),
+          expect.objectContaining({ intentId: "read-second" }),
+          expect.objectContaining({ intentId: "evidence", toolName: "record_evidence" }),
+          expect.objectContaining({ intentId: "claim", toolName: "propose_claim" }),
+          expect.objectContaining({ intentId: "complete", toolName: "complete_research" }),
+        ],
+        evidenceRecords: [expect.objectContaining({ evidenceId: "evidence-event-008" })],
+        claims: [expect.objectContaining({ claimId: "claim-event-009" })],
+      });
+      const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+      expect(trace.events.filter((event) => [
+        "source_read_observed",
+        "evidence_recorded",
+        "claim_recorded",
+        "research_completed",
+      ].includes(event.type)).map((event) => event.type)).toEqual([
+        "source_read_observed",
+        "source_read_observed",
+        "evidence_recorded",
+        "claim_recorded",
+        "research_completed",
+      ]);
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("does not start queued safe reads after cancellation", async () => {
+    const firstStarted = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const calls: string[] = [];
+    const sourceSearch: SourceSearchPort = {
+      search: async (_scope, request) => {
+        calls.push(request.query);
+        if (request.query === "first") {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+        return [];
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [{
+        text: "取消时第二个只读调用仍在队列中。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [
+          {
+            intentId: "search-first",
+            name: "search_sources",
+            input: { query: "first", maxResults: 1 },
+          },
+          {
+            intentId: "search-second",
+            name: "search_sources",
+            input: { query: "second", maxResults: 1 },
+          },
+          {
+            intentId: "complete",
+            name: "complete_research",
+            input: { unresolvedQuestions: [] },
+          },
+        ],
+      }],
+      {},
+      { sourceSearch, safeReadConcurrency: 1 },
+    );
+
+    try {
+      const advancing = fixture.runtime.advanceResearch({ runId: fixture.runId });
+      await firstStarted.promise;
+      await expect(fixture.runtime.cancelRun({ runId: fixture.runId }))
+        .resolves.toMatchObject({ state: { type: "cancelled" } });
+      releaseFirst.resolve();
+
+      const cancelled = await advancing;
+      expect(calls).toEqual(["first"]);
+      expect(cancelled.state).toMatchObject({
+        type: "cancelled",
+        cancelledState: {
+          type: "researching",
+          researchToolObservations: [
+            expect.objectContaining({ intentId: "search-first", status: "succeeded" }),
+          ],
+          pendingToolIntents: [
+            expect.objectContaining({ intentId: "search-second" }),
+            expect.objectContaining({ intentId: "complete" }),
+          ],
+        },
+      });
+    } finally {
+      releaseFirst.resolve();
+      fixture.runtime.close();
+    }
+  });
+
+  it("does not start a sibling search retry after cancellation during backoff", async () => {
+    const waitStarted = deferred<void>();
+    const releaseWait = deferred<void>();
+    const calls = new Map<string, number>();
+    const sourceSearch: SourceSearchPort = {
+      search: async (_scope, request) => {
+        const count = (calls.get(request.query) ?? 0) + 1;
+        calls.set(request.query, count);
+        if (request.query === "retry" && count === 1) {
+          throw new InfrastructureFailureError("service_unavailable");
+        }
+        return [];
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [{
+        text: "backoff 期间取消后不能启动排队 retry。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [
+          {
+            intentId: "search-retry",
+            name: "search_sources",
+            input: { query: "retry", maxResults: 1 },
+          },
+          {
+            intentId: "search-once",
+            name: "search_sources",
+            input: { query: "once", maxResults: 1 },
+          },
+        ],
+      }],
+      {},
+      {
+        sourceSearch,
+        retryPolicy: {
+          version: "retry-v1",
+          modelMaxAttempts: 2,
+          toolMaxAttempts: 2,
+          baseDelayMs: 10,
+          maxDelayMs: 10,
+        },
+        retryScheduler: {
+          wait: async () => {
+            waitStarted.resolve();
+            await releaseWait.promise;
+          },
+        },
+      },
+    );
+
+    try {
+      const advancing = fixture.runtime.advanceResearch({ runId: fixture.runId });
+      await waitStarted.promise;
+      await expect(fixture.runtime.cancelRun({ runId: fixture.runId }))
+        .resolves.toMatchObject({ state: { type: "cancelled" } });
+      releaseWait.resolve();
+
+      await expect(advancing).resolves.toMatchObject({ state: { type: "cancelled" } });
+      expect(Object.fromEntries(calls)).toEqual({ retry: 1, once: 1 });
+    } finally {
+      releaseWait.resolve();
+      fixture.runtime.close();
+    }
+  });
+
   it("rebuilds a Model View across five Harness-dispatched Research Tools and completes explicitly", async () => {
     const runtimeHome = await createTemporaryDirectory("research-loop-runtime-");
     const sourceRoot = await createTemporaryDirectory("research-loop-source-");
@@ -1813,14 +3045,24 @@ async function createApprovedLoopRun(
   limits: Partial<RunBudget> = {},
   runtimeOptions: Pick<
     OpenRuntimeOptions,
-    "maxModelViewBytes" | "clock" | "sourceSearch" | "researchLoopHooks"
+    | "maxModelViewBytes"
+    | "clock"
+    | "sourceSearch"
+    | "researchLoopHooks"
+    | "sourceAccessHooks"
+    | "safeReadConcurrency"
+    | "retryPolicy"
+    | "retryScheduler"
   > & {
     /** 可选 draft 模型脚本，用于断言预算在 Model Port 调用之前阻断副作用。 */
     readonly learningArtifactProposals?: ConstructorParameters<typeof ScriptedModel>[1];
+    /** 多个独立 Runtime fixture 可复用的 canonical Source Root。 */
+    readonly fixtureSourceRoot?: string;
   } = {},
 ) {
   const runtimeHome = await createTemporaryDirectory("research-loop-errors-runtime-");
-  const sourceRoot = await createTemporaryDirectory("research-loop-errors-source-");
+  const sourceRoot = runtimeOptions.fixtureSourceRoot ??
+    await createTemporaryDirectory("research-loop-errors-source-");
   const outputRoot = await createTemporaryDirectory("research-loop-errors-output-");
   await Promise.all([
     writeFile(join(sourceRoot, "journal.md"), "Run Journal 是 canonical history。\n", "utf8"),
@@ -1848,6 +3090,18 @@ async function createApprovedLoopRun(
     ...(runtimeOptions.researchLoopHooks === undefined
       ? {}
       : { researchLoopHooks: runtimeOptions.researchLoopHooks }),
+    ...(runtimeOptions.sourceAccessHooks === undefined
+      ? {}
+      : { sourceAccessHooks: runtimeOptions.sourceAccessHooks }),
+    ...(runtimeOptions.safeReadConcurrency === undefined
+      ? {}
+      : { safeReadConcurrency: runtimeOptions.safeReadConcurrency }),
+    ...(runtimeOptions.retryPolicy === undefined
+      ? {}
+      : { retryPolicy: runtimeOptions.retryPolicy }),
+    ...(runtimeOptions.retryScheduler === undefined
+      ? {}
+      : { retryScheduler: runtimeOptions.retryScheduler }),
     ...(runtimeOptions.maxModelViewBytes === undefined
       ? {}
       : { maxModelViewBytes: runtimeOptions.maxModelViewBytes }),
@@ -1893,6 +3147,14 @@ function fixedClock(): Clock {
   return { now: () => "2026-08-12T08:00:00.000Z" };
 }
 
+function tickingClock(): Clock {
+  let milliseconds = 0;
+  return {
+    now: () =>
+      new Date(Date.UTC(2026, 7, 12, 8, 0, 0, milliseconds++)).toISOString(),
+  };
+}
+
 function sequentialIds(startAt = 0): IdGenerator {
   let event = startAt;
   let toolCall = startAt;
@@ -1911,4 +3173,16 @@ async function createTemporaryDirectory(prefix: string): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), prefix));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+function deferred<T>() {
+  let resolvePromise: (value: T | PromiseLike<T>) => void = () => undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
+
+async function delay(durationMs: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, durationMs));
 }

@@ -53,6 +53,8 @@ export interface SourceAccessApproved {
   readonly startLine: number;
   /** 原样保留的请求末行，使用 1-based inclusive 语义。 */
   readonly endLine: number;
+  /** 预检时普通文件的完整精确字节数，用于 batch 顺序预留预算。 */
+  readonly byteLength: number;
 }
 
 /** 预检只返回安全的批准元数据或稳定的非成功结果。 */
@@ -109,8 +111,10 @@ type EvaluatedSource = ReadySource | SourceAccessDenied | SourceAccessFailed;
 const READ_CHUNK_BYTES = 64 * 1024;
 /** capture 生命周期中的可选异步边界，不接收私有路径或源字节。 */
 export interface SourceAccessLifecycleHooks {
-  /** 完整预检通过后、打开 candidate handle 前运行的可选协调回调。 */
-  readonly afterPreflight?: () => void | Promise<void>;
+  /** 完整预检通过后、打开 candidate handle 前接收安全批准元数据的可选协调回调。 */
+  readonly afterPreflight?: (
+    approved: SourceAccessApproved,
+  ) => void | Promise<void>;
   /** 完整字节读出后、最终版本与路径复核前运行的可选协调回调。 */
   readonly afterRead?: () => void | Promise<void>;
 }
@@ -226,7 +230,7 @@ export class PrivateSourceAccess {
       return evaluated;
     }
     try {
-      await this.#hooks.afterPreflight?.();
+      await this.#hooks.afterPreflight?.(evaluated.approved);
     } catch {
       return failed("source_io_error");
     }
@@ -451,6 +455,7 @@ export class PrivateSourceAccess {
         relativePath: normalizedRelativePath,
         startLine: request.startLine,
         endLine: request.endLine,
+        byteLength: Number(metadata.size),
       },
     };
   }

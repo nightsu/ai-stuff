@@ -1116,7 +1116,15 @@ describe("source_read_observed schema and reducer boundary", () => {
     }
     const observation = sourceEvent.payload.observation;
     const tamperCases = [
-      ["event time", { ...observation, observedAt: "2026-08-12T09:00:00.000Z" }],
+      [
+        "event time",
+        {
+          ...observation,
+          observedAt: new Date(
+            Date.parse(sourceEvent.occurredAt) + 1,
+          ).toISOString(),
+        },
+      ],
       ["request hash", { ...observation, requestHash: "0".repeat(64) }],
       ["excerpt hash", { ...observation, excerptHash: "0".repeat(64) }],
       [
