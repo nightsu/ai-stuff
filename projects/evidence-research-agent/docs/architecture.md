@@ -1,6 +1,6 @@
-# Evidence Research Agent 架构（Issue #14）
+# Evidence Research Agent 架构（Issue #15 毕业状态）
 
-当前 slice 把 publish-ready report 的最终写出升级为 durable Publication Effect。action identity 稳定绑定 Run、approved draft hash 与 canonical target path；Run Journal 区分 PENDING、EXECUTING、UNKNOWN、CONFLICT 与 SUCCEEDED。任何 crash window 都必须通过显式 `reconcilePublicationEffect` 检查 exact approved target bytes，绝不盲目重放或覆盖。
+毕业状态把完整系统暴露在同一个 `ResearchAgentRuntime` 主 seam：CLI 只负责逐命令打开 Runtime，live Model/Evaluator adapter 只在需要 generation 时加载；Run Journal、Projection、Research Loop、审批、Run Operation、Evidence Gate 与 Publication Effect 仍由 headless Runtime 统一约束。action identity 稳定绑定 Run、approved draft hash 与 canonical target path；Run Journal 区分 PENDING、EXECUTING、UNKNOWN、CONFLICT 与 SUCCEEDED。任何 crash window 都必须通过显式 `reconcilePublicationEffect` 检查 exact approved target bytes，绝不盲目重放或覆盖。
 
 外层 workflow 仍由 Harness 确定性控制。Research Model 与 Evaluator 都不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。Evaluator 也不能看到 Model View、Run Journal 或 Research Loop history。
 
@@ -8,7 +8,10 @@
 
 ```mermaid
 flowchart LR
-  Caller["TypeScript caller / CLI"] --> Runtime["ResearchAgentRuntime"]
+  Caller["TypeScript caller"] --> Runtime["ResearchAgentRuntime"]
+  Cli["CLI"] --> Runtime
+  CliLive["CLI live adapter loader<br/>environment only"] --> Model
+  Cli -->|"advance / propose / evaluator retry"| CliLive
   Runtime --> Operation["Run Operation control plane<br/>lease + heartbeat + cancel request"]
   Runtime --> Harness["Deterministic Harness"]
   Operation --> Journal
@@ -86,6 +89,7 @@ flowchart LR
   Projection --> Budget["Five-dimensional Run Budget"]
   Budget -->|"hard limit"| Exhausted["budget_exhausted"]
   Caller --> Control["pause / resume / cancel<br/>extend-budget"]
+  Cli --> Control
   Control --> Journal
   Projection --> ResearchComplete["research_complete"]
   Gate["Deterministic Evidence Gate"]
@@ -134,7 +138,7 @@ provider hint 是服务端最短等待，不能被本地 backoff 上限截短；
 
 Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_turn_completed`。该事件同时把有序 tool intents 变为 durable pending work；重启后的 `advanceResearch` 会先消费这些 pending intents，而不是再次 generation。scheduler 只取开头连续的 safe read intents：schema、root identity、Source Scope 与 read-byte reservation 按模型顺序执行，批准的外部 I/O 再受 `safeReadConcurrency` 限制。Artifact/Snapshot 完成后通过短 commit queue 按真实完成先后进入 Journal；reducer 只在当前 Model Turn 内按 intent ordinal 重排 observations，因而历史 turn 不漂移，下一 Model View 也不受调度影响。后续 Evidence、Claim 与 completion 继续严格顺序。
 
-`ResearchLoopLifecycleHooks` 为测试暴露 Model Turn 以及五个 Research Tool 的命名 Fault Injection Points：Model Turn 有 Journal append 前/后；search/read 有私有 CAS 写入后与 Journal/registry 原子提交后；Evidence、Claim 和 completion 有 Journal commit 前/后。commit 前中断时 pending intent 仍是 canonical work，重启会重试；commit 后中断时 Journal 已消费 intent，重启不会重复工具。search/read 的孤立 CAS 对象不能冒充 Journal 事实。启用 Retry Policy 时 sibling searches 各自先 durable start attempt，completion 可乱序闭合；transient retry 只推进对应 Retry Sequence，并复用原逻辑 `toolCallId`。
+`ResearchLoopLifecycleHooks` 为测试暴露 Model Turn 以及五个 Research Tool 的命名 Fault Injection Points：Model Turn 有 Journal append 前/后；search/read 有私有 CAS 写入后与 Journal/registry 原子提交后；Evidence、Claim 和 completion 有 Journal commit 前/后。`ApprovalLifecycleHooks` 同样覆盖 plan/publication Receipt commit 前后。commit 前中断时 canonical waiting/pending work 保留，重启会重试；commit 后中断时 Journal 已消费 intent 或审批，重启返回同一 Projection 而不追加第二个事实。search/read 的孤立 CAS 对象不能冒充 Journal 事实。启用 Retry Policy 时 sibling searches 各自先 durable start attempt，completion 可乱序闭合；transient retry 只推进对应 Retry Sequence，并复用原逻辑 `toolCallId`。
 
 `search_sources` 与 `read_source` 共享 Source Scope 权限边界。搜索通过可注入 `SourceSearchPort` 调用默认的固定参数 `rg` adapter，下推 extension、exclusion、secret 与 file-size 过滤，启动前复核批准 root identity，每个命中再过 realpath preflight。完整命中列表写入私有 JSON Artifact；Journal observation 只保存 artifact 引用和 `matchCount`，下一轮 Model View 再按需校验并展开最近结果。搜索仍不创建 Source Snapshot。只有成功 explicit read 才冻结完整原始 UTF-8 字节；`invalid`、`denied`、`stale` 与 `failed` 都只落安全 observation。Evidence Record 也没有读取 live file 的能力，只能由 Runtime 从已持久化的成功 observation 逐字段派生。
 

@@ -91,6 +91,7 @@ export {
 } from "./application/ports.js";
 export type {
   AdvanceResearchCommand,
+  ApprovalLifecycleHooks,
   ApprovePlanCommand,
   ApprovePublicationCommand,
   CancelRunCommand,

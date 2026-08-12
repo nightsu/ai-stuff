@@ -1,0 +1,35 @@
+{
+  "fixtureVersion": "local-journal-plan-v1",
+  "question": "Run Journal 为什么支持崩溃恢复？",
+  "sourceScope": {
+    "roots": [
+      {
+        "canonicalPath": "/fixture/local-journal-plan-v1",
+        "device": "1",
+        "inode": "1"
+      }
+    ],
+    "exclusions": [],
+    "allowedExtensions": [".md"],
+    "maxFileBytes": 4096,
+    "maxTotalBytes": 4096
+  },
+  "budget": {
+    "version": "eval-budget-v1",
+    "maxModelTurns": 1,
+    "maxToolCalls": 1,
+    "maxDistinctSources": 1,
+    "maxSourceBytes": 4096,
+    "maxWallTimeMs": 120000
+  },
+  "repetitions": 2,
+  "expected": {
+    "minObjectives": 1,
+    "minSteps": 1,
+    "forbiddenTerms": [
+      "EVIDENCE_MODEL_API_KEY",
+      "ollama-local",
+      "Runtime Home"
+    ]
+  }
+}

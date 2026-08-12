@@ -840,6 +840,121 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
     }
   });
 
+  it("keeps the exact Publication Approval durable after its post-commit fault point", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "approval-fault.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试要求等待 publication approval");
+    }
+    fixture.runtime.close();
+
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(75),
+      clock: fixedPublicationClock(),
+      approvalHooks: {
+        afterPublicationApprovalCommit: () => {
+          throw new Error("simulated approval process interruption");
+        },
+      },
+    });
+    await expect(interrupted.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    })).rejects.toThrow(/publication approval/);
+    const committed = await interrupted.inspectRun({ runId: fixture.runId });
+    expect(committed.state).toMatchObject({
+      type: "ready_to_publish",
+      publicationReceipt: {
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      },
+    });
+    interrupted.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(80),
+      clock: fixedPublicationClock(),
+    });
+    try {
+      await expect(restarted.approvePublication({
+        runId: fixture.runId,
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      })).resolves.toEqual(committed);
+      const trace = await restarted.traceRun({ runId: fixture.runId });
+      expect(trace.events.filter((event) =>
+        event.type === "publication_approved"
+      )).toHaveLength(1);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("leaves Publication Approval unconsumed at its pre-commit fault point", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "approval-pre-commit.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试要求等待 publication approval");
+    }
+    fixture.runtime.close();
+
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(75),
+      clock: fixedPublicationClock(),
+      approvalHooks: {
+        beforePublicationApprovalCommit: () => {
+          throw new Error("simulated approval process interruption");
+        },
+      },
+    });
+    await expect(interrupted.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    })).rejects.toThrow(/publication approval/);
+    await expect(interrupted.inspectRun({ runId: fixture.runId })).resolves
+      .toEqual(waiting);
+    const interruptedTrace = await interrupted.traceRun({ runId: fixture.runId });
+    expect(interruptedTrace.events.some((event) =>
+      event.type === "publication_approved"
+    )).toBe(false);
+    interrupted.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(80),
+      clock: fixedPublicationClock(),
+    });
+    try {
+      await expect(restarted.approvePublication({
+        runId: fixture.runId,
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      })).resolves.toMatchObject({ state: { type: "ready_to_publish" } });
+      const trace = await restarted.traceRun({ runId: fixture.runId });
+      expect(trace.events.filter((event) =>
+        event.type === "publication_approved"
+      )).toHaveLength(1);
+    } finally {
+      restarted.close();
+    }
+  });
+
   it("blocks draft creation when a source read has no valid Evidence Record and leaves no draft artifact", async () => {
     const fixture = await createEvidenceReadyRun({ recordEvidenceAndClaim: false });
     const targetPath = join(fixture.outputDirectory, "blocked.md");

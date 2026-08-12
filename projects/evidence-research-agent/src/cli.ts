@@ -13,6 +13,7 @@ import {
   RunBusyError,
   StalePlanApprovalError,
 } from "./application/research-agent-runtime.js";
+import type { EvaluatorPort, ModelPort } from "./application/ports.js";
 import { formatRunTrace } from "./application/trace-format.js";
 import type {
   ResearchPlan,
@@ -28,9 +29,19 @@ export interface CliIo {
   readonly stderr: (message: string) => void;
 }
 
+/** CLI 的进程外 system boundaries；测试可替换 live provider 装载。 */
+export interface CliDependencies {
+  /** 从环境配置创建同时实现 Model/Evaluator Port 的 live adapter。 */
+  readonly loadLiveModelPort: () => Promise<ModelPort & EvaluatorPort>;
+}
+
 const processIo: CliIo = {
   stdout: (message) => console.log(message),
   stderr: (message) => console.error(message),
+};
+
+const productionDependencies: CliDependencies = {
+  loadLiveModelPort,
 };
 
 const DEFAULT_RUN_BUDGET: RunBudget = Object.freeze({
@@ -45,6 +56,7 @@ const DEFAULT_RUN_BUDGET: RunBudget = Object.freeze({
 export async function runCli(
   args: readonly string[],
   io: CliIo = processIo,
+  dependencies: CliDependencies = productionDependencies,
 ): Promise<number> {
   const jsonRequested = args.includes("--json");
   try {
@@ -76,7 +88,7 @@ export async function runCli(
         const question = requireOption(values.question, "--question");
         const roots = requireMultipleOption(values["source-root"], "--source-root");
         const model = values["live-model"]
-          ? await loadLiveModelPort()
+          ? await dependencies.loadLiveModelPort()
           : new ScriptedModel([createLearningPlan(question)]);
         const runtime = ResearchAgentRuntime.open({
           runtimeHome,
@@ -160,6 +172,43 @@ export async function runCli(
         });
         try {
           const projection = await runtime.approvePlan({ runId, bindingHash });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
+      case "advance": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "live-model": { type: "boolean", default: false },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+            steering: { type: "string" },
+          },
+        });
+        if (!values["live-model"]) {
+          throw new CliUsageError("advance 需要显式 --live-model");
+        }
+        const model = await dependencies.loadLiveModelPort();
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(
+            requireOption(values["runtime-home"], "--runtime-home"),
+          ),
+          model,
+          evaluator: model,
+        });
+        try {
+          const projection = await runtime.advanceResearch({
+            runId: requireOption(values["run-id"], "--run-id"),
+            ...(values.steering === undefined
+              ? {}
+              : { steering: values.steering }),
+          });
           io.stdout(formatProjection(projection, values.json));
         } finally {
           runtime.close();
@@ -309,6 +358,182 @@ export async function runCli(
                 "--max-wall-time-ms",
               ),
             },
+          });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
+      case "propose-artifact": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "live-model": { type: "boolean", default: false },
+            "output-root": { type: "string" },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+            "target-path": { type: "string" },
+          },
+        });
+        if (!values["live-model"]) {
+          throw new CliUsageError("propose-artifact 需要显式 --live-model");
+        }
+        const model = await dependencies.loadLiveModelPort();
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(
+            requireOption(values["runtime-home"], "--runtime-home"),
+          ),
+          outputRoot: resolve(
+            requireOption(values["output-root"], "--output-root"),
+          ),
+          model,
+          evaluator: model,
+        });
+        try {
+          const projection = await runtime.proposeLearningArtifact({
+            runId: requireOption(values["run-id"], "--run-id"),
+            targetPath: resolve(
+              requireOption(values["target-path"], "--target-path"),
+            ),
+          });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
+      case "retry-evaluator": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "live-model": { type: "boolean", default: false },
+            "output-root": { type: "string" },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
+        if (!values["live-model"]) {
+          throw new CliUsageError("retry-evaluator 需要显式 --live-model");
+        }
+        const model = await dependencies.loadLiveModelPort();
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(
+            requireOption(values["runtime-home"], "--runtime-home"),
+          ),
+          outputRoot: resolve(
+            requireOption(values["output-root"], "--output-root"),
+          ),
+          model,
+          evaluator: model,
+        });
+        try {
+          const projection = await runtime.retryEvaluatorReview({
+            runId: requireOption(values["run-id"], "--run-id"),
+          });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
+      case "skip-evaluator": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "output-root": { type: "string" },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(
+            requireOption(values["runtime-home"], "--runtime-home"),
+          ),
+          outputRoot: resolve(
+            requireOption(values["output-root"], "--output-root"),
+          ),
+          model: new ScriptedModel([]),
+        });
+        try {
+          const projection = await runtime.skipEvaluatorReview({
+            runId: requireOption(values["run-id"], "--run-id"),
+          });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
+      case "approve-publication": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            "binding-hash": { type: "string" },
+            json: { type: "boolean", default: false },
+            "output-root": { type: "string" },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(
+            requireOption(values["runtime-home"], "--runtime-home"),
+          ),
+          outputRoot: resolve(
+            requireOption(values["output-root"], "--output-root"),
+          ),
+          model: new ScriptedModel([]),
+        });
+        try {
+          const projection = await runtime.approvePublication({
+            runId: requireOption(values["run-id"], "--run-id"),
+            bindingHash: requireOption(
+              values["binding-hash"],
+              "--binding-hash",
+            ),
+          });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
+      case "publish": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "output-root": { type: "string" },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(
+            requireOption(values["runtime-home"], "--runtime-home"),
+          ),
+          outputRoot: resolve(
+            requireOption(values["output-root"], "--output-root"),
+          ),
+          model: new ScriptedModel([]),
+        });
+        try {
+          const projection = await runtime.publishLearningArtifact({
+            runId: requireOption(values["run-id"], "--run-id"),
           });
           io.stdout(formatProjection(projection, values.json));
         } finally {

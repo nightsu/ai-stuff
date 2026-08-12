@@ -1,0 +1,95 @@
+{
+  "resultVersion": "live-plan-eval-result-v1",
+  "fixtureVersion": "local-journal-plan-v1",
+  "experimentIdentity": {
+    "provider": "ollama",
+    "model": "qwen3-coder:30b",
+    "adapterVersion": "openai-compatible-adapter-v1",
+    "promptVersion": "evidence-research-prompts-v1",
+    "toolSchemaVersion": "research-tools-v2"
+  },
+  "verdictIdentity": {
+    "evaluator": "deterministic-plan-contract",
+    "version": "deterministic-plan-contract-v1"
+  },
+  "budget": {
+    "version": "eval-budget-v1",
+    "maxModelTurns": 1,
+    "maxToolCalls": 1,
+    "maxDistinctSources": 1,
+    "maxSourceBytes": 4096,
+    "maxWallTimeMs": 120000
+  },
+  "recordedAt": "2026-08-12T19:53:14.562Z",
+  "trials": [
+    {
+      "trial": 1,
+      "latencyMs": 16717,
+      "usage": "unavailable",
+      "cost": {
+        "basis": "local_provider_no_api_charge",
+        "amountUsd": 0,
+        "excluded": "hardware_and_energy_not_measured"
+      },
+      "plan": {
+        "title": "Run Journal 崩溃恢复机制研究",
+        "objectives": [
+          "了解 Run Journal 为什么支持崩溃恢复",
+          "分析 Run Journal 崩溃恢复的实现方式",
+          "识别 Run Journal 崩溃恢复相关的关键技术"
+        ],
+        "steps": [
+          {
+            "id": "step-1",
+            "description": "查阅 Run Journal 的官方文档，了解其崩溃恢复机制的实现原理。"
+          },
+          {
+            "id": "step-2",
+            "description": "分析 Run Journal 的日志系统，识别其崩溃恢复的关键技术点。"
+          },
+          {
+            "id": "step-3",
+            "description": "对比其他类似系统，分析 Run Journal 崩溃恢复的特性和优势。"
+          }
+        ]
+      },
+      "passed": true,
+      "verdicts": []
+    },
+    {
+      "trial": 2,
+      "latencyMs": 4913,
+      "usage": "unavailable",
+      "cost": {
+        "basis": "local_provider_no_api_charge",
+        "amountUsd": 0,
+        "excluded": "hardware_and_energy_not_measured"
+      },
+      "plan": {
+        "title": "Run Journal 崩溃恢复机制研究",
+        "objectives": [
+          "理解 Run Journal 为什么支持崩溃恢复",
+          "分析 Run Journal 的崩溃恢复机制",
+          "探讨 Run Journal 崩溃恢复的实现方式"
+        ],
+        "steps": [
+          {
+            "id": "step-1",
+            "description": "收集 Run Journal 的官方文档和相关资料，了解其基本功能和特性"
+          },
+          {
+            "id": "step-2",
+            "description": "分析 Run Journal 崩溃恢复机制的技术细节"
+          },
+          {
+            "id": "step-3",
+            "description": "研究 Run Journal 崩溃恢复的实现方式和原理"
+          }
+        ]
+      },
+      "passed": true,
+      "verdicts": []
+    }
+  ],
+  "passed": true
+}

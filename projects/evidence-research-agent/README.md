@@ -1,8 +1,8 @@
 # Evidence Research Agent
 
-这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #14：除确定性的 Scripted Model、OpenAI-compatible live adapter、durable Run control、完整 Claim-to-Evidence lineage Gate 与独立 Evaluator Review 外，Learning Artifact publication 已成为可跨崩溃恢复的 durable Publication Effect。
+这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。Issue #15 毕业范围已实现：确定性的 Scripted Model、OpenAI-compatible live adapter、durable Run control、完整 Claim-to-Evidence lineage Gate、独立 Evaluator Review、跨崩溃 Publication Effect，以及覆盖完整运行路径的 headless CLI。
 
-当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。同一 Model Turn 开头连续、已通过顺序 preflight 的 `search_sources` / `read_source` 会按 `safeReadConcurrency` 有界并发；状态型工具仍严格顺序执行。Evaluator 使用单独的 versioned prompt，只看到用户问题、选中 Claims 和各自 cited Evidence 摘录，不接收 Model View、Run Journal 或 Research Loop history。CLI 已提供显式 `reconcile` 命令；跨进程推进 Research Loop 与完整 publication approval/publish 演示由毕业 ticket 继续补齐。
+当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。同一 Model Turn 开头连续、已通过顺序 preflight 的 `search_sources` / `read_source` 会按 `safeReadConcurrency` 有界并发；状态型工具仍严格顺序执行。Evaluator 使用单独的 versioned prompt，只看到用户问题、选中 Claims 和各自 cited Evidence 摘录，不接收 Model View、Run Journal 或 Research Loop history。CLI 可以跨进程推进 Research Loop、处理 evaluator resolution、批准并发布 Learning Artifact，以及显式 reconcile 崩溃后的 Publication Effect。
 
 ## 快速开始：创建并批准计划
 
@@ -40,7 +40,50 @@ node dist/src/cli.js run \
   --json
 ```
 
-adapter/prompt/tool schema/evaluator prompt versions 可分别由 `EVIDENCE_MODEL_ADAPTER_VERSION`、`EVIDENCE_MODEL_PROMPT_VERSION`、`EVIDENCE_MODEL_TOOL_SCHEMA_VERSION`、`EVIDENCE_EVALUATOR_PROMPT_VERSION` 覆盖。provider、model 与这些版本作为非秘密 identity 进入 Journal/Trace/binding；base URL、API key、headers 与 provider payload 不持久化。CLI 目前只把 live adapter 接到新 Run 的计划 generation；跨进程推进 Research Loop、Evaluator resolution 与 publication 仍使用 TypeScript public seam。
+adapter/prompt/tool schema/evaluator prompt versions 可分别由 `EVIDENCE_MODEL_ADAPTER_VERSION`、`EVIDENCE_MODEL_PROMPT_VERSION`、`EVIDENCE_MODEL_TOOL_SCHEMA_VERSION`、`EVIDENCE_EVALUATOR_PROMPT_VERSION` 覆盖。provider、model 与这些版本作为非秘密 identity 进入 Journal/Trace/binding；base URL、API key、headers 与 provider payload 不持久化。需要模型 generation 的 CLI 命令必须显式给出 `--live-model`；审批、控制、发布与 reconcile 命令从同一 Runtime Home 恢复 durable state，不加载 provider。
+
+## CLI 毕业路径
+
+下面的命令展示完整跨进程边界。每个命令打开 Runtime、执行一个 public command、打印 Projection/Trace 后退出；实际脚本应从前一步 JSON 读取 `runId` 与 binding hash，不能自行构造审批 authority。
+
+```bash
+node dist/src/cli.js run --live-model \
+  --runtime-home .runtime \
+  --question "追加式 Run Journal 如何驱动派生状态投影？" \
+  --source-root "$PWD/../../docs" --json
+
+node dist/src/cli.js inspect --runtime-home .runtime --run-id <run-id> --json
+node dist/src/cli.js approve-plan --runtime-home .runtime --run-id <run-id> \
+  --binding-hash <state.approvalBinding.bindingHash> --json
+
+# 重复 advance，直到 state.type 为 research_complete、等待/暂停或 terminal 状态。
+node dist/src/cli.js advance --live-model --runtime-home .runtime \
+  --run-id <run-id> --json
+
+node dist/src/cli.js propose-artifact --live-model \
+  --runtime-home .runtime \
+  --output-root "$PWD/learning-artifacts" \
+  --run-id <run-id> \
+  --target-path "$PWD/learning-artifacts/run-journal.md" --json
+
+# evaluator failure 时二选一；成功时跳过这一步。
+node dist/src/cli.js retry-evaluator --live-model \
+  --runtime-home .runtime --output-root "$PWD/learning-artifacts" \
+  --run-id <run-id> --json
+node dist/src/cli.js skip-evaluator \
+  --runtime-home .runtime --output-root "$PWD/learning-artifacts" \
+  --run-id <run-id> --json
+
+node dist/src/cli.js approve-publication \
+  --runtime-home .runtime --output-root "$PWD/learning-artifacts" \
+  --run-id <run-id> \
+  --binding-hash <state.publicationBinding.bindingHash> --json
+node dist/src/cli.js publish \
+  --runtime-home .runtime --output-root "$PWD/learning-artifacts" \
+  --run-id <run-id> --json
+```
+
+`inspect`、`trace` 与 `operation` 是只读命令。`pause`、`resume`、`cancel`、`extend-budget` 仍作为独立 control commands 使用；若 publish 在 external effect 与 success settlement 之间中断，则改用本文后面的 `reconcile`，不能直接重放 `publish`。
 
 ## OpenAI-compatible live Model Port
 
@@ -72,6 +115,20 @@ await runtime.advanceResearch({
 ```
 
 provider 可能错误地把 request metadata 或 credential 回显到生成内容；adapter 在解析 plan、Model Turn 或 Learning Artifact proposal 前会按精确 API key 字符串拒绝整个 completed result。公开错误只使用稳定分类与代码，不包含 provider message、URL、body 或 credential。
+
+## 独立真实模型 eval
+
+默认 `pnpm check` 只运行 deterministic runtime、infrastructure、CLI 与 documentation suite，不访问网络或本机模型。版本化 live eval 必须先 build，再显式运行：
+
+```bash
+EVIDENCE_MODEL_PROVIDER=ollama \
+EVIDENCE_MODEL_BASE_URL=http://127.0.0.1:11434/v1 \
+EVIDENCE_MODEL_API_KEY=ollama-local \
+EVIDENCE_MODEL_NAME=qwen3-coder:30b \
+pnpm eval:live
+```
+
+固定输入位于 `evals/fixtures/local-journal-plan-v1.json`，结果写入 `evals/results/local-journal-plan-v1.json`。已记录的真实运行使用 `ollama` / `qwen3-coder:30b`、`openai-compatible-adapter-v1`、`evidence-research-prompts-v1`、`research-tools-v2`，2/2 trials 通过 `deterministic-plan-contract-v1`；latency 为 16,717 ms 与 4,913 ms。API charge 为 USD 0，但未计量本地硬件与电力；plan usage 当前由 adapter 记录为 `unavailable`。该结果不使用 LLM judge，也不声称两次成功证明 Runtime 的恢复、并发或安全可靠性——这些结论只来自 fault-injected deterministic suite。
 
 ## 独立 Evaluator Review 与 publish-ready report
 
@@ -389,8 +446,18 @@ Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE
 - `tests/runtime/retry-policy.test.ts`：Model/Search transient retry、provider hint、attempt lineage、policy approval/restart、崩溃恢复、普通失败、schema/permanent/invariant failure、wall-time 与 SQLite commit failure。
 - `tests/runtime/run-control.test.ts`：pause/resume、预算版本扩展、terminal cancellation、stream/pending tool/completed result race 与 Suspended Run 取消矩阵。
 - `tests/runtime/run-operation.test.ts`：run_busy、read-only access、跨 Run 并行、heartbeat、expiry、stale owner takeover 与 durable cancellation request。
+- `tests/cli/cli.test.ts`：process-like CLI graduation、独立 control commands、publish 与真实 crash fixture 后的 reconcile。
+- `tests/evals/live-plan-eval.test.ts`：版本化 fixture、重复 trial、identity/cost/latency/verdict 记录与 deterministic judge 分离。
+- `docs/graduation-matrix.md`：Issue #15 每条 acceptance criterion 与 fault boundary 的实现/测试映射。
 - `docs/architecture.md`：组件图、状态机、publication effect 的明确恢复边界。
 
-## 尚未实现
+## 当前运行边界与限制
 
-- Issue #15：完整毕业 fault matrix、版本化真实模型 eval，以及所有 CLI 命令的端到端毕业演示。
+- 这是单机、单用户、local-text MVP；不是多租户服务，也没有远程 source connector、浏览器、shell 或任意写工具。
+- CLI 的 `advance`、`propose-artifact` 与 `retry-evaluator` 每次都会从环境创建 live adapter，并要求 Experiment Identity 与已批准 Run 精确一致；CLI 尚不提供 Scripted fixture 文件格式作为生产运行模式。
+- Runtime Home 与 Output Root 必须由调用者妥善保护。Journal/CAS 提供一致性与恢复语义，不提供静态加密、OS 级访问控制或恶意同用户进程隔离。
+- provider 侧日志、传输策略与数据保留不受本项目控制；source 摘录会进入已配置的模型 provider。不要把未获授权的私密来源纳入 Source Scope。
+- Node.js 24 缺少可移植 `openat2` 与 `renameat2(RENAME_NOREPLACE)`；实现能拒绝 symlink、复核 handle/parent identity 并对稳定可观测替换 fail closed，但不能原子隔离 hostile same-user concurrent rename。
+- SQLite/CAS 不包含跨机器 replication、backup protocol 或灾难恢复；Publication Effect reconcile 只对单一已批准 target 的可观测状态分类。
+- live plan eval 当前没有 token usage 与本地能耗计量，只验证计划结构和 forbidden terms；它不衡量答案质量，也不替代 deterministic Evidence Gate。
+- Evaluator Review 是 advisory model evidence。即使 verdict 全部 supported，publication 仍依赖 deterministic Gate 与 exact user approval；显式 skip 会在 report/Trace 中保留 warning。

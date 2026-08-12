@@ -172,8 +172,22 @@ export interface OpenRuntimeOptions {
   readonly sourceAccessHooks?: SourceAccessLifecycleHooks;
   /** Run Operation durable seam 的可选命名中断点。 */
   readonly runOperationHooks?: RunOperationLifecycleHooks;
+  /** Plan/Publication Approval durable consumption 的命名故障注入点。 */
+  readonly approvalHooks?: ApprovalLifecycleHooks;
   /** Publication Effect prepare/write/settlement 的可选命名故障注入点。 */
   readonly publicationEffectHooks?: PublicationEffectLifecycleHooks;
+}
+
+/** 用户审批从校验通过到 exact Receipt durable 的命名故障注入点。 */
+export interface ApprovalLifecycleHooks {
+  /** exact Plan Approval Receipt 追加 Run Journal 前运行。 */
+  readonly beforePlanApprovalCommit?: () => void | Promise<void>;
+  /** exact Plan Approval Receipt 已 durable append、命令尚未返回前运行。 */
+  readonly afterPlanApprovalCommit?: () => void | Promise<void>;
+  /** exact Publication Approval Receipt 追加 Run Journal 前运行。 */
+  readonly beforePublicationApprovalCommit?: () => void | Promise<void>;
+  /** exact Publication Approval Receipt 已 durable append、命令尚未返回前运行。 */
+  readonly afterPublicationApprovalCommit?: () => void | Promise<void>;
 }
 
 /** Publication Effect durable lifecycle 的命名故障注入点。 */
@@ -608,6 +622,14 @@ export class PublicationApprovalConflictError extends Error {
   }
 }
 
+/** 测试专用审批边界中断；只携带稳定阶段文案，不携带审批 payload。 */
+class ApprovalLifecycleInterruptionError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "ApprovalLifecycleInterruptionError";
+  }
+}
+
 /** 非 ready_to_publish 状态收到 publication 命令时抛出的安全状态错误。 */
 export class IllegalLearningArtifactPublicationStateError extends Error {
   public constructor() {
@@ -972,6 +994,8 @@ export class ResearchAgentRuntime {
   readonly #sourceAccessHooks: SourceAccessLifecycleHooks;
   /** durable control-plane seam 的可选命名中断点。 */
   readonly #runOperationHooks: RunOperationLifecycleHooks;
+  /** 用户审批 receipt consumption 的命名故障注入点。 */
+  readonly #approvalHooks: ApprovalLifecycleHooks;
   /** Publication Effect prepare/write/settlement 的命名故障注入点。 */
   readonly #publicationEffectHooks: PublicationEffectLifecycleHooks;
   /** 只允许同一异步 command chain 的嵌套 mutation 复用当前 lease。 */
@@ -1027,6 +1051,9 @@ export class ResearchAgentRuntime {
     });
     this.#runOperationHooks = Object.freeze({
       ...(options.runOperationHooks ?? {}),
+    });
+    this.#approvalHooks = Object.freeze({
+      ...(options.approvalHooks ?? {}),
     });
     this.#publicationEffectHooks = Object.freeze({
       ...(options.publicationEffectHooks ?? {}),
@@ -1179,9 +1206,9 @@ export class ResearchAgentRuntime {
     );
   }
 
-  #approvePlan(
+  async #approvePlan(
     command: z.infer<typeof approvePlanCommandSchema>,
-  ): RunProjection {
+  ): Promise<RunProjection> {
     const parsedCommand = approvePlanCommandSchema.safeParse(command);
     if (!parsedCommand.success) throw new InvalidPlanApprovalCommandError();
     const { runId, bindingHash } = parsedCommand.data;
@@ -1225,11 +1252,22 @@ export class ResearchAgentRuntime {
     // Approval 是独立用户命令，不接受模型输出、Research Tool 参数、环境变量或
     // 调用方自造 Receipt；这里使用读取时的 last sequence 保留乐观并发语义。
     try {
-      return this.#appendEvents(
+      await this.#runApprovalHook(
+        this.#approvalHooks.beforePlanApprovalCommit,
+        "plan approval 在 durable Receipt 前中断",
+      );
+      const approved = this.#appendEvents(
         runId,
         current.lastEventSequence,
         [event],
       );
+      // Receipt 已成为 canonical authorization fact；after hook 只能模拟调用方
+      // 未收到响应，重启后的重复命令必须返回同一 Receipt 而不是再次消费审批。
+      await this.#runApprovalHook(
+        this.#approvalHooks.afterPlanApprovalCommit,
+        "plan approval 在 durable Receipt 后中断",
+      );
+      return approved;
     } catch (error) {
       if (!(error instanceof ConcurrentRunWriteError)) {
         throw error;
@@ -4230,9 +4268,25 @@ export class ResearchAgentRuntime {
     };
 
     try {
-      return this.#appendEvents(runId, current.lastEventSequence, [event]);
+      await this.#runApprovalHook(
+        this.#approvalHooks.beforePublicationApprovalCommit,
+        "publication approval 在 durable Receipt 前中断",
+      );
+      const approved = this.#appendEvents(
+        runId,
+        current.lastEventSequence,
+        [event],
+      );
+      await this.#runApprovalHook(
+        this.#approvalHooks.afterPublicationApprovalCommit,
+        "publication approval 在 durable Receipt 后中断",
+      );
+      return approved;
     } catch (error) {
       if (!(error instanceof ConcurrentRunWriteError)) {
+        if (error instanceof ApprovalLifecycleInterruptionError) {
+          throw error;
+        }
         throw new LearningArtifactPublicationError();
       }
       const persisted = this.#store.readProjection(runId);
@@ -5018,6 +5072,20 @@ export class ResearchAgentRuntime {
       await hook();
     } catch {
       throw new Error(message);
+    }
+  }
+
+  async #runApprovalHook(
+    hook: (() => void | Promise<void>) | undefined,
+    message: string,
+  ): Promise<void> {
+    if (hook === undefined) return;
+    try {
+      await hook();
+    } catch {
+      // Approval hook 只模拟调用方在 receipt transaction 边界消失；错误不回显
+      // binding、计划、target 或 provider 细节，重启从 Journal 判断是否已消费。
+      throw new ApprovalLifecycleInterruptionError(message);
     }
   }
 }

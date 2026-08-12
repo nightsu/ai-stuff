@@ -184,6 +184,71 @@ describe("ResearchAgentRuntime plan approval", () => {
     }
   });
 
+  it("keeps the exact Receipt durable after the afterPlanApprovalCommit fault point", async () => {
+    const runtimeHome = await createRuntimeHome();
+    const waiting = await createWaitingRun(runtimeHome);
+    const command = approvalCommandFor(waiting);
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: new ScriptedModel([]),
+      clock: { now: () => "2026-08-12T08:01:00.000Z" },
+      ids: fullApprovalIds(createApprovalIds()),
+      approvalHooks: {
+        afterPlanApprovalCommit: () => {
+          throw new Error("simulated approval process interruption");
+        },
+      },
+    });
+    await expect(interrupted.approvePlan(command)).rejects.toThrow(/plan approval/);
+    const committed = await interrupted.inspectRun({ runId: waiting.runId });
+    expect(committed.state).toMatchObject({
+      type: "researching",
+      approvalReceipt: { approvalId: "approval-001" },
+    });
+    interrupted.close();
+
+    const restarted = openApprovalRuntime(runtimeHome, throwingApprovalIds());
+    try {
+      await expect(restarted.approvePlan(command)).resolves.toEqual(committed);
+      expect(countEvents(runtimeHome, waiting.runId)).toBe(4);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("leaves approval unconsumed at the beforePlanApprovalCommit fault point", async () => {
+    const runtimeHome = await createRuntimeHome();
+    const waiting = await createWaitingRun(runtimeHome);
+    const command = approvalCommandFor(waiting);
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: new ScriptedModel([]),
+      clock: { now: () => "2026-08-12T08:01:00.000Z" },
+      ids: fullApprovalIds(createApprovalIds()),
+      approvalHooks: {
+        beforePlanApprovalCommit: () => {
+          throw new Error("simulated approval process interruption");
+        },
+      },
+    });
+    await expect(interrupted.approvePlan(command)).rejects.toThrow(/plan approval/);
+    await expect(interrupted.inspectRun({ runId: waiting.runId })).resolves
+      .toEqual(waiting);
+    expect(countEvents(runtimeHome, waiting.runId)).toBe(3);
+    interrupted.close();
+
+    const restarted = openApprovalRuntime(runtimeHome, createApprovalIds());
+    try {
+      await expect(restarted.approvePlan(command)).resolves.toMatchObject({
+        state: { type: "researching" },
+        lastEventSequence: 4,
+      });
+      expect(countEvents(runtimeHome, waiting.runId)).toBe(4);
+    } finally {
+      restarted.close();
+    }
+  });
+
   it(
     "rejects a stale but well-formed binding with a named payload-safe error before generating IDs",
     async () => {

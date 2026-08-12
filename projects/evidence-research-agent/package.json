@@ -14,6 +14,7 @@
     "build": "tsc -p tsconfig.build.json",
     "check": "pnpm typecheck && pnpm test && pnpm docs:check",
     "docs:check": "vitest run tests/documentation",
+    "eval:live": "node dist/src/evals/live-plan-eval.js evals/fixtures/local-journal-plan-v1.json evals/results/local-journal-plan-v1.json",
     "start": "node dist/src/cli.js",
     "test": "vitest run",
     "test:watch": "vitest",
