@@ -10,6 +10,7 @@ import {
   InvalidPlanApprovalCommandError,
   PlanApprovalConflictError,
   ResearchAgentRuntime,
+  RunBusyError,
   StalePlanApprovalError,
 } from "./application/research-agent-runtime.js";
 import { formatRunTrace } from "./application/trace-format.js";
@@ -185,6 +186,40 @@ export async function runCli(
         try {
           const trace = await runtime.traceRun({ runId });
           io.stdout(formatRunTrace(trace, values.json ? "json" : "human"));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
+      case "operation": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(values["runtime-home"] ?? ".runtime"),
+          model: new ScriptedModel([]),
+        });
+        try {
+          const view = await runtime.inspectRunOperation({
+            runId: requireOption(values["run-id"], "--run-id"),
+          });
+          io.stdout(values.json
+            ? JSON.stringify(view, null, 2)
+            : [
+                `Operation: ${view.lease?.operationId ?? "none"}`,
+                `Kind: ${view.lease?.kind ?? "none"}`,
+                `Heartbeat: ${view.lease?.heartbeatAt ?? "none"}`,
+                `Expires: ${view.lease?.expiresAt ?? "none"}`,
+                `Cancellation: ${view.cancellationRequest?.requestId ?? "none"}`,
+                `Consumed: ${view.cancellationRequest?.consumedAt ?? "none"}`,
+              ].join("\n"));
         } finally {
           runtime.close();
         }
@@ -373,6 +408,9 @@ function describeCliError(error: unknown): readonly [string, string] {
     error instanceof PlanApprovalConflictError
   ) {
     return ["PLAN_APPROVAL_REJECTED", "计划审批未被接受"];
+  }
+  if (error instanceof RunBusyError) {
+    return ["RUN_BUSY", "Research Run 正由另一个 mutating operation 推进"];
   }
   return ["CLI_COMMAND_FAILED", "命令执行失败"];
 }

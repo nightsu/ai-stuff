@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 import { z } from "zod";
 
@@ -62,6 +63,10 @@ import type {
   InProgressRetryAttempt,
   NormalizedFailure,
   RetrySequenceKind,
+  RunOperationKind,
+  RunOperationLease,
+  RunOperationView,
+  RunCancellationRequest,
 } from "../domain/types.js";
 import { ContentAddressedArtifactStore } from "../infrastructure/content-addressed-artifact-store.js";
 import {
@@ -71,7 +76,9 @@ import {
 } from "../infrastructure/private-source-access.js";
 import {
   ConcurrentRunWriteError,
+  RunCancellationPendingError,
   RunNotFoundError,
+  RunOperationBusyError,
   SourceSnapshotRegistrationError,
   SqliteRunStore,
 } from "../infrastructure/sqlite-run-store.js";
@@ -103,6 +110,8 @@ export interface OpenRuntimeOptions {
   readonly model: ModelPort;
   /** 可选时间边界；生产默认使用系统 UTC 时间。 */
   readonly clock?: Clock;
+  /** 只服务 lease/heartbeat/expiry 的时间边界；省略时使用系统 UTC，不消耗业务测试 clock。 */
+  readonly operationClock?: Clock;
   /** 可选 identity 边界；生产默认使用 UUID。 */
   readonly ids?: IdGenerator;
   /** 可选 Source Search Port；测试可替换 host `rg` 与 discovery 故障。 */
@@ -115,6 +124,20 @@ export interface OpenRuntimeOptions {
   readonly retryPolicy?: RetryPolicy;
   /** 可选 retry 等待边界；生产默认使用真实 timer。 */
   readonly retryScheduler?: RetryScheduler;
+  /** durable operation lease 的存活窗口，单位毫秒；heartbeat 会向后续租同一长度。 */
+  readonly operationLeaseDurationMs?: number;
+  /** active operation 自动 heartbeat 与 cancellation poll 的间隔毫秒。 */
+  readonly operationHeartbeatIntervalMs?: number;
+  /** Run Operation durable seam 的可选命名中断点。 */
+  readonly runOperationHooks?: RunOperationLifecycleHooks;
+}
+
+/** Run Operation control-plane 的命名故障注入点。 */
+export interface RunOperationLifecycleHooks {
+  /** lease 已 durable 获取、业务恢复或外部 I/O 尚未执行前运行。 */
+  readonly afterLeaseAcquired?: () => void | Promise<void>;
+  /** cancellation request 已 durable、canonical `run_cancelled` 尚未提交前运行。 */
+  readonly afterCancellationRequested?: () => void | Promise<void>;
 }
 
 /** Research Loop durable 边界上的命名故障注入点。 */
@@ -168,6 +191,12 @@ export interface InspectRunCommand {
 /** 通过 identity 读取派生 Run Trace 的应用命令。 */
 export interface TraceRunCommand {
   /** 要投影为 Trace 的 Research Run identity。 */
+  readonly runId: string;
+}
+
+/** 只读检查一个 Run 的 operation lease 与 cancellation request。 */
+export interface InspectRunOperationCommand {
+  /** 要检查 control-plane 状态的 Research Run identity。 */
   readonly runId: string;
 }
 
@@ -505,6 +534,14 @@ export class ResearchLoopError extends Error {
   }
 }
 
+/** 同一 Run 已被另一个未到期 mutating operation 占用。 */
+export class RunBusyError extends Error {
+  public constructor() {
+    super("Research Run 正由另一个 mutating operation 推进");
+    this.name = "RunBusyError";
+  }
+}
+
 /** 确定性裁剪后仍无法容纳 pinned Model View 时抛出的显式停止错误。 */
 export class ModelViewTooLargeError extends Error {
   public constructor() {
@@ -718,6 +755,8 @@ function stripArtifactCreatedAt(artifact: PersistedArtifact): ArtifactReference 
 export class ResearchAgentRuntime {
   /** 为事件与 artifact 提供可测试时间的边界。 */
   readonly #clock: Clock;
+  /** control plane 独立时间边界，避免 heartbeat 改变 Run Journal 的业务时间语义。 */
+  readonly #operationClock: Clock;
   /** 为 Run 与事件提供可测试 identity 的边界。 */
   readonly #ids: IdGenerator;
   /** 生成研究计划且不泄漏 provider SDK 类型的模型边界。 */
@@ -740,14 +779,25 @@ export class ResearchAgentRuntime {
   readonly #retryEnabled: boolean;
   /** 自动 retry 之间执行等待的可注入边界。 */
   readonly #retryScheduler: RetryScheduler;
+  /** 当前 Runtime 实例的 process-local owner identity，仅用于 durable lease 诊断。 */
+  readonly #runtimeOwnerId = `runtime-${randomUUID()}`;
+  /** 每次 heartbeat 向未来续租的严格正整数毫秒。 */
+  readonly #operationLeaseDurationMs: number;
+  /** active operation 的 heartbeat 与 cancellation poll 周期。 */
+  readonly #operationHeartbeatIntervalMs: number;
+  /** durable control-plane seam 的可选命名中断点。 */
+  readonly #runOperationHooks: RunOperationLifecycleHooks;
+  /** 只允许同一异步 command chain 的嵌套 mutation 复用当前 lease。 */
+  readonly #operationContext = new AsyncLocalStorage<RunOperationLease>();
   /** 当前 Runtime 进程内由 `advanceResearch` 持有的 provider cancellation controllers。 */
-  readonly #activeResearchControllers = new Map<string, AbortController>();
+  readonly #activeOperationControllers = new Map<string, AbortController>();
 
   private constructor(options: OpenRuntimeOptions) {
     // 两个 store 只能收到同一次集中准备得到的 canonical Runtime Home，避免
     // SQLite 先创建文件、Artifact Store 随后才发现 caller final path 是 symlink。
     const runtimeHome = preparePrivateRuntimeHome(options.runtimeHome);
     this.#clock = options.clock ?? systemClock;
+    this.#operationClock = options.operationClock ?? systemClock;
     this.#ids = options.ids ?? uuidGenerator;
     this.#model = options.model;
     this.#maxModelViewBytes = options.maxModelViewBytes ?? 32_768;
@@ -756,6 +806,16 @@ export class ResearchAgentRuntime {
       options.retryPolicy ?? noAutomaticRetryPolicy,
     );
     this.#retryScheduler = options.retryScheduler ?? systemRetryScheduler;
+    this.#operationLeaseDurationMs = parseOperationLeaseDuration(
+      options.operationLeaseDurationMs ?? 30_000,
+    );
+    this.#operationHeartbeatIntervalMs = parseOperationHeartbeatInterval(
+      options.operationHeartbeatIntervalMs ?? Math.max(
+        10,
+        Math.floor(this.#operationLeaseDurationMs / 3),
+      ),
+      this.#operationLeaseDurationMs,
+    );
     this.#artifacts = new ContentAddressedArtifactStore(runtimeHome);
     this.#store = new SqliteRunStore(runtimeHome);
     this.#publisher = new LearningArtifactPublisher({
@@ -767,6 +827,9 @@ export class ResearchAgentRuntime {
     this.#sourceSearch = options.sourceSearch ?? new RgSourceSearch();
     this.#researchLoopHooks = Object.freeze({
       ...(options.researchLoopHooks ?? {}),
+    });
+    this.#runOperationHooks = Object.freeze({
+      ...(options.runOperationHooks ?? {}),
     });
   }
 
@@ -792,6 +855,16 @@ export class ResearchAgentRuntime {
     const runBudget = parseRunBudget(parsed.runBudget);
     const runId = this.#ids.nextRunId();
     const createdAt = this.#clock.now();
+    const acquiredAt = this.#operationClock.now();
+    const lease: RunOperationLease = {
+      runId,
+      operationId: `operation-${randomUUID()}`,
+      ownerId: this.#runtimeOwnerId,
+      kind: "create_run",
+      acquiredAt,
+      heartbeatAt: acquiredAt,
+      expiresAt: addMilliseconds(acquiredAt, this.#operationLeaseDurationMs),
+    };
 
     const initialEvents: ResearchRunEvent[] = [
       {
@@ -819,7 +892,38 @@ export class ResearchAgentRuntime {
         payload: {},
       },
     ];
-    this.#store.appendEvents(runId, 0, initialEvents);
+    this.#store.appendEvents(runId, 0, initialEvents, [], [], {
+      initialOperationLease: lease,
+    });
+
+    return this.#runAcquiredOperation(
+      lease,
+      (_operation, operationSignal) => this.#completeRunCreation({
+        parsed,
+        runId,
+        sourceScope,
+        runBudget,
+        operationSignal,
+      }),
+    );
+  }
+
+  async #completeRunCreation(input: {
+    /** 已通过 command schema 的创建输入。 */
+    readonly parsed: z.infer<typeof createRunCommandSchema>;
+    /** 已与初始 Journal 原子持久化的 Research Run identity。 */
+    readonly runId: string;
+    /** 已 canonicalize 并写入 `run_created` 的 Source Scope。 */
+    readonly sourceScope: SourceScope;
+    /** 已写入 `run_created` 且进入审批边界的 Run Budget。 */
+    readonly runBudget: RunProjection["runBudget"];
+    /** durable cancellation 或 owner loss 可中止 provider stream 的 signal。 */
+    readonly operationSignal: AbortSignal;
+  }): Promise<RunProjection> {
+    const { parsed, runId, sourceScope, runBudget, operationSignal } = input;
+    const planAbortSignal = parsed.abortSignal === undefined
+      ? operationSignal
+      : AbortSignal.any([parsed.abortSignal, operationSignal]);
 
     // Model 调用位于数据库短事务之外，避免用 SQLite 写锁包住不可预测的外部延迟。
     // 若调用失败，Run 仍可从 planning 状态被 inspect；显式失败语义将在 ticket #7 加入。
@@ -828,7 +932,7 @@ export class ResearchAgentRuntime {
         runId,
         question: parsed.question,
         sourceScope,
-      }, { abortSignal: parsed.abortSignal }),
+      }, { abortSignal: planAbortSignal }),
     );
     const proposedAt = this.#clock.now();
     const artifact = await this.#artifacts.putJson(
@@ -868,6 +972,18 @@ export class ResearchAgentRuntime {
     if (!parsedCommand.success) {
       throw new InvalidPlanApprovalCommandError();
     }
+    return this.#withRunOperation(
+      parsedCommand.data.runId,
+      "approve_plan",
+      () => this.#approvePlan(parsedCommand.data),
+    );
+  }
+
+  #approvePlan(
+    command: z.infer<typeof approvePlanCommandSchema>,
+  ): RunProjection {
+    const parsedCommand = approvePlanCommandSchema.safeParse(command);
+    if (!parsedCommand.success) throw new InvalidPlanApprovalCommandError();
     const { runId, bindingHash } = parsedCommand.data;
     const current = this.#store.readProjection(runId);
 
@@ -939,6 +1055,13 @@ export class ResearchAgentRuntime {
     return buildRunTrace(this.#store.readEvents(runId));
   }
 
+  public async inspectRunOperation(
+    command: InspectRunOperationCommand,
+  ): Promise<RunOperationView> {
+    const { runId } = runIdentityCommandSchema.parse(command);
+    return this.#store.inspectRunOperation(runId);
+  }
+
   public async advanceResearch(
     command: AdvanceResearchCommand,
   ): Promise<RunProjection> {
@@ -946,19 +1069,34 @@ export class ResearchAgentRuntime {
     if (!parsedCommand.success || this.#model.generateResearchTurn === undefined) {
       throw new ResearchLoopError();
     }
+    return this.#withRunOperation(
+      parsedCommand.data.runId,
+      "advance_research",
+      (_lease, operationSignal) => this.#advanceResearch(
+        parsedCommand.data,
+        operationSignal,
+      ),
+    );
+  }
+
+  async #advanceResearch(
+    command: z.infer<typeof advanceResearchCommandSchema>,
+    operationSignal: AbortSignal,
+  ): Promise<RunProjection> {
+    const parsedCommand = advanceResearchCommandSchema.safeParse(command);
+    if (!parsedCommand.success) throw new ResearchLoopError();
     const { runId, steering, abortSignal } = parsedCommand.data;
 
-    const operationController = new AbortController();
     const modelAbortSignal = abortSignal === undefined
-      ? operationController.signal
-      : AbortSignal.any([abortSignal, operationController.signal]);
-    this.#activeResearchControllers.set(runId, operationController);
+      ? operationSignal
+      : AbortSignal.any([abortSignal, operationSignal]);
 
     // 每个迭代只做三件事：从 Journal 重建视图、提交一个完整 Model Turn、
     // 顺序消费其 intents。任何一步崩溃后，canonical Projection 都能指出是该
     // 重新 generation，还是先完成已经 durable 的 pending intent。
-    try {
-      while (true) {
+    while (true) {
+      const cancelled = this.#consumePendingCancellationForActiveOperation(runId);
+      if (cancelled !== undefined) return cancelled;
       const current = this.#store.readProjection(runId);
       if (
         current.state.type === "budget_exhausted" ||
@@ -1040,7 +1178,7 @@ export class ResearchAgentRuntime {
         let generated: z.infer<typeof researchTurnOutputSchema>;
         try {
           generated = researchTurnOutputSchema.parse(
-            await this.#model.generateResearchTurn(view, {
+            await this.#model.generateResearchTurn!(view, {
               abortSignal: modelAbortSignal,
             }),
           );
@@ -1107,7 +1245,7 @@ export class ResearchAgentRuntime {
         generated = researchTurnOutputSchema.parse(
           // AbortSignal 只控制当前物理 provider attempt；Harness 不会把已收到但
           // 未完成的 delta 记作 Model Turn，重启仍从 durable attempt fact 恢复。
-          await this.#model.generateResearchTurn(view, {
+          await this.#model.generateResearchTurn!(view, {
             abortSignal: modelAbortSignal,
           }),
         );
@@ -1169,11 +1307,6 @@ export class ResearchAgentRuntime {
         );
       } catch {
         throw new ResearchLoopError();
-      }
-      }
-    } finally {
-      if (this.#activeResearchControllers.get(runId) === operationController) {
-        this.#activeResearchControllers.delete(runId);
       }
     }
   }
@@ -1918,9 +2051,37 @@ export class ResearchAgentRuntime {
         sourceSnapshots,
       );
     } catch (error) {
+      if (error instanceof RunCancellationPendingError) {
+        const cancelled = this.#consumePendingCancellationForActiveOperation(
+          expected.runId,
+        );
+        if (cancelled === undefined) throw error;
+        return this.#appendLateResearchResults(
+          cancelled,
+          events,
+          artifacts,
+          sourceSnapshots,
+        );
+      }
       if (!(error instanceof ConcurrentRunWriteError)) throw error;
       const current = this.#store.readProjection(expected.runId);
       if (current.state.type !== "cancelled") throw error;
+      return this.#appendLateResearchResults(
+        current,
+        events,
+        artifacts,
+        sourceSnapshots,
+      );
+    }
+  }
+
+  #appendLateResearchResults(
+    current: RunProjection,
+    events: readonly ResearchRunEvent[],
+    artifacts: readonly PersistedArtifact[],
+    sourceSnapshots: readonly PersistedSourceSnapshot[],
+  ): RunProjection {
+    if (current.state.type !== "cancelled") throw new ResearchLoopError();
       // 外部 Model/Research Tool 已完整返回后，并发 cancellation 可以先成为
       // terminal fact；完整结果仍按原事件顺序进入 cancelled snapshot 供审计，
       // 但 reducer 永远保留外层 cancelled，Harness 因而不会消费后续 intent。
@@ -1940,7 +2101,6 @@ export class ResearchAgentRuntime {
         artifacts,
         sourceSnapshots,
       );
-    }
   }
 
   #normalizeModelFailure(error: unknown): NormalizedFailure {
@@ -2082,7 +2242,20 @@ export class ResearchAgentRuntime {
   }
 
   public async readSource(command: ReadSourceCommand): Promise<RunProjection> {
-    return this.#readSource(command);
+    const parsedCommand = readSourceCommandSchema.safeParse(command);
+    if (!parsedCommand.success) throw new InvalidSourceReadCommandError();
+    try {
+      return await this.#withRunOperation(
+        parsedCommand.data.runId,
+        "read_source",
+        () => this.#readSource(parsedCommand.data),
+      );
+    } catch (error) {
+      if (error instanceof RunNotFoundError) {
+        throw new SourceReadRunNotFoundError();
+      }
+      throw error;
+    }
   }
 
   async #readSource(
@@ -2262,7 +2435,13 @@ export class ResearchAgentRuntime {
   public async recordEvidence(
     command: RecordEvidenceCommand,
   ): Promise<RunProjection> {
-    return this.#recordEvidence(command);
+    const parsedCommand = recordEvidenceCommandSchema.safeParse(command);
+    if (!parsedCommand.success) throw new InvalidEvidenceCommandError();
+    return this.#withRunOperation(
+      parsedCommand.data.runId,
+      "record_evidence",
+      () => this.#recordEvidence(parsedCommand.data),
+    );
   }
 
   async #recordEvidence(
@@ -2366,7 +2545,13 @@ export class ResearchAgentRuntime {
   }
 
   public async recordClaim(command: RecordClaimCommand): Promise<RunProjection> {
-    return this.#recordClaim(command);
+    const parsedCommand = recordClaimCommandSchema.safeParse(command);
+    if (!parsedCommand.success) throw new InvalidClaimCommandError();
+    return this.#withRunOperation(
+      parsedCommand.data.runId,
+      "record_claim",
+      () => this.#recordClaim(parsedCommand.data),
+    );
   }
 
   async #recordClaim(
@@ -2462,7 +2647,26 @@ export class ResearchAgentRuntime {
     if (!parsedCommand.success) {
       throw new InvalidLearningArtifactCommandError();
     }
+    return this.#withRunOperation(
+      parsedCommand.data.runId,
+      "propose_learning_artifact",
+      (_lease, operationSignal) => this.#proposeLearningArtifact(
+        parsedCommand.data,
+        operationSignal,
+      ),
+    );
+  }
+
+  async #proposeLearningArtifact(
+    command: z.infer<typeof proposeLearningArtifactCommandSchema>,
+    operationSignal: AbortSignal,
+  ): Promise<RunProjection> {
+    const parsedCommand = proposeLearningArtifactCommandSchema.safeParse(command);
+    if (!parsedCommand.success) throw new InvalidLearningArtifactCommandError();
     const { runId, targetPath, abortSignal } = parsedCommand.data;
+    const modelAbortSignal = abortSignal === undefined
+      ? operationSignal
+      : AbortSignal.any([abortSignal, operationSignal]);
     let current: RunProjection;
     try {
       current = this.#store.readProjection(runId);
@@ -2518,7 +2722,7 @@ export class ResearchAgentRuntime {
           question: current.question,
           claims: researching.claims,
           evidenceRecords: researching.evidenceRecords,
-        }, { abortSignal }),
+        }, { abortSignal: modelAbortSignal }),
       );
       proposedAt = this.#clock.now();
       assertEvidenceGateBudget({
@@ -2609,6 +2813,18 @@ export class ResearchAgentRuntime {
     if (!parsedCommand.success) {
       throw new InvalidPublicationApprovalCommandError();
     }
+    return this.#withRunOperation(
+      parsedCommand.data.runId,
+      "approve_publication",
+      () => this.#approvePublication(parsedCommand.data),
+    );
+  }
+
+  async #approvePublication(
+    command: z.infer<typeof approvePublicationCommandSchema>,
+  ): Promise<RunProjection> {
+    const parsedCommand = approvePublicationCommandSchema.safeParse(command);
+    if (!parsedCommand.success) throw new InvalidPublicationApprovalCommandError();
     const { runId, bindingHash } = parsedCommand.data;
     let current: RunProjection;
     try {
@@ -2695,6 +2911,18 @@ export class ResearchAgentRuntime {
     if (!parsedCommand.success) {
       throw new InvalidLearningArtifactCommandError();
     }
+    return this.#withRunOperation(
+      parsedCommand.data.runId,
+      "publish_learning_artifact",
+      () => this.#publishLearningArtifact(parsedCommand.data),
+    );
+  }
+
+  async #publishLearningArtifact(
+    command: z.infer<typeof publishLearningArtifactCommandSchema>,
+  ): Promise<RunProjection> {
+    const parsedCommand = publishLearningArtifactCommandSchema.safeParse(command);
+    if (!parsedCommand.success) throw new InvalidLearningArtifactCommandError();
     const { runId } = parsedCommand.data;
     let current: RunProjection;
     try {
@@ -2761,6 +2989,10 @@ export class ResearchAgentRuntime {
 
   public async pauseRun(command: PauseRunCommand): Promise<RunProjection> {
     const { runId } = runIdentityCommandSchema.parse(command);
+    return this.#withRunOperation(runId, "pause_run", () => this.#pauseRun(runId));
+  }
+
+  #pauseRun(runId: string): RunProjection {
     const current = this.#store.readProjection(runId);
     if (current.state.type === "user_paused") return current;
     const occurredAt = this.#clock.now();
@@ -2776,6 +3008,10 @@ export class ResearchAgentRuntime {
 
   public async resumeRun(command: ResumeRunCommand): Promise<RunProjection> {
     const { runId } = runIdentityCommandSchema.parse(command);
+    return this.#withRunOperation(runId, "resume_run", () => this.#resumeRun(runId));
+  }
+
+  #resumeRun(runId: string): RunProjection {
     const current = this.#store.readProjection(runId);
     const occurredAt = this.#clock.now();
     return this.#store.appendEvents(runId, current.lastEventSequence, [{
@@ -2792,25 +3028,107 @@ export class ResearchAgentRuntime {
     const { runId } = runIdentityCommandSchema.parse(command);
     const current = this.#store.readProjection(runId);
     if (current.state.type === "cancelled") return current;
-    const occurredAt = this.#clock.now();
-    const cancelled = this.#store.appendEvents(runId, current.lastEventSequence, [{
-      eventId: this.#ids.nextEventId(),
+    if (current.state.type === "completed" || current.state.type === "failed") {
+      throw new Error("terminal Run 不能再次取消");
+    }
+    const requestedAt = this.#operationClock.now();
+    const request = this.#store.requestRunCancellation({
       runId,
+      requestId: `cancellation-${randomUUID()}`,
+      requestedAt,
+    });
+    await this.#runOperationHook(
+      this.#runOperationHooks.afterCancellationRequested,
+      "Run Operation 在 durable cancellation request 后中断",
+    );
+    const active = this.#operationContext.getStore();
+    if (active?.runId === runId) {
+      // 同一 command chain 内的 lifecycle hook 取消必须立即消费；若等待 timer，
+      // 当前 operation 正在 await 该 hook，会形成自己等待自己的死锁。
+      return this.#consumeCancellationRequest(request, active.operationId);
+    }
+    while (true) {
+      const projection = this.#store.readProjection(runId);
+      if (projection.state.type === "cancelled") return projection;
+      const control = this.#store.inspectRunOperation(runId);
+      const now = this.#operationClock.now();
+      if (control.lease?.ownerId === this.#runtimeOwnerId) {
+        // 同一 Runtime 的独立 cancel call 不继承 advanceResearch 的 async context，
+        // 但可以由 owner identity 证明它持有 provider controller；直接结算后 abort。
+        return this.#consumeCancellationRequest(
+          request,
+          control.lease.operationId,
+        );
+      }
+      if (
+        control.lease === undefined ||
+        Date.parse(control.lease.expiresAt) <= Date.parse(now)
+      ) {
+        return this.#withRunOperation(
+          runId,
+          "consume_cancellation",
+          (lease) => this.#consumeCancellationRequest(request, lease.operationId),
+        );
+      }
+      await new Promise<void>((resolve) => setTimeout(
+        resolve,
+        Math.min(50, this.#operationHeartbeatIntervalMs),
+      ));
+    }
+  }
+
+  #consumeCancellationRequest(
+    request: RunCancellationRequest,
+    operationId?: string,
+  ): RunProjection {
+    const current = this.#store.readProjection(request.runId);
+    if (current.state.type === "cancelled") return current;
+    const occurredAt = this.#clock.now();
+    const cancelled = this.#store.appendEvents(request.runId, current.lastEventSequence, [{
+      eventId: this.#ids.nextEventId(),
+      runId: request.runId,
       sequence: current.lastEventSequence + 1,
       type: "run_cancelled",
       occurredAt,
       payload: {},
-    }]);
+    }], [], [], {
+      consumedCancellation: {
+        requestId: request.requestId,
+        consumedAt: occurredAt,
+        ...(operationId === undefined ? {} : { operationId }),
+      },
+    });
     // Journal terminal fact 必须先成功提交，再中止当前 Runtime 进程里的 provider
     // stream；否则 abort 已发生但 cancellation 未 durable 时，重启可能错误恢复工作。
     // 跨进程 durable request 与 stale owner recovery 明确由后继 Issue #10 交付。
-    this.#activeResearchControllers.get(runId)?.abort();
+    this.#activeOperationControllers.get(request.runId)?.abort();
     return cancelled;
+  }
+
+  #consumePendingCancellationForActiveOperation(
+    runId: string,
+  ): RunProjection | undefined {
+    const request = this.#store.readPendingRunCancellation(runId);
+    if (request === undefined) return undefined;
+    const operation = this.#operationContext.getStore();
+    if (operation?.runId !== runId) throw new RunBusyError();
+    return this.#consumeCancellationRequest(request, operation.operationId);
   }
 
   public async extendRunBudget(
     command: ExtendRunBudgetCommand,
   ): Promise<RunProjection> {
+    const parsed = extendRunBudgetCommandSchema.parse(command);
+    return this.#withRunOperation(
+      parsed.runId,
+      "extend_run_budget",
+      () => this.#extendRunBudget(parsed),
+    );
+  }
+
+  #extendRunBudget(
+    command: z.infer<typeof extendRunBudgetCommandSchema>,
+  ): RunProjection {
     const parsed = extendRunBudgetCommandSchema.parse(command);
     const current = this.#store.readProjection(parsed.runId);
     const runBudget = parseRunBudget(parsed.runBudget);
@@ -2843,12 +3161,143 @@ export class ResearchAgentRuntime {
     command: RebuildRunProjectionCommand,
   ): Promise<RunProjection> {
     const { runId } = runIdentityCommandSchema.parse(command);
-    return this.#store.rebuildProjection(runId);
+    return this.#withRunOperation(
+      runId,
+      "rebuild_projection",
+      () => this.#store.rebuildProjection(runId),
+    );
   }
 
   public close(): void {
     this.#store.close();
   }
+
+  async #withRunOperation<T>(
+    runId: string,
+    kind: RunOperationKind,
+    action: (
+      lease: RunOperationLease,
+      operationSignal: AbortSignal,
+    ) => Promise<T> | T,
+  ): Promise<T> {
+    const active = this.#operationContext.getStore();
+    if (active?.runId === runId) {
+      const controller = this.#activeOperationControllers.get(runId);
+      if (controller === undefined) throw new RunBusyError();
+      return action(active, controller.signal);
+    }
+    const acquiredAt = this.#operationClock.now();
+    const operationId = `operation-${randomUUID()}`;
+    const lease: RunOperationLease = {
+      runId,
+      operationId,
+      ownerId: this.#runtimeOwnerId,
+      kind,
+      acquiredAt,
+      heartbeatAt: acquiredAt,
+      expiresAt: addMilliseconds(acquiredAt, this.#operationLeaseDurationMs),
+    };
+    try {
+      this.#store.acquireRunOperation(lease);
+    } catch (error) {
+      if (error instanceof RunOperationBusyError) throw new RunBusyError();
+      throw error;
+    }
+    return this.#runAcquiredOperation(lease, action);
+  }
+
+  async #runAcquiredOperation<T>(
+    lease: RunOperationLease,
+    action: (
+      lease: RunOperationLease,
+      operationSignal: AbortSignal,
+    ) => Promise<T> | T,
+  ): Promise<T> {
+    const { runId, operationId } = lease;
+    this.#store.guardRunOperation(runId, operationId);
+    let releaseLease = true;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const operationController = new AbortController();
+    this.#activeOperationControllers.set(runId, operationController);
+    try {
+      try {
+        await this.#runOperationHook(
+          this.#runOperationHooks.afterLeaseAcquired,
+          "Run Operation 在 durable lease 后中断",
+        );
+      } catch (error) {
+        // 故障注入模拟 owner 在 lease durable 后直接消失；这里故意不释放，
+        // 让后续 Runtime 只能等 expiry，再从 Journal 判断实际业务进度。
+        releaseLease = false;
+        throw error;
+      }
+      heartbeat = setInterval(() => {
+        try {
+          const heartbeatAt = this.#operationClock.now();
+          this.#store.heartbeatRunOperation(
+            runId,
+            operationId,
+            heartbeatAt,
+            addMilliseconds(heartbeatAt, this.#operationLeaseDurationMs),
+          );
+          const request = this.#store.readPendingRunCancellation(runId);
+          if (request !== undefined) {
+            operationController.abort();
+          }
+        } catch {
+          operationController.abort();
+        }
+      }, this.#operationHeartbeatIntervalMs);
+      const pending = this.#store.readPendingRunCancellation(runId);
+      if (pending !== undefined) {
+        return await this.#consumeCancellationRequest(pending, operationId) as T;
+      }
+      return await this.#operationContext.run(
+        lease,
+        () => action(lease, operationController.signal),
+      );
+    } finally {
+      if (heartbeat !== undefined) clearInterval(heartbeat);
+      if (this.#activeOperationControllers.get(runId) === operationController) {
+        this.#activeOperationControllers.delete(runId);
+      }
+      this.#store.unguardRunOperation(runId, operationId);
+      if (releaseLease) this.#store.releaseRunOperation(runId, operationId);
+    }
+  }
+
+  async #runOperationHook(
+    hook: (() => void | Promise<void>) | undefined,
+    message: string,
+  ): Promise<void> {
+    if (hook === undefined) return;
+    try {
+      await hook();
+    } catch {
+      throw new Error(message);
+    }
+  }
+}
+
+function parseOperationLeaseDuration(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("operationLeaseDurationMs 必须是正整数");
+  }
+  return value;
+}
+
+function parseOperationHeartbeatInterval(
+  value: number,
+  leaseDurationMs: number,
+): number {
+  if (!Number.isSafeInteger(value) || value <= 0 || value >= leaseDurationMs) {
+    throw new Error("operationHeartbeatIntervalMs 必须小于 lease duration 的正整数");
+  }
+  return value;
+}
+
+function addMilliseconds(isoUtc: string, durationMs: number): string {
+  return new Date(Date.parse(isoUtc) + durationMs).toISOString();
 }
 
 function parseSourceSearchMatches(value: unknown): SourceSearchMatch[] {

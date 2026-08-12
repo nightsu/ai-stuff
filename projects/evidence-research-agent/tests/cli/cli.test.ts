@@ -124,6 +124,21 @@ it("creates, inspects, approves, and traces one Run through process-like CLI cal
     ),
   ).toBe(0);
   expect(output.pop()).toContain("#4 plan_approved → researching");
+
+  expect(
+    await runCli(
+      [
+        "operation",
+        "--runtime-home",
+        runtimeHome,
+        "--run-id",
+        created.runId,
+        "--json",
+      ],
+      io,
+    ),
+  ).toBe(0);
+  expect(JSON.parse(output.pop() ?? "null")).toEqual({});
   expect(errorOutput).toEqual([]);
 });
 
@@ -549,6 +564,7 @@ it("rejects a run-only option on approve-plan without appending approval", async
 it.each([
   ["inspect", ["--binding-hash", "b".repeat(64)]],
   ["trace", ["--question", "secret cross-command question"]],
+  ["operation", ["--binding-hash", "b".repeat(64)]],
   ["rebuild", []],
   ["inspect", ["unexpected-positional"]],
 ] as const)(

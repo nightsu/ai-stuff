@@ -1,6 +1,6 @@
-# Evidence Research Agent 架构（Issue #9）
+# Evidence Research Agent 架构（Issue #10）
 
-当前 slice 在 #8 的 live Model Port 上补齐 durable user pause、精确 resume、terminal cancellation 与经用户批准的 Run Budget Extension。Harness 继续拥有单步 Research Loop、Research Tool 调度、retry、Journal、审批和 publication；partial provider delta 永远不是 canonical Model Turn。
+当前 slice 在 durable Run control 上补齐 per-run Run Operation lease、heartbeat、expiry 与独立 cancellation request。Harness 继续拥有单步 Research Loop、Research Tool 调度、retry、Journal、审批和 publication；control plane 只保护 command ownership，永远不能替代 canonical Run Journal。
 
 外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。当前仍没有并行 tool batch 或 publication crash reconciliation；这些分别属于后续 tickets。
 
@@ -9,7 +9,9 @@
 ```mermaid
 flowchart LR
   Caller["TypeScript caller / CLI"] --> Runtime["ResearchAgentRuntime"]
+  Runtime --> Operation["Run Operation control plane<br/>lease + heartbeat + cancel request"]
   Runtime --> Harness["Deterministic Harness"]
+  Operation --> Journal
 
   Harness <--> Journal["Run Journal"]
   Journal --> Projection["Run Projection"]
@@ -213,7 +215,37 @@ stateDiagram-v2
 
 `SuspendedRunState` 包含 plan/publication approval waits、`budget_exhausted`、`retry_exhausted` 与 `user_paused`。approval waits 由各自的显式 approval 命令继续；普通 `resumeRun` 只接受 `user_paused`。user pause 和 budget exhaustion 的停留时间累加到 `suspendedDurationMs`，不计入 Research Loop wall time。`completed`、`cancelled` 与 `failed` 是不可恢复 terminal states。
 
-取消可以先于并发外部结果成为 Journal fact。同一 Runtime 内，`cancelRun` 先提交 terminal event，再 abort 当前 `advanceResearch` 持有的 provider signal；跨进程 durable cancellation request 属于 Issue #10。若 Model Turn、Search/read observation、Evidence、Claim、completion 或 aborted Retry Attempt 已经完整形成，Runtime 会在乐观并发冲突后重新编号并把该结果追加到 `cancelledState`；reducer 始终保留外层 `cancelled`，不会执行 queued tool、进入 Gate 或推进 publication。partial stream 从未形成 completed result，因而只闭合已 durable started 的 attempt，不持久化 delta。
+取消可以先于并发外部结果成为 Journal fact。`cancelRun` 先在独立 control table 持久化 cancellation request；active owner 的 heartbeat/poll safe-point 原子提交 `run_cancelled` 与 request consumption，再 abort 当前 operation 的 provider signal。若请求者或 owner 崩溃，下一 mutation 在做业务工作前先消费 pending request。若 Model Turn、Search/read observation、Evidence、Claim、completion 或 aborted Retry Attempt 已经完整形成，Runtime 仍可把该结果追加到 `cancelledState` 供审计；reducer 始终保留外层 `cancelled`，不会执行 queued tool、进入 Gate 或推进 publication。partial stream 从未形成 completed result，因而只闭合已 durable started 的 attempt，不持久化 delta。
+
+## Run Operation lease 与 cancellation control plane
+
+```mermaid
+stateDiagram-v2
+  [*] --> idle
+  idle --> active: acquire per-run lease
+  active --> active: heartbeat + poll cancel request
+  active --> idle: command returns / release
+  active --> expired: owner disappears / expiry
+  expired --> active: next command takes over
+
+  idle --> cancel_requested: durable cancel request
+  active --> cancel_requested: durable cancel request
+  cancel_requested --> cancelled: owner or recovery command<br/>journal run_cancelled + consume request
+  cancelled --> idle: release operation lease
+
+  note right of active
+    SQLite transactions are short
+    model/tool I/O runs outside transactions
+    inspect / trace / operation stay readable
+  end note
+
+  note right of expired
+    lease never says what business work finished
+    recovery replays the Run Journal
+  end note
+```
+
+mutating public commands validate their input, then acquire one per-run durable lease before external or Journal side effects。竞争 owner 收到 `run_busy`；不同 Runs 仍可并行。heartbeat/expiry 使用独立 control-plane clock，不计入 Run Budget wall time。`createRun` 是唯一没有既有 Run 的命令：初始 `run_created` / `planning_started` 与首个 lease 在同一 SQLite 短事务创建，随后才调用 Model Port。
 
 publication 状态以 `researchOrigin` 判别 provenance：Issue #5 的零 Research Loop Model Turn 显式教学路径只能是 `legacy_explicit`，真正多轮路径只能是 `research_loop` 且结构上必须同时保留非空 Model Turns、tool observations、`researchStartedAt` 与 `completion`。因此 schema 和 reducer 都无法表达“有 Research Loop turns 但没有完成事实”或“零 turn 凭空带 completion”的非法组合。
 

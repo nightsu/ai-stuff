@@ -12,7 +12,7 @@ const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 it("parses every architecture Mermaid block", async () => {
   const diagrams = extractMermaidDiagrams(await readArchitecture());
 
-  expect(diagrams).toHaveLength(2);
+  expect(diagrams).toHaveLength(3);
   for (const diagram of diagrams) {
     await expect(mermaid.parse(diagram)).resolves.toBeTruthy();
   }
@@ -29,6 +29,8 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   }
 
   expect(markdown).toContain("Runtime --> Harness");
+  expect(markdown).toContain("Runtime --> Operation");
+  expect(markdown).toContain("Operation --> Journal");
   expect(markdown).toContain("Harness <--> Journal");
   expect(markdown).toContain("Journal --> Projection");
   expect(markdown).toContain("Projection --> View");
@@ -92,6 +94,9 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   expect(markdown).toContain("budget_exhausted");
   expect(markdown).toContain("research_complete");
   expect(markdown).toContain("completed`、`cancelled` 与 `failed` 是不可恢复 terminal states");
+  expect(markdown).toContain("Run Operation lease 与 cancellation control plane");
+  expect(markdown).toContain("active --> active: heartbeat + poll cancel request");
+  expect(markdown).toContain("expired --> active: next command takes over");
 });
 
 async function readArchitecture(): Promise<string> {

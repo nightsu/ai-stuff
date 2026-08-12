@@ -653,7 +653,7 @@ describe("ResearchAgentRuntime source reads", () => {
     }
   });
 
-  it("reports a concurrent append conflict without claiming both reads were persisted", async () => {
+  it("reports run_busy without claiming two concurrent source reads were persisted", async () => {
     const fixture = await createApprovedRun();
     const firstBoundaries = createReadBoundaries("first-attempt", [
       "2026-08-12T11:20:00.000Z",
@@ -687,7 +687,7 @@ describe("ResearchAgentRuntime source reads", () => {
       const rejected = outcomes.find(({ status }) => status === "rejected");
       expect(rejected).toMatchObject({
         status: "rejected",
-        reason: { name: "SourceReadConflictError" },
+        reason: { name: "RunBusyError" },
       });
       expect(countSourceReadEvents(fixture.runtimeHome, fixture.runId)).toBe(1);
       const persisted = await first.inspectRun({ runId: fixture.runId });
@@ -695,15 +695,15 @@ describe("ResearchAgentRuntime source reads", () => {
       expect(researchingStateOf(persisted).sourceBytesRead).toBe(
         fixture.sourceBytes.byteLength,
       );
-      // 两次 attempt 都在进入短事务前完成 capture 并消费自己的 clock/ID；
-      // 只有赢得 expected sequence 的那一个成为 Journal 事实。
-      expect(firstBoundaries.calls()).toEqual({
-        clock: 1,
-        event: 1,
-        observation: 1,
-        toolCall: 1,
+      // lease 在外部文件 I/O 前完成竞争；输家不读取 live source，也不消费
+      // Journal event / observation / tool-call identity。
+      expect([firstBoundaries.calls(), secondBoundaries.calls()]).toContainEqual({
+        clock: 0,
+        event: 0,
+        observation: 0,
+        toolCall: 0,
       });
-      expect(secondBoundaries.calls()).toEqual({
+      expect([firstBoundaries.calls(), secondBoundaries.calls()]).toContainEqual({
         clock: 1,
         event: 1,
         observation: 1,

@@ -371,48 +371,45 @@ describe("ResearchAgentRuntime plan approval", () => {
     }
   });
 
-  it("returns one persisted Projection to both concurrent same-binding approvals", async () => {
+  it("returns run_busy to a concurrent same-binding approval", async () => {
     const runtimeHome = await createRuntimeHome();
     const waiting = await createWaitingRun(runtimeHome);
     const command = approvalCommandFor(waiting);
-    const winner = openApprovalRuntime(runtimeHome, createApprovalIds());
-    let winningApproval: Promise<RunProjection> | undefined;
-    let winnerTriggered = false;
-    const triggerWinner = (): void => {
-      if (!winnerTriggered) {
-        winnerTriggered = true;
-        winningApproval = winner.approvePlan(command);
-      }
-    };
+    let leaseAcquired: (() => void) | undefined;
+    let releaseWinner: (() => void) | undefined;
+    const acquired = new Promise<void>((resolve) => {
+      leaseAcquired = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseWinner = resolve;
+    });
+    const winner = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: new ScriptedModel([]),
+      clock: { now: () => "2026-08-12T08:01:00.000Z" },
+      ids: fullApprovalIds(createApprovalIds()),
+      runOperationHooks: {
+        afterLeaseAcquired: async () => {
+          leaseAcquired?.();
+          await released;
+        },
+      },
+    });
     const contender = ResearchAgentRuntime.open({
       runtimeHome,
       model: new ScriptedModel([]),
       clock: { now: () => "2026-08-12T08:02:00.000Z" },
-      ids: {
-        nextRunId: () => {
-          throw new Error("审批不得生成新的 Run ID");
-        },
-        nextApprovalId: () => {
-          triggerWinner();
-          return "approval-stale";
-        },
-        nextEventId: () => {
-          triggerWinner();
-          return "event-stale";
-        },
-        nextToolCallId: unexpectedSourceReadId,
-        nextObservationId: unexpectedSourceReadId,
-      },
+      ids: fullApprovalIds(createApprovalIds()),
     });
 
     try {
-      const contenderApproval = contender.approvePlan(command);
-      if (winningApproval === undefined) {
-        throw new Error("测试要求竞争写入已发生");
-      }
-      const winnerProjection = await winningApproval;
-      const contenderProjection = await contenderApproval;
-      expect(contenderProjection).toEqual(winnerProjection);
+      const winningApproval = winner.approvePlan(command);
+      await acquired;
+      await expect(contender.approvePlan(command)).rejects.toMatchObject({
+        name: "RunBusyError",
+      });
+      releaseWinner?.();
+      await winningApproval;
       expect(countEvents(runtimeHome, waiting.runId)).toBe(4);
       expect(
         (await winner.traceRun({ runId: waiting.runId })).events.filter(
@@ -420,6 +417,7 @@ describe("ResearchAgentRuntime plan approval", () => {
         ),
       ).toHaveLength(1);
     } finally {
+      releaseWinner?.();
       contender.close();
       winner.close();
     }
@@ -667,6 +665,18 @@ function openApprovalRuntime(runtimeHome: string, ids: ApprovalIds) {
       nextObservationId: unexpectedSourceReadId,
     },
   });
+}
+
+function fullApprovalIds(ids: ApprovalIds) {
+  return {
+    nextRunId: () => {
+      throw new Error("审批不得生成新的 Run ID");
+    },
+    nextEventId: ids.nextEventId,
+    nextApprovalId: ids.nextApprovalId,
+    nextToolCallId: unexpectedSourceReadId,
+    nextObservationId: unexpectedSourceReadId,
+  };
 }
 
 function createApprovalIds(): ApprovalIds {

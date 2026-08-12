@@ -15,6 +15,9 @@ import type {
   PersistedArtifact,
   PersistedSourceSnapshot,
   ResearchRunEvent,
+  RunCancellationRequest,
+  RunOperationLease,
+  RunOperationView,
   RunProjection,
   SourceSnapshotReference,
 } from "../domain/types.js";
@@ -72,9 +75,68 @@ interface SourceSnapshotRow {
   readonly created_at: string;
 }
 
+interface RunOperationRow {
+  /** lease 所保护的 Research Run identity。 */
+  readonly run_id: string;
+  /** 当前 command-owned operation identity。 */
+  readonly operation_id: string;
+  /** 持有 lease 的 Runtime 实例 identity。 */
+  readonly owner_id: string;
+  /** 不参与 Run Projection 的 command 类别。 */
+  readonly kind: RunOperationLease["kind"];
+  /** lease 首次获取的 ISO 8601 UTC 时间。 */
+  readonly acquired_at: string;
+  /** 最近 durable heartbeat 的 ISO 8601 UTC 时间。 */
+  readonly heartbeat_at: string;
+  /** 其他 owner 可接管此 lease 的 ISO 8601 UTC 截止时间。 */
+  readonly expires_at: string;
+}
+
+interface RunCancellationRequestRow {
+  /** 请求终止的 Research Run identity。 */
+  readonly run_id: string;
+  /** durable cancellation request identity。 */
+  readonly request_id: string;
+  /** 请求首次 durable 创建的 ISO 8601 UTC 时间。 */
+  readonly requested_at: string;
+  /** 请求转化为 canonical cancellation 的时间。 */
+  readonly consumed_at: string | null;
+  /** 消费请求的 operation identity。 */
+  readonly consumed_by_operation_id: string | null;
+}
+
+interface RunIdentityRow {
+  /** SQLite 中已存在的 Research Run identity。 */
+  readonly run_id: string;
+}
+
+/** appendEvents 可选的 control-plane 原子变更。 */
+interface AppendEventsControl {
+  /** 创建新 Run 时与初始 Journal 同事务取得的 operation lease。 */
+  readonly initialOperationLease?: RunOperationLease | undefined;
+  /** 与 `run_cancelled` 同事务结算的 durable cancellation request。 */
+  readonly consumedCancellation?: {
+    /** 必须仍未消费的 cancellation request identity。 */
+    readonly requestId: string;
+    /** canonical cancellation 成为事实的 ISO 8601 UTC 时间。 */
+    readonly consumedAt: string;
+    /** 代表活跃 command 消费时的 operation identity；独立 cancel 可省略。 */
+    readonly operationId?: string | undefined;
+  } | undefined;
+}
+
 export class RunNotFoundError extends Error {}
 
 export class ConcurrentRunWriteError extends Error {}
+
+/** 另一个未到期 owner 已持有同一 Run 的 mutating operation lease。 */
+export class RunOperationBusyError extends Error {}
+
+/** 当前 owner 无法再续租其 operation 时抛出的内部控制面错误。 */
+export class RunOperationLeaseLostError extends Error {}
+
+/** Journal mutation 发现更早 durable 的未消费 cancellation request。 */
+export class RunCancellationPendingError extends Error {}
 
 export class SourceSnapshotRegistrationError extends Error {
   public constructor() {
@@ -103,6 +165,8 @@ export class SourceSnapshotEventInvariantError extends Error {
 export class SqliteRunStore {
   /** 当前 Runtime Home 独占的同步 SQLite 连接。 */
   readonly #database: Database.Database;
+  /** 当前进程已取得、且每次 Journal mutation 都要向 SQLite 复核的 operation IDs。 */
+  readonly #operationGuards = new Map<string, string>();
 
   public constructor(runtimeHome: string) {
     this.#database = new Database(join(runtimeHome, "runtime.sqlite"));
@@ -117,6 +181,7 @@ export class SqliteRunStore {
     events: readonly ResearchRunEvent[],
     artifacts: readonly PersistedArtifact[] = [],
     sourceSnapshots: readonly PersistedSourceSnapshot[] = [],
+    control: AppendEventsControl = {},
   ): RunProjection {
     if (events.length === 0) {
       throw new Error("appendEvents 至少需要一个语义事件");
@@ -138,6 +203,28 @@ export class SqliteRunStore {
         );
       }
 
+      const pendingCancellation = lastSequence === 0
+        ? undefined
+        : this.#readCancellationRequestRow(runId);
+      if (
+        pendingCancellation?.consumed_at === null &&
+        control.consumedCancellation === undefined
+      ) {
+        // cancellation request 是独立 durable control fact。它一旦先提交，后续
+        // mutation 不能在 heartbeat 间隙越过它；caller 必须先原子写 run_cancelled
+        // 并消费 request，再决定完整 late result 是否进入 cancelled snapshot。
+        throw new RunCancellationPendingError();
+      }
+      const guardedOperationId = this.#operationGuards.get(runId);
+      if (guardedOperationId !== undefined) {
+        const activeOperation = this.#readRunOperationRow(runId);
+        if (activeOperation?.operation_id !== guardedOperationId) {
+          // lease expiry 后旧进程可能重新获得 CPU；每次事务都必须用 durable
+          // operation identity fencing，不能只相信进程内“我曾经拿到过 lease”。
+          throw new RunOperationLeaseLostError();
+        }
+      }
+
       if (lastSequence === 0) {
         const firstEvent = events[0];
         if (firstEvent === undefined) {
@@ -146,6 +233,14 @@ export class SqliteRunStore {
         this.#database
           .prepare("INSERT INTO runs (run_id, created_at) VALUES (?, ?)")
           .run(runId, firstEvent.occurredAt);
+        if (control.initialOperationLease !== undefined) {
+          if (control.initialOperationLease.runId !== runId) {
+            throw new RunOperationLeaseLostError();
+          }
+          this.#insertRunOperation(control.initialOperationLease);
+        }
+      } else if (control.initialOperationLease !== undefined) {
+        throw new RunOperationLeaseLostError();
       }
 
       const referencedArtifacts = collectArtifactReferences(events);
@@ -215,6 +310,23 @@ export class SqliteRunStore {
           event.occurredAt,
           JSON.stringify(event.payload),
         );
+      }
+
+      if (control.consumedCancellation !== undefined) {
+        if (!events.some((event) => event.type === "run_cancelled")) {
+          throw new RunOperationLeaseLostError();
+        }
+        const result = this.#database.prepare(
+          `UPDATE run_cancellation_requests
+              SET consumed_at = ?, consumed_by_operation_id = ?
+            WHERE run_id = ? AND request_id = ? AND consumed_at IS NULL`,
+        ).run(
+          control.consumedCancellation.consumedAt,
+          control.consumedCancellation.operationId ?? null,
+          runId,
+          control.consumedCancellation.requestId,
+        );
+        if (result.changes !== 1) throw new RunOperationLeaseLostError();
       }
 
       // Journal 与缓存投影在同一短事务提交。崩溃只会得到“都可见”或“都不可见”，
@@ -346,6 +458,100 @@ export class SqliteRunStore {
     };
   }
 
+  public acquireRunOperation(lease: RunOperationLease): RunOperationLease {
+    const transaction = this.#database.transaction(() => {
+      this.#assertRunExists(lease.runId);
+      const existing = this.#readRunOperationRow(lease.runId);
+      if (
+        existing !== undefined &&
+        Date.parse(existing.expires_at) > Date.parse(lease.acquiredAt)
+      ) {
+        throw new RunOperationBusyError();
+      }
+      // lease 只保护 command ownership；过期 owner 可在一个短事务内被替换，
+      // 但接管者随后仍必须从 canonical Journal 恢复，绝不从旧 lease 猜业务结果。
+      this.#insertRunOperation(lease);
+      return lease;
+    });
+    return transaction.immediate();
+  }
+
+  public heartbeatRunOperation(
+    runId: string,
+    operationId: string,
+    heartbeatAt: string,
+    expiresAt: string,
+  ): RunOperationLease {
+    const result = this.#database.prepare(
+      `UPDATE run_operations
+          SET heartbeat_at = ?, expires_at = ?
+        WHERE run_id = ? AND operation_id = ? AND expires_at > ?`,
+    ).run(heartbeatAt, expiresAt, runId, operationId, heartbeatAt);
+    if (result.changes !== 1) throw new RunOperationLeaseLostError();
+    const row = this.#readRunOperationRow(runId);
+    if (row === undefined) throw new RunOperationLeaseLostError();
+    return runOperationFromRow(row);
+  }
+
+  public guardRunOperation(runId: string, operationId: string): void {
+    this.#operationGuards.set(runId, operationId);
+  }
+
+  public unguardRunOperation(runId: string, operationId: string): void {
+    if (this.#operationGuards.get(runId) === operationId) {
+      this.#operationGuards.delete(runId);
+    }
+  }
+
+  public releaseRunOperation(runId: string, operationId: string): void {
+    this.#database.prepare(
+      "DELETE FROM run_operations WHERE run_id = ? AND operation_id = ?",
+    ).run(runId, operationId);
+  }
+
+  public inspectRunOperation(runId: string): RunOperationView {
+    this.#assertRunExists(runId);
+    const lease = this.#readRunOperationRow(runId);
+    const cancellationRequest = this.#database.prepare(
+      `SELECT run_id, request_id, requested_at, consumed_at,
+              consumed_by_operation_id
+         FROM run_cancellation_requests
+        WHERE run_id = ?`,
+    ).get(runId) as RunCancellationRequestRow | undefined;
+    return {
+      lease: lease === undefined ? undefined : runOperationFromRow(lease),
+      cancellationRequest: cancellationRequest === undefined
+        ? undefined
+        : cancellationRequestFromRow(cancellationRequest),
+    };
+  }
+
+  public requestRunCancellation(
+    request: RunCancellationRequest,
+  ): RunCancellationRequest {
+    const transaction = this.#database.transaction(() => {
+      this.#assertRunExists(request.runId);
+      const existing = this.#readCancellationRequestRow(request.runId);
+      if (existing !== undefined) return cancellationRequestFromRow(existing);
+      this.#database.prepare(
+        `INSERT INTO run_cancellation_requests
+          (run_id, request_id, requested_at, consumed_at,
+           consumed_by_operation_id)
+         VALUES (?, ?, ?, NULL, NULL)`,
+      ).run(request.runId, request.requestId, request.requestedAt);
+      return request;
+    });
+    return transaction.immediate();
+  }
+
+  public readPendingRunCancellation(
+    runId: string,
+  ): RunCancellationRequest | undefined {
+    const row = this.#readCancellationRequestRow(runId);
+    if (row === undefined || row.consumed_at !== null) return undefined;
+    return cancellationRequestFromRow(row);
+  }
+
   public close(): void {
     this.#database.close();
   }
@@ -357,6 +563,56 @@ export class SqliteRunStore {
       )
       .get(runId) as LastSequenceRow;
     return row.last_sequence;
+  }
+
+  #assertRunExists(runId: string): void {
+    const row = this.#database.prepare(
+      "SELECT run_id FROM runs WHERE run_id = ?",
+    ).get(runId) as RunIdentityRow | undefined;
+    if (row === undefined) throw new RunNotFoundError(`找不到 Research Run：${runId}`);
+  }
+
+  #readRunOperationRow(runId: string): RunOperationRow | undefined {
+    return this.#database.prepare(
+      `SELECT run_id, operation_id, owner_id, kind, acquired_at,
+              heartbeat_at, expires_at
+         FROM run_operations
+        WHERE run_id = ?`,
+    ).get(runId) as RunOperationRow | undefined;
+  }
+
+  #insertRunOperation(lease: RunOperationLease): void {
+    this.#database.prepare(
+      `INSERT INTO run_operations
+        (run_id, operation_id, owner_id, kind, acquired_at, heartbeat_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(run_id) DO UPDATE SET
+         operation_id = excluded.operation_id,
+         owner_id = excluded.owner_id,
+         kind = excluded.kind,
+         acquired_at = excluded.acquired_at,
+         heartbeat_at = excluded.heartbeat_at,
+         expires_at = excluded.expires_at`,
+    ).run(
+      lease.runId,
+      lease.operationId,
+      lease.ownerId,
+      lease.kind,
+      lease.acquiredAt,
+      lease.heartbeatAt,
+      lease.expiresAt,
+    );
+  }
+
+  #readCancellationRequestRow(
+    runId: string,
+  ): RunCancellationRequestRow | undefined {
+    return this.#database.prepare(
+      `SELECT run_id, request_id, requested_at, consumed_at,
+              consumed_by_operation_id
+         FROM run_cancellation_requests
+        WHERE run_id = ?`,
+    ).get(runId) as RunCancellationRequestRow | undefined;
   }
 
   #registerSourceSnapshot(snapshot: PersistedSourceSnapshot): void {
@@ -497,6 +753,24 @@ export class SqliteRunStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS run_operations (
+        run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+        operation_id TEXT NOT NULL UNIQUE,
+        owner_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS run_cancellation_requests (
+        run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+        request_id TEXT NOT NULL UNIQUE,
+        requested_at TEXT NOT NULL,
+        consumed_at TEXT,
+        consumed_by_operation_id TEXT
+      );
+
       CREATE TRIGGER IF NOT EXISTS run_events_are_append_only_on_update
       BEFORE UPDATE ON run_events
       BEGIN
@@ -534,6 +808,32 @@ export class SqliteRunStore {
       END;
     `);
   }
+}
+
+function runOperationFromRow(row: RunOperationRow): RunOperationLease {
+  return {
+    runId: row.run_id,
+    operationId: row.operation_id,
+    ownerId: row.owner_id,
+    kind: row.kind,
+    acquiredAt: row.acquired_at,
+    heartbeatAt: row.heartbeat_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+function cancellationRequestFromRow(
+  row: RunCancellationRequestRow,
+): RunCancellationRequest {
+  return {
+    runId: row.run_id,
+    requestId: row.request_id,
+    requestedAt: row.requested_at,
+    ...(row.consumed_at === null ? {} : { consumedAt: row.consumed_at }),
+    ...(row.consumed_by_operation_id === null
+      ? {}
+      : { consumedByOperationId: row.consumed_by_operation_id }),
+  };
 }
 
 function isIsoUtc(value: string): boolean {

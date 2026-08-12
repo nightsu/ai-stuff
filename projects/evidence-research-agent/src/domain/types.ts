@@ -705,6 +705,63 @@ export interface RunProjection {
   readonly updatedAt: string;
 }
 
+/** 一个 mutating application command 在持有 durable lease 时的稳定类别。 */
+export type RunOperationKind =
+  | "create_run"
+  | "approve_plan"
+  | "advance_research"
+  | "read_source"
+  | "record_evidence"
+  | "record_claim"
+  | "propose_learning_artifact"
+  | "approve_publication"
+  | "publish_learning_artifact"
+  | "pause_run"
+  | "resume_run"
+  | "consume_cancellation"
+  | "extend_run_budget"
+  | "rebuild_projection";
+
+/** 与 Run Journal 分离、只表达 command ownership 的 durable operation lease。 */
+export interface RunOperationLease {
+  /** lease 所保护的 Research Run identity。 */
+  readonly runId: string;
+  /** 每次获取时生成、续租和释放都必须匹配的 operation identity。 */
+  readonly operationId: string;
+  /** 持有 lease 的 Runtime 实例 identity，用于诊断 stale owner。 */
+  readonly ownerId: string;
+  /** 当前 command 的稳定类别；不能被解释为 Research Run state。 */
+  readonly kind: RunOperationKind;
+  /** 首次获取 lease 的 ISO 8601 UTC 时间。 */
+  readonly acquiredAt: string;
+  /** owner 最近一次证明存活的 ISO 8601 UTC 时间。 */
+  readonly heartbeatAt: string;
+  /** 超过此 ISO 8601 UTC 时间后其他 owner 可以接管。 */
+  readonly expiresAt: string;
+}
+
+/** 独立于 active lease 持久化的用户 cancellation control request。 */
+export interface RunCancellationRequest {
+  /** 请求终止的 Research Run identity。 */
+  readonly runId: string;
+  /** 单次用户取消请求的稳定 identity。 */
+  readonly requestId: string;
+  /** 请求首次持久化的 ISO 8601 UTC 时间。 */
+  readonly requestedAt: string;
+  /** 请求已转化为 canonical cancellation fact 的时间；未消费时省略。 */
+  readonly consumedAt?: string | undefined;
+  /** 消费请求的 operation identity；独立 cancel command 可省略。 */
+  readonly consumedByOperationId?: string | undefined;
+}
+
+/** 只读观察 control plane，不把 lease 或 request 混入 Run Projection。 */
+export interface RunOperationView {
+  /** 当前尚未到期的 durable operation lease；没有 active owner 时省略。 */
+  readonly lease?: RunOperationLease | undefined;
+  /** 最近一次 durable cancellation request；从未请求时省略。 */
+  readonly cancellationRequest?: RunCancellationRequest | undefined;
+}
+
 /** `run_created` 事件携带的创建事实。 */
 export interface RunCreatedPayload {
   /** 创建时去除首尾空白后的技术问题，后续事件不得覆写。 */
