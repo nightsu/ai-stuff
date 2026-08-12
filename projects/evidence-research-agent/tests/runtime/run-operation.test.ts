@@ -287,6 +287,137 @@ describe("ResearchAgentRuntime durable Run Operations", () => {
     }
   });
 
+  it("fences an expired owner before another operation takes over", async () => {
+    const runtimeHome = await temporaryDirectory("run-expired-operation-runtime-");
+    const sourceRoot = await temporaryDirectory("run-expired-operation-source-");
+    const [operationClock, setOperationTime] = controlledClock(
+      "2026-08-12T10:00:00.000Z",
+    );
+    let enterStream: (() => void) | undefined;
+    let releaseStream: (() => void) | undefined;
+    const entered = new Promise<void>((resolve) => {
+      enterStream = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      operationClock,
+      operationLeaseDurationMs: 1_000,
+      operationHeartbeatIntervalMs: 900,
+      model: {
+        proposePlan: async () => learningPlan(),
+        proposeLearningArtifact: async () => {
+          throw new Error("测试不会生成 Learning Artifact");
+        },
+        generateResearchTurn: async () => {
+          enterStream?.();
+          await released;
+          return {
+            text: "租期外的迟到结果不得进入 Journal。",
+            evidenceGaps: [],
+            finishReason: "tool_calls",
+            toolIntents: [{
+              intentId: "expired-complete",
+              name: "complete_research",
+              input: { unresolvedQuestions: [] },
+            }],
+          };
+        },
+      },
+    });
+
+    try {
+      const runId = await createApprovedRun(runtime, sourceRoot);
+      const expiredAdvance = runtime.advanceResearch({ runId });
+      await entered;
+      setOperationTime("2026-08-12T10:00:02.000Z");
+      releaseStream?.();
+
+      await expect(expiredAdvance).rejects.toMatchObject({
+        name: "ResearchLoopError",
+      });
+      await expect(runtime.inspectRun({ runId })).resolves.toMatchObject({
+        lastEventSequence: 4,
+        state: { type: "researching" },
+      });
+    } finally {
+      releaseStream?.();
+      runtime.close();
+    }
+  });
+
+  it("keeps fencing an expired owner after same-Runtime takeover releases its lease", async () => {
+    const runtimeHome = await temporaryDirectory("run-same-owner-takeover-runtime-");
+    const sourceRoot = await temporaryDirectory("run-same-owner-takeover-source-");
+    const [operationClock, setOperationTime] = controlledClock(
+      "2026-08-12T10:00:00.000Z",
+    );
+    let enterStream: (() => void) | undefined;
+    let releaseStream: (() => void) | undefined;
+    const entered = new Promise<void>((resolve) => {
+      enterStream = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      operationClock,
+      operationLeaseDurationMs: 1_000,
+      operationHeartbeatIntervalMs: 900,
+      model: {
+        proposePlan: async () => learningPlan(),
+        proposeLearningArtifact: async () => {
+          throw new Error("测试不会生成 Learning Artifact");
+        },
+        generateResearchTurn: async () => {
+          enterStream?.();
+          await released;
+          return {
+            text: "同进程旧 command 也不得失去 fencing。",
+            evidenceGaps: [],
+            finishReason: "tool_calls",
+            toolIntents: [{
+              intentId: "same-runtime-complete",
+              name: "complete_research",
+              input: { unresolvedQuestions: [] },
+            }],
+          };
+        },
+      },
+    });
+
+    try {
+      const runId = await createApprovedRun(runtime, sourceRoot);
+      const approved = await runtime.inspectRun({ runId });
+      if (approved.state.type !== "researching") {
+        throw new Error("测试夹具没有进入 researching");
+      }
+      const staleAdvance = runtime.advanceResearch({ runId });
+      await entered;
+      setOperationTime("2026-08-12T10:00:02.000Z");
+
+      await expect(runtime.approvePlan({
+        runId,
+        bindingHash: approved.state.approvalReceipt.bindingHash,
+      })).resolves.toMatchObject({ lastEventSequence: 4 });
+      releaseStream?.();
+
+      await expect(staleAdvance).rejects.toMatchObject({
+        name: "ResearchLoopError",
+      });
+      await expect(runtime.inspectRun({ runId })).resolves.toMatchObject({
+        lastEventSequence: 4,
+        state: { type: "researching" },
+      });
+    } finally {
+      releaseStream?.();
+      runtime.close();
+    }
+  });
+
   it("consumes a durable cancellation request before the next mutation after the requester crashes", async () => {
     const runtimeHome = await temporaryDirectory("run-cancel-recovery-runtime-");
     const sourceRoot = await temporaryDirectory("run-cancel-recovery-source-");

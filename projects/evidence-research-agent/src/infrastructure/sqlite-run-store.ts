@@ -111,7 +111,9 @@ interface RunIdentityRow {
 }
 
 /** appendEvents 可选的 control-plane 原子变更。 */
-interface AppendEventsControl {
+export interface AppendEventsControl {
+  /** 当前 command chain 持有的 operation identity；存在 lease 时必须提供。 */
+  readonly operationId?: string | undefined;
   /** 创建新 Run 时与初始 Journal 同事务取得的 operation lease。 */
   readonly initialOperationLease?: RunOperationLease | undefined;
   /** 与 `run_cancelled` 同事务结算的 durable cancellation request。 */
@@ -168,11 +170,15 @@ export class SourceSnapshotEventInvariantError extends Error {
 export class SqliteRunStore {
   /** 当前 Runtime Home 独占的同步 SQLite 连接。 */
   readonly #database: Database.Database;
-  /** 当前进程已取得、且每次 Journal mutation 都要向 SQLite 复核的 operation IDs。 */
-  readonly #operationGuards = new Map<string, string>();
+  /** 返回 control-plane 当前时间，用于在 Journal 事务内校验 lease 尚未过期。 */
+  readonly #controlPlaneNow: () => string;
 
-  public constructor(runtimeHome: string) {
+  public constructor(
+    runtimeHome: string,
+    controlPlaneNow: () => string = () => new Date().toISOString(),
+  ) {
     this.#database = new Database(join(runtimeHome, "runtime.sqlite"));
+    this.#controlPlaneNow = controlPlaneNow;
     this.#database.pragma("foreign_keys = ON");
     this.#database.pragma("journal_mode = WAL");
     this.#migrate();
@@ -218,14 +224,20 @@ export class SqliteRunStore {
         // 并消费 request，再决定完整 late result 是否进入 cancelled snapshot。
         throw new RunCancellationPendingError();
       }
-      const guardedOperationId = this.#operationGuards.get(runId);
-      if (guardedOperationId !== undefined) {
-        const activeOperation = this.#readRunOperationRow(runId);
-        if (activeOperation?.operation_id !== guardedOperationId) {
-          // lease expiry 后旧进程可能重新获得 CPU；每次事务都必须用 durable
-          // operation identity fencing，不能只相信进程内“我曾经拿到过 lease”。
+      const activeOperation = this.#readRunOperationRow(runId);
+      if (activeOperation !== undefined) {
+        if (
+          activeOperation.operation_id !== control.operationId ||
+          Date.parse(activeOperation.expires_at) <=
+            Date.parse(this.#controlPlaneNow())
+        ) {
+          // operation identity 随异步 command chain 进入每次 mutation；因此同一
+          // Runtime 内的新 command 也不能覆盖旧 owner 的 fencing token。expiry
+          // 后无论是否已有接管者，旧 I/O 都不得把迟到结果写入 canonical Journal。
           throw new RunOperationLeaseLostError();
         }
+      } else if (control.operationId !== undefined) {
+        throw new RunOperationLeaseLostError();
       }
 
       if (lastSequence === 0) {
@@ -494,16 +506,6 @@ export class SqliteRunStore {
     const row = this.#readRunOperationRow(runId);
     if (row === undefined) throw new RunOperationLeaseLostError();
     return runOperationFromRow(row);
-  }
-
-  public guardRunOperation(runId: string, operationId: string): void {
-    this.#operationGuards.set(runId, operationId);
-  }
-
-  public unguardRunOperation(runId: string, operationId: string): void {
-    if (this.#operationGuards.get(runId) === operationId) {
-      this.#operationGuards.delete(runId);
-    }
   }
 
   public releaseRunOperation(runId: string, operationId: string): void {

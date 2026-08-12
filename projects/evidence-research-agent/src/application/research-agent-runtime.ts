@@ -75,6 +75,7 @@ import {
   SourceScopeCanonicalizationError,
 } from "../infrastructure/private-source-access.js";
 import {
+  type AppendEventsControl,
   ConcurrentRunWriteError,
   RunCancellationPendingError,
   RunCancellationTerminalError,
@@ -820,7 +821,10 @@ export class ResearchAgentRuntime {
       this.#operationLeaseDurationMs,
     );
     this.#artifacts = new ContentAddressedArtifactStore(runtimeHome);
-    this.#store = new SqliteRunStore(runtimeHome);
+    this.#store = new SqliteRunStore(
+      runtimeHome,
+      () => this.#operationClock.now(),
+    );
     this.#publisher = new LearningArtifactPublisher({
       runtimeHome,
       ...(options.outputRoot === undefined
@@ -895,7 +899,7 @@ export class ResearchAgentRuntime {
         payload: {},
       },
     ];
-    this.#store.appendEvents(runId, 0, initialEvents, [], [], {
+    this.#appendEvents(runId, 0, initialEvents, [], [], {
       initialOperationLease: lease,
     });
 
@@ -960,7 +964,7 @@ export class ResearchAgentRuntime {
       payload: { planArtifact: artifact, approvalBinding },
     };
 
-    return this.#store.appendEvents(runId, 2, [planProposed], [artifact]);
+    return this.#appendEvents(runId, 2, [planProposed], [artifact]);
   }
 
   public async inspectRun(command: InspectRunCommand): Promise<RunProjection> {
@@ -1028,7 +1032,7 @@ export class ResearchAgentRuntime {
     // Approval 是独立用户命令，不接受模型输出、Research Tool 参数、环境变量或
     // 调用方自造 Receipt；这里使用读取时的 last sequence 保留乐观并发语义。
     try {
-      return this.#store.appendEvents(
+      return this.#appendEvents(
         runId,
         current.lastEventSequence,
         [event],
@@ -1904,7 +1908,7 @@ export class ResearchAgentRuntime {
       ...(intentId === undefined ? {} : { intentId }),
       ...(latestSteering === undefined ? {} : { latestSteering }),
     } as const;
-    const projection = this.#store.appendEvents(
+    const projection = this.#appendEvents(
       current.runId,
       current.lastEventSequence,
       [{
@@ -2046,7 +2050,7 @@ export class ResearchAgentRuntime {
     sourceSnapshots: readonly PersistedSourceSnapshot[] = [],
   ): RunProjection {
     try {
-      return this.#store.appendEvents(
+      return this.#appendEvents(
         expected.runId,
         expected.lastEventSequence,
         events,
@@ -2097,7 +2101,7 @@ export class ResearchAgentRuntime {
         ...event,
         sequence: current.lastEventSequence + index + 1,
       })) as readonly ResearchRunEvent[];
-      return this.#store.appendEvents(
+      return this.#appendEvents(
         current.runId,
         current.lastEventSequence,
         resequenced,
@@ -2232,7 +2236,7 @@ export class ResearchAgentRuntime {
     if (exhaustedDimension === undefined) {
       throw new ResearchLoopError();
     }
-    return this.#store.appendEvents(current.runId, current.lastEventSequence, [
+    return this.#appendEvents(current.runId, current.lastEventSequence, [
       {
         eventId: this.#ids.nextEventId(),
         runId: current.runId,
@@ -2400,7 +2404,7 @@ export class ResearchAgentRuntime {
 
     try {
       const projection = researchIntent === undefined
-        ? this.#store.appendEvents(
+        ? this.#appendEvents(
             runId,
             current.lastEventSequence,
             [event],
@@ -2530,7 +2534,7 @@ export class ResearchAgentRuntime {
         );
       }
       const projection = researchIntent === undefined
-        ? this.#store.appendEvents(runId, current.lastEventSequence, [event])
+        ? this.#appendEvents(runId, current.lastEventSequence, [event])
         : this.#appendCompletedResearchResults(current, [event]);
       if (researchIntent !== undefined) {
         await this.#runResearchLoopHook(
@@ -2626,7 +2630,7 @@ export class ResearchAgentRuntime {
         );
       }
       const projection = researchIntent === undefined
-        ? this.#store.appendEvents(runId, current.lastEventSequence, [event])
+        ? this.#appendEvents(runId, current.lastEventSequence, [event])
         : this.#appendCompletedResearchResults(current, [event]);
       if (researchIntent !== undefined) {
         await this.#runResearchLoopHook(
@@ -2793,7 +2797,7 @@ export class ResearchAgentRuntime {
     };
 
     try {
-      return this.#store.appendEvents(
+      return this.#appendEvents(
         runId,
         current.lastEventSequence,
         [event],
@@ -2891,7 +2895,7 @@ export class ResearchAgentRuntime {
     };
 
     try {
-      return this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+      return this.#appendEvents(runId, current.lastEventSequence, [event]);
     } catch (error) {
       if (!(error instanceof ConcurrentRunWriteError)) {
         throw new LearningArtifactPublicationError();
@@ -2979,7 +2983,7 @@ export class ResearchAgentRuntime {
       },
     };
     try {
-      return this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+      return this.#appendEvents(runId, current.lastEventSequence, [event]);
     } catch (error) {
       if (error instanceof ConcurrentRunWriteError) {
         // 外部 bytes 已经 no-clobber 发布，后续显式相同 publish 会先验证精确 bytes
@@ -2999,7 +3003,7 @@ export class ResearchAgentRuntime {
     const current = this.#store.readProjection(runId);
     if (current.state.type === "user_paused") return current;
     const occurredAt = this.#clock.now();
-    return this.#store.appendEvents(runId, current.lastEventSequence, [{
+    return this.#appendEvents(runId, current.lastEventSequence, [{
       eventId: this.#ids.nextEventId(),
       runId,
       sequence: current.lastEventSequence + 1,
@@ -3017,7 +3021,7 @@ export class ResearchAgentRuntime {
   #resumeRun(runId: string): RunProjection {
     const current = this.#store.readProjection(runId);
     const occurredAt = this.#clock.now();
-    return this.#store.appendEvents(runId, current.lastEventSequence, [{
+    return this.#appendEvents(runId, current.lastEventSequence, [{
       eventId: this.#ids.nextEventId(),
       runId,
       sequence: current.lastEventSequence + 1,
@@ -3100,7 +3104,7 @@ export class ResearchAgentRuntime {
     const current = this.#store.readProjection(request.runId);
     if (current.state.type === "cancelled") return current;
     const occurredAt = this.#clock.now();
-    const cancelled = this.#store.appendEvents(request.runId, current.lastEventSequence, [{
+    const cancelled = this.#appendEvents(request.runId, current.lastEventSequence, [{
       eventId: this.#ids.nextEventId(),
       runId: request.runId,
       sequence: current.lastEventSequence + 1,
@@ -3159,7 +3163,7 @@ export class ResearchAgentRuntime {
       runBudgetVersion: runBudget.version,
       runBudgetHash: hashCanonicalJson(runBudget),
     } as const;
-    return this.#store.appendEvents(
+    return this.#appendEvents(
       parsed.runId,
       current.lastEventSequence,
       [{
@@ -3230,7 +3234,6 @@ export class ResearchAgentRuntime {
     ) => Promise<T> | T,
   ): Promise<T> {
     const { runId, operationId } = lease;
-    this.#store.guardRunOperation(runId, operationId);
     let releaseLease = true;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     const operationController = new AbortController();
@@ -3277,9 +3280,33 @@ export class ResearchAgentRuntime {
       if (this.#activeOperationControllers.get(runId) === operationController) {
         this.#activeOperationControllers.delete(runId);
       }
-      this.#store.unguardRunOperation(runId, operationId);
       if (releaseLease) this.#store.releaseRunOperation(runId, operationId);
     }
+  }
+
+  #appendEvents(
+    runId: string,
+    expectedLastSequence: number,
+    events: readonly ResearchRunEvent[],
+    artifacts: readonly PersistedArtifact[] = [],
+    sourceSnapshots: readonly PersistedSourceSnapshot[] = [],
+    control: AppendEventsControl = {},
+  ): RunProjection {
+    const active = this.#operationContext.getStore();
+    const operationId = control.operationId ??
+      control.consumedCancellation?.operationId ??
+      (active?.runId === runId ? active.operationId : undefined);
+    return this.#store.appendEvents(
+      runId,
+      expectedLastSequence,
+      events,
+      artifacts,
+      sourceSnapshots,
+      {
+        ...control,
+        ...(operationId === undefined ? {} : { operationId }),
+      },
+    );
   }
 
   async #runOperationHook(
