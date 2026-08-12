@@ -23,7 +23,17 @@ import {
   RunBudgetCalculationError,
 } from "../domain/run-budget.js";
 import {
+  buildEvaluatorReviewRequest,
+  createReviewedPublicationEvaluation,
+  evaluatorInputHash,
+  EvaluatorReviewValidationError,
+  validateEvaluatorReview,
+  validateReviewedPublicationEvaluation,
+} from "../domain/evaluator-review.js";
+import {
   createPublicationApprovalBinding,
+  createPublicationApprovalSummary,
+  calculateLearningArtifactToolUsage,
   renderLearningArtifact,
 } from "../domain/learning-artifact.js";
 import { hasPreRenderedCitationToken } from "../domain/citation-safety.js";
@@ -31,6 +41,7 @@ import { buildRunTrace, reduceRunEvents } from "../domain/reducer.js";
 import {
   parseResearchPlan,
   parseLearningArtifactProposal,
+  parseEvaluatorReview,
   readSourceRequestSchema,
   parseRequestedSourceScope,
   parseRunBudget,
@@ -40,6 +51,7 @@ import type {
   ArtifactReference,
   Claim,
   EvidenceRecord,
+  PublicationEvaluation,
   LearningArtifactProposal,
   PublicationApprovalReceipt,
   PublicationTarget,
@@ -102,6 +114,7 @@ import {
 } from "./ports.js";
 import type {
   Clock,
+  EvaluatorPort,
   IdGenerator,
   ModelPort,
   RetryScheduler,
@@ -116,6 +129,8 @@ export interface OpenRuntimeOptions {
   readonly outputRoot?: string;
   /** 计划生成使用的 Model Port；inspect 与 trace 不会调用它。 */
   readonly model: ModelPort;
+  /** 独立 advisory Evaluator；省略时仅当 Model Port 同时实现 EvaluatorPort 才可评审。 */
+  readonly evaluator?: EvaluatorPort | undefined;
   /** 可选时间边界；生产默认使用系统 UTC 时间。 */
   readonly clock?: Clock;
   /** 只服务 lease/heartbeat/expiry 的时间边界；省略时使用系统 UTC，不消耗业务测试 clock。 */
@@ -287,6 +302,20 @@ export interface ApprovePublicationCommand {
 /** 在 durable publication approval 后执行一次正常 no-clobber 写入的应用命令。 */
 export interface PublishLearningArtifactCommand {
   /** 当前必须处于 ready_to_publish 的 Research Run identity。 */
+  readonly runId: string;
+}
+
+/** 对 durable Evaluator failure 重新执行 exact isolated review。 */
+export interface RetryEvaluatorReviewCommand {
+  /** 当前必须处于 `waiting_evaluator_resolution` 的 Run identity。 */
+  readonly runId: string;
+  /** 取消尚未形成完整 review 的 evaluator stream。 */
+  readonly abortSignal?: AbortSignal | undefined;
+}
+
+/** 用户明确放弃 advisory review 并继续生成无 verdict draft。 */
+export interface SkipEvaluatorReviewCommand {
+  /** 当前必须处于 `waiting_evaluator_resolution` 的 Run identity。 */
   readonly runId: string;
 }
 
@@ -484,6 +513,14 @@ export class LearningArtifactDraftError extends Error {
   }
 }
 
+/** Evaluator 未形成合法 review、Run 已持久等待用户 resolution 时抛出的安全错误。 */
+export class EvaluatorReviewPendingError extends Error {
+  public constructor() {
+    super("Evaluator Review 未完成，等待 retry 或显式 skip");
+    this.name = "EvaluatorReviewPendingError";
+  }
+}
+
 /** draft Journal 追加与另一项 Run 更新冲突时抛出的安全错误。 */
 export class LearningArtifactDraftConflictError extends Error {
   public constructor() {
@@ -642,6 +679,13 @@ const publishLearningArtifactCommandSchema = z
     runId: z.string().trim().min(1),
   })
   .strict();
+
+const evaluatorResolutionCommandSchema = z.object({
+  runId: z.string().trim().min(1),
+  abortSignal: z.custom<AbortSignal>(
+    (value) => value === undefined || isAbortSignal(value),
+  ).optional(),
+}).strict();
 
 const extendRunBudgetCommandSchema = z.object({
   runId: z.string().trim().min(1),
@@ -847,6 +891,8 @@ export class ResearchAgentRuntime {
   readonly #ids: IdGenerator;
   /** 生成研究计划且不泄漏 provider SDK 类型的模型边界。 */
   readonly #model: ModelPort;
+  /** 只接收 exact Claims/cited Evidence、永远看不到 Model View 的独立评审边界。 */
+  readonly #evaluator?: EvaluatorPort | undefined;
   /** 持久化大 payload、只向 Journal 返回内容引用的 artifact 组件。 */
   readonly #artifacts: ContentAddressedArtifactStore;
   /** 持有 canonical Journal 与 derived Projection cache 的 SQLite 组件。 */
@@ -890,6 +936,7 @@ export class ResearchAgentRuntime {
     this.#operationClock = options.operationClock ?? systemClock;
     this.#ids = options.ids ?? uuidGenerator;
     this.#model = options.model;
+    this.#evaluator = options.evaluator ?? asEvaluatorPort(options.model);
     this.#maxModelViewBytes = options.maxModelViewBytes ?? 32_768;
     this.#retryEnabled = options.retryPolicy !== undefined;
     this.#retryPolicy = parseRetryPolicy(
@@ -3575,8 +3622,8 @@ export class ResearchAgentRuntime {
     }
 
     let proposal: LearningArtifactProposal;
-    let markdown: string;
-    let proposedAt: string;
+    let gate: ReturnType<typeof evaluateEvidenceGate>;
+    let proposalCompletedAt: string;
     try {
       proposal = parseLearningArtifactProposal(
         await this.#model.proposeLearningArtifact({
@@ -3586,7 +3633,7 @@ export class ResearchAgentRuntime {
           evidenceRecords: researching.evidenceRecords,
         }, { abortSignal: modelAbortSignal }),
       );
-      proposedAt = this.#clock.now();
+      proposalCompletedAt = this.#clock.now();
       assertEvidenceGateBudget({
         modelTurnsUsed:
           2 +
@@ -3605,9 +3652,9 @@ export class ResearchAgentRuntime {
         wallTimeEndedAt:
           researching.type === "research_complete"
             ? researching.completion.completedAt
-            : proposedAt,
+            : proposalCompletedAt,
       });
-      const gate = evaluateEvidenceGate(
+      gate = evaluateEvidenceGate(
         proposal,
         researching.claims,
         researching.evidenceRecords,
@@ -3618,7 +3665,6 @@ export class ResearchAgentRuntime {
         readSourceSnapshot: (reference) =>
           this.#artifacts.readSourceSnapshot(reference),
       });
-      markdown = renderLearningArtifact(proposal, gate);
     } catch (error) {
       if (error instanceof ModelGenerationAbortedError) throw error;
       if (error instanceof EvidenceGateError) {
@@ -3646,6 +3692,62 @@ export class ResearchAgentRuntime {
       }
       throw error;
     }
+    const reviewRequest = buildEvaluatorReviewRequest({
+      question: current.question,
+      claims: gate.claims,
+      evidenceRecords: gate.evidenceRecords,
+      sourceReadObservations: researching.sourceReadObservations,
+    });
+    const inputHash = evaluatorInputHash(reviewRequest);
+    const evaluator = this.#evaluator;
+    let evaluation: PublicationEvaluation;
+    let reviewArtifact: PersistedArtifact;
+    try {
+      if (evaluator === undefined) throw new EvaluatorReviewValidationError();
+      const review = validateEvaluatorReview(
+        reviewRequest,
+        await evaluator.reviewClaims(reviewRequest, {
+          abortSignal: modelAbortSignal,
+        }),
+      );
+      const reviewedAt = this.#clock.now();
+      reviewArtifact = await this.#artifacts.putJson(
+        review,
+        "application/json",
+        reviewedAt,
+      );
+      evaluation = createReviewedPublicationEvaluation({
+        review,
+        reviewArtifact: stripArtifactCreatedAt(reviewArtifact),
+        evaluatorIdentity: evaluator.identity,
+        inputHash,
+      });
+    } catch (error) {
+      if (error instanceof ModelGenerationAbortedError) throw error;
+      this.#appendEvaluatorReviewFailure(
+        current,
+        proposal,
+        publicationTarget,
+        inputHash,
+        evaluator?.identity ?? {
+          provider: "unavailable",
+          model: "unavailable",
+          promptVersion: "unavailable",
+        },
+      );
+      throw new EvaluatorReviewPendingError();
+    }
+    const proposedAt = this.#clock.now();
+    const markdown = renderLearningArtifact(proposal, gate, evaluation, {
+      question: current.question,
+      unresolvedQuestions: researching.type === "research_complete"
+        ? researching.completion.unresolvedQuestions
+        : [],
+      toolUsage: calculateLearningArtifactToolUsage({
+        sourceReadObservations: researching.sourceReadObservations,
+        researchToolObservations: researching.researchToolObservations,
+      }),
+    });
     let draftArtifact: PersistedArtifact;
     try {
       draftArtifact = await this.#artifacts.putMarkdown(markdown, proposedAt);
@@ -3654,8 +3756,13 @@ export class ResearchAgentRuntime {
     }
     const publicationBinding = createPublicationApprovalBinding({
       draftHash: draftArtifact.sha256,
+      evaluation,
       publicationTarget,
     });
+    const publicationApprovalSummary = createPublicationApprovalSummary(
+      gate,
+      evaluation,
+    );
     const event: ResearchRunEvent = {
       eventId: this.#ids.nextEventId(),
       runId,
@@ -3665,8 +3772,10 @@ export class ResearchAgentRuntime {
       payload: {
         draftArtifact: stripArtifactCreatedAt(draftArtifact),
         proposal,
+        evaluation,
         publicationTarget,
         publicationBinding,
+        publicationApprovalSummary,
       },
     };
 
@@ -3675,7 +3784,7 @@ export class ResearchAgentRuntime {
         runId,
         current.lastEventSequence,
         [event],
-        [draftArtifact],
+        [reviewArtifact, draftArtifact],
       );
     } catch (error) {
       if (error instanceof ConcurrentRunWriteError) {
@@ -3685,6 +3794,268 @@ export class ResearchAgentRuntime {
       }
       throw new LearningArtifactDraftError();
     }
+  }
+
+  /** Evaluator failure 冻结 exact proposal/input/target，后续 retry 不会重采样 proposal。 */
+  #appendEvaluatorReviewFailure(
+    current: RunProjection,
+    proposal: LearningArtifactProposal,
+    publicationTarget: PublicationTarget,
+    inputHash: string,
+    evaluatorIdentity: import("../domain/types.js").EvaluatorIdentity,
+  ): void {
+    const failedAt = this.#clock.now();
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId: current.runId,
+      sequence: current.lastEventSequence + 1,
+      type: "evaluator_review_failed",
+      occurredAt: failedAt,
+      payload: {
+        proposal,
+        publicationTarget,
+        evaluatorInputHash: inputHash,
+        evaluatorIdentity,
+        failure: {
+          attempt: 1,
+          code: "evaluation_failed",
+          failedAt,
+        },
+      },
+    };
+    try {
+      this.#appendEvents(current.runId, current.lastEventSequence, [event]);
+    } catch {
+      throw new LearningArtifactDraftConflictError();
+    }
+  }
+
+  public async retryEvaluatorReview(
+    command: RetryEvaluatorReviewCommand,
+  ): Promise<RunProjection> {
+    const parsed = evaluatorResolutionCommandSchema.safeParse(command);
+    if (!parsed.success) throw new InvalidLearningArtifactCommandError();
+    return this.#withRunOperation(
+      parsed.data.runId,
+      "retry_evaluator_review",
+      (_lease, operationSignal) => this.#resolveEvaluatorReview(
+        parsed.data.runId,
+        "retry",
+        parsed.data.abortSignal === undefined
+          ? operationSignal
+          : AbortSignal.any([parsed.data.abortSignal, operationSignal]),
+      ),
+    );
+  }
+
+  public async skipEvaluatorReview(
+    command: SkipEvaluatorReviewCommand,
+  ): Promise<RunProjection> {
+    const parsed = runIdentityCommandSchema.safeParse(command);
+    if (!parsed.success) throw new InvalidLearningArtifactCommandError();
+    return this.#withRunOperation(
+      parsed.data.runId,
+      "skip_evaluator_review",
+      (_lease, operationSignal) => this.#resolveEvaluatorReview(
+        parsed.data.runId,
+        "skip",
+        operationSignal,
+      ),
+    );
+  }
+
+  async #resolveEvaluatorReview(
+    runId: string,
+    resolution: "retry" | "skip",
+    abortSignal: AbortSignal,
+  ): Promise<RunProjection> {
+    const current = this.#store.readProjection(runId);
+    if (current.state.type !== "waiting_evaluator_resolution") {
+      throw new IllegalLearningArtifactStateError();
+    }
+    const pending = current.state;
+    const waitingProjection = current as RunProjection & {
+      /** 已由上方 discriminant guard 缩窄的 evaluator waiting continuation。 */
+      readonly state: import("../domain/types.js").WaitingEvaluatorResolutionRunState;
+    };
+    const gate = evaluateEvidenceGate(
+      pending.proposal,
+      pending.claims,
+      pending.evidenceRecords,
+    );
+    await assertEvidenceGateLineage(gate, {
+      sourceScope: current.sourceScope,
+      sourceReadObservations: pending.sourceReadObservations,
+      readSourceSnapshot: (reference) =>
+        this.#artifacts.readSourceSnapshot(reference),
+    });
+    const reviewRequest = buildEvaluatorReviewRequest({
+      question: current.question,
+      claims: gate.claims,
+      evidenceRecords: gate.evidenceRecords,
+      sourceReadObservations: pending.sourceReadObservations,
+    });
+    if (evaluatorInputHash(reviewRequest) !== pending.evaluatorInputHash) {
+      throw new LearningArtifactDraftError();
+    }
+
+    let evaluation: PublicationEvaluation;
+    let reviewArtifact: PersistedArtifact | undefined;
+    if (resolution === "skip") {
+      const proposedAt = this.#clock.now();
+      const eventId = this.#ids.nextEventId();
+      evaluation = {
+        kind: "skipped",
+        identity: {
+          skipId: `skip-${eventId}`,
+          skippedBy: "user-command",
+          skippedAt: proposedAt,
+        },
+      };
+      return this.#appendResolvedEvaluatorDraft(
+        waitingProjection,
+        gate,
+        evaluation,
+        proposedAt,
+        eventId,
+      );
+    }
+
+    const evaluator = this.#evaluator;
+    try {
+      if (
+        evaluator === undefined ||
+        !isDeepEqualEvaluatorIdentity(evaluator.identity, pending.evaluatorIdentity)
+      ) {
+        throw new EvaluatorReviewValidationError();
+      }
+      const review = validateEvaluatorReview(
+        reviewRequest,
+        await evaluator.reviewClaims(reviewRequest, { abortSignal }),
+      );
+      const reviewedAt = this.#clock.now();
+      reviewArtifact = await this.#artifacts.putJson(
+        review,
+        "application/json",
+        reviewedAt,
+      );
+      evaluation = createReviewedPublicationEvaluation({
+        review,
+        reviewArtifact: stripArtifactCreatedAt(reviewArtifact),
+        evaluatorIdentity: evaluator.identity,
+        inputHash: pending.evaluatorInputHash,
+      });
+    } catch (error) {
+      if (error instanceof ModelGenerationAbortedError) throw error;
+      this.#appendEvaluatorReviewRetryFailure(waitingProjection);
+      throw new EvaluatorReviewPendingError();
+    }
+    const proposedAt = this.#clock.now();
+    return this.#appendResolvedEvaluatorDraft(
+      waitingProjection,
+      gate,
+      evaluation,
+      proposedAt,
+      this.#ids.nextEventId(),
+      reviewArtifact,
+    );
+  }
+
+  #appendResolvedEvaluatorDraft(
+    current: RunProjection & {
+      /** 只接受保留 exact proposal/input/target 的 evaluator waiting state。 */
+      readonly state: import("../domain/types.js").WaitingEvaluatorResolutionRunState;
+    },
+    gate: ReturnType<typeof evaluateEvidenceGate>,
+    evaluation: PublicationEvaluation,
+    proposedAt: string,
+    eventId: string,
+    reviewArtifact?: PersistedArtifact,
+  ): Promise<RunProjection> {
+    const pending = current.state;
+    const markdown = renderLearningArtifact(
+      pending.proposal,
+      gate,
+      evaluation,
+      {
+        question: current.question,
+        unresolvedQuestions: pending.researchOrigin === "research_loop"
+          ? pending.completion.unresolvedQuestions
+          : [],
+        toolUsage: calculateLearningArtifactToolUsage({
+          sourceReadObservations: pending.sourceReadObservations,
+          researchToolObservations: pending.researchToolObservations,
+        }),
+      },
+    );
+    return this.#artifacts.putMarkdown(markdown, proposedAt).then(
+      (draftArtifact) => {
+        const publicationBinding = createPublicationApprovalBinding({
+          draftHash: draftArtifact.sha256,
+          evaluation,
+          publicationTarget: pending.publicationTarget,
+        });
+        const publicationApprovalSummary = createPublicationApprovalSummary(
+          gate,
+          evaluation,
+        );
+        const event: ResearchRunEvent = {
+          eventId,
+          runId: current.runId,
+          sequence: current.lastEventSequence + 1,
+          type: "learning_artifact_draft_proposed",
+          occurredAt: proposedAt,
+          payload: {
+            draftArtifact: stripArtifactCreatedAt(draftArtifact),
+            proposal: pending.proposal,
+            evaluation,
+            publicationTarget: pending.publicationTarget,
+            publicationBinding,
+            publicationApprovalSummary,
+          },
+        };
+        return this.#appendEvents(
+          current.runId,
+          current.lastEventSequence,
+          [event],
+          [
+            ...(reviewArtifact === undefined ? [] : [reviewArtifact]),
+            draftArtifact,
+          ],
+        );
+      },
+      () => {
+        throw new LearningArtifactDraftError();
+      },
+    );
+  }
+
+  #appendEvaluatorReviewRetryFailure(
+    current: RunProjection & {
+      /** retry failure 必须追加到同一 evaluator waiting continuation。 */
+      readonly state: import("../domain/types.js").WaitingEvaluatorResolutionRunState;
+    },
+  ): void {
+    const failedAt = this.#clock.now();
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId: current.runId,
+      sequence: current.lastEventSequence + 1,
+      type: "evaluator_review_failed",
+      occurredAt: failedAt,
+      payload: {
+        proposal: current.state.proposal,
+        publicationTarget: current.state.publicationTarget,
+        evaluatorInputHash: current.state.evaluatorInputHash,
+        evaluatorIdentity: current.state.evaluatorIdentity,
+        failure: {
+          attempt: current.state.evaluatorFailures.length + 1,
+          code: "evaluation_failed",
+          failedAt,
+        },
+      },
+    };
+    this.#appendEvents(current.runId, current.lastEventSequence, [event]);
   }
 
   /**
@@ -3870,7 +4241,46 @@ export class ResearchAgentRuntime {
         readSourceSnapshot: (reference) =>
           this.#artifacts.readSourceSnapshot(reference),
       });
-      markdown = renderLearningArtifact(ready.proposal, gate);
+      if (ready.evaluation.kind === "reviewed") {
+        const reviewRequest = buildEvaluatorReviewRequest({
+          question: current.question,
+          claims: gate.claims,
+          evidenceRecords: gate.evidenceRecords,
+          sourceReadObservations: ready.sourceReadObservations,
+        });
+        const persistedReview = parseEvaluatorReview(
+          await this.#artifacts.readJson(ready.evaluation.reviewArtifact),
+        );
+        const persistedEvaluation = {
+          ...ready.evaluation,
+          review: persistedReview,
+        };
+        validateReviewedPublicationEvaluation(
+          reviewRequest,
+          persistedEvaluation,
+        );
+        if (
+          hashCanonicalJson(persistedReview) !==
+            hashCanonicalJson(ready.evaluation.review)
+        ) {
+          throw new LearningArtifactPublicationError();
+        }
+      }
+      markdown = renderLearningArtifact(
+        ready.proposal,
+        gate,
+        ready.evaluation,
+        {
+          question: current.question,
+          unresolvedQuestions: ready.researchOrigin === "research_loop"
+            ? ready.completion.unresolvedQuestions
+            : [],
+          toolUsage: calculateLearningArtifactToolUsage({
+            sourceReadObservations: ready.sourceReadObservations,
+            researchToolObservations: ready.researchToolObservations,
+          }),
+        },
+      );
       if (
         hashUtf8Text(markdown) !== ready.draftArtifact.sha256 ||
         Buffer.byteLength(markdown, "utf8") !== ready.draftArtifact.byteLength
@@ -4335,5 +4745,27 @@ function sameExperimentIdentity(
     expected.adapterVersion === actual.adapterVersion &&
     expected.promptVersion === actual.promptVersion &&
     expected.toolSchemaVersion === actual.toolSchemaVersion
+  );
+}
+
+function asEvaluatorPort(model: ModelPort): EvaluatorPort | undefined {
+  if (
+    "identity" in model &&
+    "reviewClaims" in model &&
+    typeof model.reviewClaims === "function"
+  ) {
+    return model as ModelPort & EvaluatorPort;
+  }
+  return undefined;
+}
+
+function isDeepEqualEvaluatorIdentity(
+  left: import("../domain/types.js").EvaluatorIdentity,
+  right: import("../domain/types.js").EvaluatorIdentity,
+): boolean {
+  return (
+    left.provider === right.provider &&
+    left.model === right.model &&
+    left.promptVersion === right.promptVersion
   );
 }

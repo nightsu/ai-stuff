@@ -26,7 +26,16 @@ import {
   sourceSnapshotHasMatchingContentIdentity,
 } from "./integrity.js";
 import {
+  buildEvaluatorReviewRequest,
+  evaluatorInputHash,
+  EvaluatorReviewValidationError,
+  validateReviewedPublicationEvaluation,
+} from "./evaluator-review.js";
+import {
   createPublicationApprovalBinding,
+  createPublicationApprovalSummary,
+  calculateLearningArtifactToolUsage,
+  isSingleSentenceConclusion,
   publicationBindingsEqual,
   renderLearningArtifact,
 } from "./learning-artifact.js";
@@ -889,16 +898,143 @@ function applyRunEvent(
         updatedAt: event.occurredAt,
       };
     }
+    case "evaluator_review_failed": {
+      if (
+        current.state.type !== "researching" &&
+        current.state.type !== "research_complete" &&
+        current.state.type !== "waiting_evaluator_resolution"
+      ) {
+        throw new IllegalRunEventError(
+          "只有完成 Gate 的 publication 流程可以等待 Evaluator resolution",
+        );
+      }
+      if (event.payload.failure.failedAt !== event.occurredAt) {
+        throw new IllegalRunEventError("Evaluator failure 时间无效");
+      }
+      if (current.state.type === "waiting_evaluator_resolution") {
+        if (
+          !isDeepStrictEqual(current.state.proposal, event.payload.proposal) ||
+          !isDeepStrictEqual(
+            current.state.publicationTarget,
+            event.payload.publicationTarget,
+          ) ||
+          current.state.evaluatorInputHash !== event.payload.evaluatorInputHash ||
+          !isDeepStrictEqual(
+            current.state.evaluatorIdentity,
+            event.payload.evaluatorIdentity,
+          ) ||
+          event.payload.failure.attempt !==
+            current.state.evaluatorFailures.length + 1
+        ) {
+          throw new IllegalRunEventError("Evaluator retry 未保持 exact input");
+        }
+        return {
+          ...current,
+          state: {
+            ...current.state,
+            evaluatorFailures: [
+              ...current.state.evaluatorFailures,
+              event.payload.failure,
+            ],
+          },
+          lastEventSequence: event.sequence,
+          updatedAt: event.occurredAt,
+        };
+      }
+      if (
+        event.payload.failure.attempt !== 1 ||
+        (current.state.modelTurns.length > 0 &&
+          current.state.type !== "research_complete")
+      ) {
+        throw new IllegalRunEventError("Evaluator 首次失败 provenance 无效");
+      }
+      try {
+        const gate = evaluateEvidenceGate(
+          event.payload.proposal,
+          current.state.claims,
+          current.state.evidenceRecords,
+        );
+        const request = buildEvaluatorReviewRequest({
+          question: current.question,
+          claims: gate.claims,
+          evidenceRecords: gate.evidenceRecords,
+          sourceReadObservations: current.state.sourceReadObservations,
+        });
+        if (
+          evaluatorInputHash(request) !== event.payload.evaluatorInputHash ||
+          !hasExactPublicationTargetShape(event.payload.publicationTarget)
+        ) {
+          throw new EvaluatorReviewValidationError();
+        }
+      } catch {
+        throw new IllegalRunEventError("Evaluator failure input identity 无效");
+      }
+      const pendingFields = {
+        planArtifact: current.state.planArtifact,
+        approvalReceipt: current.state.approvalReceipt,
+        sourceReadObservations: current.state.sourceReadObservations,
+        sourceBytesRead: current.state.sourceBytesRead,
+        evidenceRecords: current.state.evidenceRecords,
+        claims: current.state.claims,
+        proposal: event.payload.proposal,
+        publicationTarget: event.payload.publicationTarget,
+        evaluatorInputHash: event.payload.evaluatorInputHash,
+        evaluatorIdentity: event.payload.evaluatorIdentity,
+        evaluatorFailures: [event.payload.failure] as const,
+        suspendedDurationMs: current.state.suspendedDurationMs,
+        retryAttempts: current.state.retryAttempts,
+      };
+      return {
+        ...current,
+        state: current.state.type === "research_complete"
+          ? {
+              ...pendingFields,
+              type: "waiting_evaluator_resolution",
+              researchOrigin: "research_loop",
+              modelTurns: current.state.modelTurns as readonly [
+                (typeof current.state.modelTurns)[number],
+                ...(typeof current.state.modelTurns)[number][],
+              ],
+              researchToolObservations:
+                current.state.researchToolObservations as readonly [
+                  (typeof current.state.researchToolObservations)[number],
+                  ...(typeof current.state.researchToolObservations)[number][],
+                ],
+              evidenceGaps: current.state.evidenceGaps,
+              evidenceGateRepairs: current.state.evidenceGateRepairs,
+              pendingToolIntents: [],
+              ...(current.state.latestSteering === undefined
+                ? {}
+                : { latestSteering: current.state.latestSteering }),
+              researchStartedAt: current.state.researchStartedAt as string,
+              completion: current.state.completion,
+            }
+          : {
+              ...pendingFields,
+              type: "waiting_evaluator_resolution",
+              researchOrigin: "legacy_explicit",
+              modelTurns: [],
+              researchToolObservations: [],
+              evidenceGaps: [],
+              evidenceGateRepairs: [],
+              pendingToolIntents: [],
+            },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
     case "learning_artifact_draft_proposed": {
       if (
         current.state.type !== "researching" &&
-        current.state.type !== "research_complete"
+        current.state.type !== "research_complete" &&
+        current.state.type !== "waiting_evaluator_resolution"
       ) {
         throw new IllegalRunEventError(
           "只有 researching Run 可以提出 Learning Artifact draft",
         );
       }
       if (
+        current.state.type !== "waiting_evaluator_resolution" &&
         current.state.modelTurns.length > 0 &&
         current.state.type !== "research_complete"
       ) {
@@ -916,7 +1052,12 @@ function applyRunEvent(
       ) {
         throw new IllegalRunEventError("Research Loop publication provenance 不完整");
       }
-      validateLearningArtifactDraft(current, event.payload, event.occurredAt);
+      validateLearningArtifactDraft(
+        current,
+        event.payload,
+        event.eventId,
+        event.occurredAt,
+      );
       const publicationFields = {
         planArtifact: current.state.planArtifact,
         approvalReceipt: current.state.approvalReceipt,
@@ -926,15 +1067,23 @@ function applyRunEvent(
         claims: current.state.claims,
         draftArtifact: event.payload.draftArtifact,
         proposal: event.payload.proposal,
+        evaluation: event.payload.evaluation,
         publicationTarget: event.payload.publicationTarget,
         publicationBinding: event.payload.publicationBinding,
+        publicationApprovalSummary: event.payload.publicationApprovalSummary,
         suspendedDurationMs: current.state.suspendedDurationMs,
         retryAttempts: current.state.retryAttempts,
       } as const;
+      const fromResearchLoop =
+        current.state.type === "research_complete" ||
+        (
+          current.state.type === "waiting_evaluator_resolution" &&
+          current.state.researchOrigin === "research_loop"
+        );
       return {
         ...current,
         state:
-          current.state.type === "research_complete"
+          fromResearchLoop
             ? {
                 ...publicationFields,
                 type: "waiting_publication_approval",
@@ -955,7 +1104,15 @@ function applyRunEvent(
                   ? {}
                   : { latestSteering: current.state.latestSteering }),
                 researchStartedAt: current.state.researchStartedAt as string,
-                completion: current.state.completion,
+                completion: current.state.type === "research_complete"
+                  ? current.state.completion
+                  : current.state.researchOrigin === "research_loop"
+                    ? current.state.completion
+                    : (() => {
+                        throw new IllegalRunEventError(
+                          "Research Loop evaluator provenance 不完整",
+                        );
+                      })(),
                 proposedAt: event.occurredAt,
               }
             : {
@@ -981,6 +1138,7 @@ function applyRunEvent(
       }
       validatePublicationApprovalReceipt(
         current.state.draftArtifact,
+        current.state.evaluation,
         current.state.publicationTarget,
         current.state.publicationBinding,
         event.payload.publicationReceipt,
@@ -1358,6 +1516,16 @@ function traceLineage(
   | "evidenceIds"
   | "evidenceGateRepairCode"
   | "draftArtifactId"
+  | "evaluatorInputHash"
+  | "evaluatorProvider"
+  | "evaluatorModel"
+  | "evaluatorPromptVersion"
+  | "evaluatorAttempt"
+  | "evaluatorFailureCode"
+  | "evaluationKind"
+  | "evaluatorReviewArtifactId"
+  | "evaluatorSkipId"
+  | "evaluationHash"
   | "publicationApprovalId"
   | "learningArtifactSha256"
   | "retrySequenceId"
@@ -1465,8 +1633,32 @@ function traceLineage(
   if (event.type === "evidence_gate_repair_requested") {
     return { evidenceGateRepairCode: event.payload.repair.code };
   }
+  if (event.type === "evaluator_review_failed") {
+    return {
+      evaluatorInputHash: event.payload.evaluatorInputHash,
+      evaluatorProvider: event.payload.evaluatorIdentity.provider,
+      evaluatorModel: event.payload.evaluatorIdentity.model,
+      evaluatorPromptVersion: event.payload.evaluatorIdentity.promptVersion,
+      evaluatorAttempt: event.payload.failure.attempt,
+      evaluatorFailureCode: event.payload.failure.code,
+    };
+  }
   if (event.type === "learning_artifact_draft_proposed") {
-    return { draftArtifactId: event.payload.draftArtifact.artifactId };
+    const { evaluation } = event.payload;
+    return {
+      draftArtifactId: event.payload.draftArtifact.artifactId,
+      evaluationKind: evaluation.kind,
+      evaluationHash: event.payload.publicationBinding.evaluationHash,
+      ...(evaluation.kind === "reviewed"
+        ? {
+            evaluatorInputHash: evaluation.identity.inputHash,
+            evaluatorProvider: evaluation.identity.provider,
+            evaluatorModel: evaluation.identity.model,
+            evaluatorPromptVersion: evaluation.identity.promptVersion,
+            evaluatorReviewArtifactId: evaluation.reviewArtifact.artifactId,
+          }
+        : { evaluatorSkipId: evaluation.identity.skipId }),
+    };
   }
   if (event.type === "publication_approved") {
     return { publicationApprovalId: event.payload.publicationReceipt.approvalId };
@@ -1897,17 +2089,27 @@ function validateClaim(
 function validateLearningArtifactDraft(
   projection: RunProjection,
   payload: LearningArtifactDraftProposedPayload,
+  eventId: string,
   occurredAt: string,
 ): void {
   if (
     projection.state.type !== "researching" &&
-    projection.state.type !== "research_complete"
+    projection.state.type !== "research_complete" &&
+    projection.state.type !== "waiting_evaluator_resolution"
   ) {
-    throw new IllegalRunEventError("Learning Artifact draft 必须来自 researching Run");
+    throw new IllegalRunEventError(
+      "Learning Artifact draft 必须来自 Gate 或 Evaluator resolution",
+    );
   }
   const researching = projection.state;
-  const { draftArtifact, proposal, publicationTarget, publicationBinding } =
-    payload;
+  const {
+    draftArtifact,
+    proposal,
+    evaluation,
+    publicationTarget,
+    publicationBinding,
+    publicationApprovalSummary,
+  } = payload;
   if (
     !hasExactKeys(draftArtifact, [
       "artifactId",
@@ -1923,6 +2125,7 @@ function validateLearningArtifactDraft(
     !hasExactKeys(proposal, ["title", "summary", "claimIds"]) ||
     proposal.title.trim() === "" ||
     proposal.summary.trim() === "" ||
+    !isSingleSentenceConclusion(proposal.summary) ||
     hasPreRenderedCitationToken(proposal.title) ||
     hasPreRenderedCitationToken(proposal.summary) ||
     proposal.claimIds.length === 0 ||
@@ -1931,6 +2134,8 @@ function validateLearningArtifactDraft(
     !hasExactPublicationTargetShape(publicationTarget) ||
     !hasExactKeys(publicationBinding, [
       "draftHash",
+      "evaluationKind",
+      "evaluationHash",
       "outputRootCanonicalPath",
       "outputRootDevice",
       "outputRootInode",
@@ -1938,9 +2143,61 @@ function validateLearningArtifactDraft(
       "parentDevice",
       "parentInode",
       "bindingHash",
-    ])
+    ]) ||
+    !isDeepStrictEqual(
+      publicationApprovalSummary,
+      createPublicationApprovalSummary(
+        evaluateEvidenceGate(proposal, researching.claims, researching.evidenceRecords),
+        evaluation,
+      ),
+    )
   ) {
     throw new IllegalRunEventError("Learning Artifact draft 公共字段无效");
+  }
+
+  let gate: ReturnType<typeof evaluateEvidenceGate>;
+  try {
+    gate = evaluateEvidenceGate(
+      proposal,
+      researching.claims,
+      researching.evidenceRecords,
+    );
+    const reviewRequest = buildEvaluatorReviewRequest({
+      question: projection.question,
+      claims: gate.claims,
+      evidenceRecords: gate.evidenceRecords,
+      sourceReadObservations: researching.sourceReadObservations,
+    });
+    if (evaluation.kind === "reviewed") {
+      validateReviewedPublicationEvaluation(reviewRequest, evaluation);
+      if (
+        researching.type === "waiting_evaluator_resolution" &&
+        (
+          evaluation.identity.inputHash !== researching.evaluatorInputHash ||
+          !isDeepStrictEqual(
+            {
+              provider: evaluation.identity.provider,
+              model: evaluation.identity.model,
+              promptVersion: evaluation.identity.promptVersion,
+            },
+            researching.evaluatorIdentity,
+          )
+        )
+      ) {
+        throw new EvaluatorReviewValidationError();
+      }
+    } else if (
+      researching.type !== "waiting_evaluator_resolution" ||
+      evaluation.identity.skipId !== `skip-${eventId}` ||
+      evaluation.identity.skippedAt !== occurredAt
+    ) {
+      throw new EvaluatorReviewValidationError();
+    }
+  } catch (error) {
+    if (error instanceof EvaluatorReviewValidationError) {
+      throw new IllegalRunEventError("Learning Artifact evaluation identity 无效");
+    }
+    throw error;
   }
 
   let markdown: string;
@@ -1961,17 +2218,33 @@ function validateLearningArtifactDraft(
       wallTimeStartedAt:
         researching.researchStartedAt ?? projection.createdAt,
       wallTimeEndedAt:
-        researching.type === "research_complete"
+        researching.type === "research_complete" ||
+        (
+          researching.type === "waiting_evaluator_resolution" &&
+          researching.researchOrigin === "research_loop"
+        )
           ? researching.completion.completedAt
           : occurredAt,
     });
     markdown = renderLearningArtifact(
       proposal,
-      evaluateEvidenceGate(
-        proposal,
-        researching.claims,
-        researching.evidenceRecords,
-      ),
+      gate,
+      evaluation,
+      {
+        question: projection.question,
+        unresolvedQuestions:
+          researching.type === "research_complete" ||
+          (
+            researching.type === "waiting_evaluator_resolution" &&
+            researching.researchOrigin === "research_loop"
+          )
+            ? researching.completion.unresolvedQuestions
+            : [],
+        toolUsage: calculateLearningArtifactToolUsage({
+          sourceReadObservations: researching.sourceReadObservations,
+          researchToolObservations: researching.researchToolObservations,
+        }),
+      },
     );
   } catch (error) {
     if (
@@ -1984,6 +2257,7 @@ function validateLearningArtifactDraft(
   }
   const expectedBinding = createPublicationApprovalBinding({
     draftHash: draftArtifact.sha256,
+    evaluation: payload.evaluation,
     publicationTarget,
   });
   if (
@@ -2003,6 +2277,7 @@ function validateLearningArtifactDraft(
 
 function validatePublicationApprovalReceipt(
   draftArtifact: ArtifactReference,
+  evaluation: import("./types.js").PublicationEvaluation,
   publicationTarget: PublicationTarget,
   publicationBinding: PublicationApprovalBinding,
   receipt: PublicationApprovalReceipt,
@@ -2010,6 +2285,7 @@ function validatePublicationApprovalReceipt(
 ): void {
   const expectedBinding = createPublicationApprovalBinding({
     draftHash: draftArtifact.sha256,
+    evaluation,
     publicationTarget,
   });
   if (
@@ -2019,6 +2295,8 @@ function validatePublicationApprovalReceipt(
       "approvedBy",
       "approvedAt",
       "draftHash",
+      "evaluationKind",
+      "evaluationHash",
       "outputRootCanonicalPath",
       "outputRootDevice",
       "outputRootInode",

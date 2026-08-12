@@ -304,6 +304,151 @@ describe("OpenAI-compatible Model Port contract", () => {
     )).toBe(true);
   });
 
+  it("runs Evaluator Review with an isolated prompt, minimal input, and closed verdict schema", async () => {
+    let receivedOptions: AiSdkStreamTextOptions | undefined;
+    const model = new OpenAiCompatibleModelPort(
+      {
+        ...liveConfig("evaluator-secret"),
+        evaluatorPromptVersion: "evaluator-prompt-v7",
+      },
+      {
+        streamText: (options) => {
+          receivedOptions = options;
+          return {
+            stream: stream([
+              {
+                type: "tool-call",
+                toolCallId: "review-call",
+                toolName: "submit_evaluator_review",
+                input: {
+                  verdicts: [{ claimId: "claim-1", verdict: "uncertain" }],
+                },
+              },
+              {
+                type: "finish",
+                finishReason: "tool-calls",
+                totalUsage: { inputTokens: 8, outputTokens: 4, totalTokens: 12 },
+              },
+            ]),
+          };
+        },
+      },
+    );
+    const request = {
+      question: "Run Journal 如何恢复？",
+      claims: [{
+        claimId: "claim-1",
+        kind: "source_fact" as const,
+        text: "Run Journal 是 canonical history。",
+        evidence: [{
+          evidenceId: "evidence-1",
+          sourceSnapshotId: `source-sha256:${"a".repeat(64)}`,
+          relativePath: "source.md",
+          startLine: 2,
+          endLine: 2,
+          excerpt: "Run Journal 是 canonical history。",
+        }],
+      }],
+    };
+
+    await expect(model.reviewClaims(request)).resolves.toEqual({
+      verdicts: [{ claimId: "claim-1", verdict: "uncertain" }],
+    });
+    expect(model.identity).toEqual({
+      provider: "local-openai",
+      model: "research-model",
+      promptVersion: "evaluator-prompt-v7",
+    });
+    expect(receivedOptions?.instructions).toContain(
+      "Evaluator prompt version: evaluator-prompt-v7",
+    );
+    expect(receivedOptions?.instructions).toContain(
+      "不要推断 Research Loop history",
+    );
+    expect(receivedOptions?.instructions).not.toContain("Harness 将验证并调度");
+    expect(JSON.parse(receivedOptions?.prompt ?? "null")).toEqual(request);
+    expect(receivedOptions?.prompt).not.toContain("recentObservations");
+    expect(Object.keys(receivedOptions?.tools ?? {})).toEqual([
+      "submit_evaluator_review",
+    ]);
+    const reviewTool = receivedOptions?.tools.submit_evaluator_review as {
+      /** AI SDK tool 暴露的结构化 Evaluator verdict 输入 schema。 */
+      readonly inputSchema?: {
+        /** 在不调用 provider 的情况下验证封闭 verdict contract。 */
+        safeParse(input: unknown): {
+          /** 输入是否满足 exact Evaluator verdict schema。 */
+          readonly success: boolean;
+        };
+      };
+    } | undefined;
+    expect(reviewTool?.inputSchema?.safeParse({
+      verdicts: [{ claimId: "claim-1", verdict: "supported" }],
+    }).success).toBe(true);
+    expect(reviewTool?.inputSchema?.safeParse({
+      verdicts: [{ claimId: "claim-1", verdict: "approved" }],
+    }).success).toBe(false);
+    expect(JSON.stringify({
+      instructions: receivedOptions?.instructions,
+      prompt: receivedOptions?.prompt,
+      tools: receivedOptions?.tools,
+      identity: model.identity,
+    })).not.toContain("evaluator-secret");
+  });
+
+  it("does not turn an aborted partial Evaluator stream into a review", async () => {
+    const controller = new AbortController();
+    const model = contractModel((options) => ({
+      stream: (async function* () {
+        yield {
+          type: "tool-input-start",
+          id: "review-call",
+          toolName: "submit_evaluator_review",
+        };
+        yield {
+          type: "tool-input-delta",
+          id: "review-call",
+          delta: '{"verdicts":[{"claimId":"claim-1",',
+        };
+        controller.abort();
+        expect(options.abortSignal?.aborted).toBe(true);
+        yield { type: "abort", reason: "user-cancelled" };
+      })(),
+    }));
+
+    await expect(
+      model.reviewClaims(evaluatorRequest(), {
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toBeInstanceOf(ModelGenerationAbortedError);
+  });
+
+  it("normalizes Evaluator provider failures without leaking provider payloads", async () => {
+    const secret = "evaluator-provider-secret";
+    const model = new OpenAiCompatibleModelPort(
+      liveConfig(secret),
+      {
+        streamText: () => {
+          throw new APICallError({
+            message: `review failed ${secret}`,
+            url: `https://provider.invalid/v1?api_key=${secret}`,
+            requestBodyValues: { authorization: secret },
+            statusCode: 500,
+            responseBody: JSON.stringify({ error: secret }),
+            isRetryable: true,
+          });
+        },
+      },
+    );
+
+    const error = await model.reviewClaims(evaluatorRequest()).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(InfrastructureFailureError);
+    expect(error).toMatchObject({ code: "service_unavailable" });
+    expect(String(error)).not.toContain(secret);
+    expect(JSON.stringify(error)).not.toContain(secret);
+  });
+
   it("rejects a completed provider result that echoes the API key", async () => {
     const secret = "echoed-provider-secret";
     const model = new OpenAiCompatibleModelPort(
@@ -368,6 +513,25 @@ function modelView(): ModelView {
     pendingIntents: [],
     relevantEvidence: [],
     recentObservations: [],
+  };
+}
+
+function evaluatorRequest() {
+  return {
+    question: "Run Journal 如何恢复？",
+    claims: [{
+      claimId: "claim-1",
+      kind: "source_fact" as const,
+      text: "Run Journal 是 canonical history。",
+      evidence: [{
+        evidenceId: "evidence-1",
+        sourceSnapshotId: `source-sha256:${"a".repeat(64)}`,
+        relativePath: "source.md",
+        startLine: 2,
+        endLine: 2,
+        excerpt: "Run Journal 是 canonical history。",
+      }],
+    }],
   };
 }
 

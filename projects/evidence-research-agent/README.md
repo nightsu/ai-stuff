@@ -1,8 +1,8 @@
 # Evidence Research Agent
 
-这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #12：除确定性的 Scripted Model、OpenAI-compatible live adapter、durable Run control 与有界并发读取外，Harness 还执行完整 Claim-to-Evidence lineage Gate，并把可修复失败作为 durable observation 返回 Research Loop。
+这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #13：除确定性的 Scripted Model、OpenAI-compatible live adapter、durable Run control 与完整 Claim-to-Evidence lineage Gate 外，Harness 还用独立 `EvaluatorPort` 对已通过 Gate 的 Claims/cited Evidence 做 advisory review，并生成 publish-ready Learning Artifact。
 
-当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。同一 Model Turn 开头连续、已通过顺序 preflight 的 `search_sources` / `read_source` 会按 `safeReadConcurrency` 有界并发；状态型工具仍严格顺序执行。live adapter 只做单次 generation：工具没有 AI SDK `execute`，也不使用 `ToolLoopAgent`、`stopWhen`、自动多步执行、`useChat` 或 SDK history。`read-source` CLI、publication CLI 与 publication crash reconciliation 仍属于后续 tickets。
+当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。同一 Model Turn 开头连续、已通过顺序 preflight 的 `search_sources` / `read_source` 会按 `safeReadConcurrency` 有界并发；状态型工具仍严格顺序执行。Evaluator 使用单独的 versioned prompt，只看到用户问题、选中 Claims 和各自 cited Evidence 摘录，不接收 Model View、Run Journal 或 Research Loop history。`read-source` CLI、publication CLI 与 publication crash reconciliation 仍属于后续 tickets。
 
 ## 快速开始：创建并批准计划
 
@@ -40,11 +40,11 @@ node dist/src/cli.js run \
   --json
 ```
 
-adapter/prompt/tool schema versions 可分别由 `EVIDENCE_MODEL_ADAPTER_VERSION`、`EVIDENCE_MODEL_PROMPT_VERSION`、`EVIDENCE_MODEL_TOOL_SCHEMA_VERSION` 覆盖。provider、model 与这些版本作为非秘密 Experiment Identity 进入 `run_created`、Projection、Trace 和 Plan Approval binding；base URL、API key、headers 与 provider payload 不持久化。CLI 目前只把 live adapter 接到新 Run 的计划 generation；跨进程推进 Research Loop 仍使用 TypeScript `advanceResearch` seam，避免在 Issue #8 静默扩张 CLI 命令面。
+adapter/prompt/tool schema/evaluator prompt versions 可分别由 `EVIDENCE_MODEL_ADAPTER_VERSION`、`EVIDENCE_MODEL_PROMPT_VERSION`、`EVIDENCE_MODEL_TOOL_SCHEMA_VERSION`、`EVIDENCE_EVALUATOR_PROMPT_VERSION` 覆盖。provider、model 与这些版本作为非秘密 identity 进入 Journal/Trace/binding；base URL、API key、headers 与 provider payload 不持久化。CLI 目前只把 live adapter 接到新 Run 的计划 generation；跨进程推进 Research Loop、Evaluator resolution 与 publication 仍使用 TypeScript public seam。
 
 ## OpenAI-compatible live Model Port
 
-`OpenAiCompatibleModelPort` 对 `proposePlan`、`generateResearchTurn` 与 `proposeLearningArtifact` 都使用 `streamText` 的一次 generation，并把 text delta、tool-input delta、completed tool calls、finish reason、usage 与 provider failure 归一化到项目类型。AI SDK 自带 retry 固定为 0，基础设施 retry 仍由已批准的 Harness Retry Policy 控制；`AbortSignal` 会中止未完成 stream，partial delta 只存在于 adapter 局部内存，不会成为 Model Turn。
+`OpenAiCompatibleModelPort` 对 `proposePlan`、`generateResearchTurn`、`proposeLearningArtifact` 与 `reviewClaims` 都使用 `streamText` 的一次 generation，并把 completed tool calls 与 provider failure 归一化到项目类型。Evaluator 使用独立 `submit_evaluator_review` schema，verdict 只能是 `supported`、`partially_supported`、`unsupported`、`contradicted` 或 `uncertain`。AI SDK 自带 retry 固定为 0；`AbortSignal` 会中止未完成 stream，partial delta 不会成为 Model Turn 或 Evaluator Review。
 
 ```ts
 import {
@@ -72,6 +72,28 @@ await runtime.advanceResearch({
 ```
 
 provider 可能错误地把 request metadata 或 credential 回显到生成内容；adapter 在解析 plan、Model Turn 或 Learning Artifact proposal 前会按精确 API key 字符串拒绝整个 completed result。公开错误只使用稳定分类与代码，不包含 provider message、URL、body 或 credential。
+
+## 独立 Evaluator Review 与 publish-ready report
+
+`proposeLearningArtifact` 先运行 deterministic Evidence Gate，再构造最小 `EvaluatorReviewRequest`。成功 review 会作为私有 JSON CAS Artifact 保存；identity 绑定 evaluator provider/model、prompt version、exact input hash 与 review artifact hash。renderer 只消费 Gate 选中的 Claim/Evidence identities：Conclusion 必须是恰好一句话，Evidence Index 从结构化 lineage 生成，tool usage summary 则分别统计 Journal 中五类 durable Research Tool calls，而不是用选中 Evidence 数量代替工具使用量。
+
+测试边界也保持分离：`ScriptedModel` 只实现 Research Model，`ScriptedEvaluator` 只实现 Evaluator。生产环境仍可显式把同一个同时实现两种 port 的 OpenAI-compatible adapter 作为默认 evaluator，但两次 generation 使用不同的 versioned prompt 与输入上下文。
+
+Evaluator 失败会 durable 进入 `waiting_evaluator_resolution`，并冻结 exact proposal、target、input hash 和 evaluator identity。`retryEvaluatorReview` 只重做同一 review，不重新调用 proposal model；`skipEvaluatorReview` 持久化 `user-command` skip identity，报告明确显示 `Evaluator: skipped`，不会伪造任何 verdict。普通 `resumeRun` 不能越过该等待。
+
+```ts
+const waiting = await runtime.proposeLearningArtifact({
+  runId: "<research-complete-run-id>",
+  targetPath: resolve("learning-artifacts/report.md"),
+});
+
+// 若抛出 EvaluatorReviewPendingError：
+await runtime.retryEvaluatorReview({ runId: waiting.runId });
+// 或由用户明确选择：
+await runtime.skipEvaluatorReview({ runId: waiting.runId });
+```
+
+publication approval 状态会同时展示已通过的 hard Evidence Gate 摘要与 advisory warnings；receipt 除 exact draft/target 外，还绑定 review artifact hash 或 explicit skip identity hash。真正发布前 Runtime 会再次读取并校验 Source Snapshots 和 reviewed JSON Artifact；任一 CAS bytes 缺失、篡改或 verdict coverage/order 不一致都保持 `ready_to_publish` 并 fail closed。Trace 暴露安全的 evaluator failure、input/model/prompt identity、review artifact 或 skip identity，不包含 prompt 输入正文、provider payload 或 credential。
 
 记下 `runId`，通过 `inspect` 读取 `state.approvalBinding.bindingHash`，再原样提交：
 
@@ -210,7 +232,7 @@ Issue #5 的显式命令仍从 TypeScript public seam 暴露，方便独立学�
 
 ```ts
 import { resolve } from "node:path";
-import { ResearchAgentRuntime } from "./src/index.js";
+import { ResearchAgentRuntime, ScriptedEvaluator } from "./src/index.js";
 import type { ModelPort } from "./src/index.js";
 
 // 真实适配器只能选择 request.claims 中已有的 ID；这里用小型确定性 adapter
@@ -229,6 +251,7 @@ const runtime = ResearchAgentRuntime.open({
   runtimeHome: ".runtime",
   outputRoot: resolve("learning-artifacts"),
   model,
+  evaluator: new ScriptedEvaluator(),
 });
 
 try {
@@ -321,9 +344,10 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 - 一个 Evidence Record 只能逐字段绑定一个现有成功 observation 的 `observationId`、`toolCallId`、Snapshot identity、规范范围和 excerpt hash。Claim 必须显式分类：`source_fact` 与 `inference` 至少引用一个既有 Evidence；`design_recommendation` 可无 Evidence，提供时也必须有效。
 - Evidence Gate 不信任 live source 或仅自洽的 Journal 字段：它从私有 CAS 按 content identity 读取完整 immutable Snapshot bytes，重新验证 Source Scope、completed tool-call lineage、1-based range、logical lines、excerpt 和 hash。live 文件后续变化不会追溯破坏既有 Evidence，Snapshot 损坏或范围/摘录不匹配则 fail closed。
 - Gate 失败会追加 typed `evidence_gate_repair_requested` 并从 `research_complete` 回到 `researching`。下一 Model View 固定显示 stable code、summary 与 recommended action；已完成但 schema-invalid 的 Artifact proposal generation 也以 `proposal_invalid` repair 计入 Run Budget，repair 不伪装成 Research Tool call，也不进入 terminal `failed`。若批准的 Source Root path/device/inode 已失效，则在调用 draft 模型前记录 `approval_invalid`，并要求创建和批准新的 Research Run/Source Scope。
-- `ModelPort.proposeLearningArtifact` 只能返回标题、摘要和**既有** Claim IDs 的展示顺序。Markdown renderer 是唯一生成 `【Evidence: <id>】` citation 的地方；Claim 行显示 ID/分类，Evidence Index 对共享 Evidence 去重并同时显示 Snapshot/range/tool-call identity。Trace 的 Claim event 暴露 kind 与 Evidence IDs，任一 artifact Claim 都能沿结构化 identity 追到 source read。title、summary 或 Claim 中夹带的预渲染 `【Evidence:` token 会被拒绝。
+- `ModelPort.proposeLearningArtifact` 只能返回标题、恰好一句话的摘要和**既有** Claim IDs 的展示顺序。Markdown renderer 是唯一生成 `【Evidence: <id>】` citation 的地方；Claim 行显示 ID/分类，Evidence Index 对共享 Evidence 去重并同时显示 Snapshot/range/tool-call identity。tool usage summary 从 durable observations 逐类计算 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research` 调用次数，不从 selected Evidence 反推。Trace 的 Claim event 暴露 kind 与 Evidence IDs，任一 artifact Claim 都能沿结构化 identity 追到 source read。title、summary 或 Claim 中夹带的预渲染 `【Evidence:` token 会被拒绝。
+- Evaluator Port 只接收用户问题、最终展示顺序的 Claims 与各自 cited Evidence；每个 Claim 必须恰好得到一个同序封闭 verdict。失败后的 retry 保持 exact input/proposal/target，显式 skip 只记录用户 identity，不生成 review 或 verdict。publication approval projection 同时公开 hard Gate pass 摘要和由 review/skip 派生的 advisory warnings。
 - `outputRoot` 是 Runtime 打开时显式配置、且与 private Runtime Home 不重叠的 canonical 目录。private Markdown draft 的 hash、Output Root identity、canonical target path 和目标父目录 `device`/`inode` 共同构成 publication binding。任何 binding、root 或 parent identity 变化都会使旧 approval 失效。
-- normal publish 不覆盖不同既有内容：publisher 使用同目录 `0600` temporary file、fsync 和 atomic hard-link no-clobber publication。真正写出前会再次从私有 CAS 验证 approved draft 的完整 Snapshot lineage；draft/approval 后 Snapshot 缺失或篡改会保持 `ready_to_publish` 并 fail closed。已有文件若字节完全一致则幂等成功；final symlink、非文件、不同字节或父目录替换同样会被拒绝。
+- normal publish 不覆盖不同既有内容：publisher 使用同目录 `0600` temporary file、fsync 和 atomic hard-link no-clobber publication。真正写出前会再次从私有 CAS 验证 approved draft 的完整 Snapshot lineage 与 reviewed JSON Artifact；draft/approval 后任一私有 bytes 缺失或篡改会保持 `ready_to_publish` 并 fail closed。已有文件若字节完全一致则幂等成功；final symlink、非文件、不同字节或父目录替换同样会被拒绝。
 
 ## Journal、Trace 与恢复边界
 
@@ -338,11 +362,11 @@ Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE
 - `src/application/research-agent-runtime.ts`：public command seam、两层 user approval、Evidence Gate 之前的模型边界与外部 publication 调用点。
 - `src/infrastructure/private-source-search.ts`：固定参数 `rg`、root identity 复核、discovery 过滤与逐命中 realpath preflight。
 - `src/domain/reducer.ts`：追加 Journal 如何确定性派生 Evidence/Claim/draft/approval/completed 状态，并重新验证所有关联。
-- `src/domain/evidence-gate.ts` 与 `src/domain/learning-artifact.ts`：结构化引文授权和 deterministic Markdown renderer。
+- `src/domain/evidence-gate.ts`、`src/domain/evaluator-review.ts` 与 `src/domain/learning-artifact.ts`：结构化引文授权、隔离 review identity 和 deterministic report renderer。
 - `src/infrastructure/private-source-access.ts`：canonical Source Scope、handle 读取与 Snapshot 前的 policy boundary。
 - `src/infrastructure/sqlite-run-store.ts`：Journal、Projection cache、Source Snapshot registry 与通用 artifact registry 的事务对应关系。
 - `src/infrastructure/learning-artifact-publisher.ts`：target identity、same-directory no-clobber atomic publication 与不同内容拒绝。
-- `tests/runtime/learning-artifact-publication.test.ts`：ScriptedModel happy path、Gate、target identity、direct replay tamper 与 Trace lineage。
+- `tests/runtime/learning-artifact-publication.test.ts`：独立 ScriptedModel/ScriptedEvaluator happy path、Evaluator retry/skip、CAS tamper、Gate、target identity 与 Trace lineage。
 - `tests/runtime/research-loop.test.ts`：五工具多轮 happy path、重启后 pending intent 恢复、search port/artifact 边界、replay 防篡改、错误 observation、五维预算暂停、steering/pinned Model View 与确定性裁剪。
 - `tests/runtime/retry-policy.test.ts`：Model/Search transient retry、provider hint、attempt lineage、policy approval/restart、崩溃恢复、普通失败、schema/permanent/invariant failure、wall-time 与 SQLite commit failure。
 - `tests/runtime/run-control.test.ts`：pause/resume、预算版本扩展、terminal cancellation、stream/pending tool/completed result race 与 Suspended Run 取消矩阵。

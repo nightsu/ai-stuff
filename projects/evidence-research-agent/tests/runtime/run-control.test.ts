@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   ModelGenerationAbortedError,
   ResearchAgentRuntime,
+  ScriptedEvaluator,
   ScriptedModel,
 } from "../../src/index.js";
 import type {
@@ -1105,6 +1106,7 @@ async function createWaitingPublicationRun(): Promise<{
     runtimeHome,
     outputRoot,
     model,
+    evaluator: new ScriptedEvaluator(),
     clock: fixedClock(),
     ids: sequentialIds(),
   });

@@ -1,5 +1,9 @@
 export { ScriptedModel, ScriptedModelExhaustedError } from "./adapters/scripted-model.js";
 export {
+  ScriptedEvaluator,
+  type ScriptedEvaluatorResult,
+} from "./adapters/scripted-evaluator.js";
+export {
   createOpenAiCompatibleModelPortFromEnv,
   OpenAiCompatibleModelConfigurationError,
   OpenAiCompatibleModelPort,
@@ -37,6 +41,7 @@ export {
   LearningArtifactDraftConflictError,
   LearningArtifactDraftError,
   LearningArtifactPublicationError,
+  EvaluatorReviewPendingError,
   ModelViewTooLargeError,
   PublicationApprovalConflictError,
   ResearchAgentRuntime,
@@ -58,6 +63,9 @@ export {
 export { EvidenceGateError, evaluateEvidenceGate } from "./domain/evidence-gate.js";
 export {
   createPublicationApprovalBinding,
+  createPublicationApprovalSummary,
+  calculateLearningArtifactToolUsage,
+  isSingleSentenceConclusion,
   renderLearningArtifact,
 } from "./domain/learning-artifact.js";
 export {
@@ -66,6 +74,7 @@ export {
 } from "./domain/integrity.js";
 export type {
   Clock,
+  EvaluatorPort,
   IdGenerator,
   LearningArtifactProposalRequest,
   ModelCallOptions,
@@ -91,6 +100,8 @@ export type {
   OpenRuntimeOptions,
   ProposeLearningArtifactCommand,
   PublishLearningArtifactCommand,
+  RetryEvaluatorReviewCommand,
+  SkipEvaluatorReviewCommand,
   PauseRunCommand,
   ReadSourceCommand,
   RecordClaimCommand,
@@ -132,11 +143,22 @@ export type {
   SucceededSourceReadObservation,
   DeniedSourceReadObservation,
   EvidenceRecord,
+  EvaluatorClaimInput,
+  EvaluatorClaimVerdict,
+  EvaluatorEvidenceInput,
+  EvaluatorIdentity,
+  EvaluatorReview,
+  EvaluatorReviewFailure,
+  EvaluatorReviewIdentity,
+  EvaluatorReviewRequest,
+  EvaluatorSkipIdentity,
+  EvaluatorVerdict,
   ExperimentIdentity,
   FailedSourceReadObservation,
   SourceSnapshotReference,
   SourceScope,
   LearningArtifactProposal,
+  LearningArtifactToolUsage,
   ModelTurn,
   ModelUsage,
   ModelView,
@@ -152,9 +174,14 @@ export type {
   ResearchCompleteRunState,
   UserPausedRunState,
   PublicationApprovalBinding,
+  PublicationApprovalSummary,
+  PublicationAdvisoryWarning,
+  PublicationHardGateSummary,
   PublicationApprovalReceipt,
+  PublicationEvaluation,
   PublicationTarget,
   PublishedLearningArtifact,
   ReadyToPublishRunState,
   WaitingPublicationApprovalRunState,
+  WaitingEvaluatorResolutionRunState,
 } from "./domain/types.js";

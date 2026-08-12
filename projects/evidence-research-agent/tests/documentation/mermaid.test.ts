@@ -57,7 +57,12 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   expect(markdown).toContain('Snapshot -->|"verified bytes / range / excerpt"| Gate');
   expect(markdown).toContain('Gate -->|"evidence_gate_repair_requested"| Journal');
   expect(markdown).toContain("Repair --> View");
-  expect(markdown).toContain("Gate --> Draft");
+  expect(markdown).toContain("Gate --> Evaluator");
+  expect(markdown).toContain('Evaluator -->|"valid structured verdicts"| ReviewArtifact');
+  expect(markdown).toContain('Evaluator -->|"evaluator_review_failed"| Journal');
+  expect(markdown).toContain("ReviewArtifact --> Renderer");
+  expect(markdown).toContain("Gate --> Renderer");
+  expect(markdown).toContain("Renderer --> Draft");
   expect(markdown).toContain("Draft --> Approval");
   expect(markdown).toContain("Approval --> Publisher");
   expect(markdown).toContain('Control["pause / resume / cancel<br/>extend-budget"]');
@@ -79,7 +84,13 @@ it("documents the bounded Research Loop and its publication handoff", async () =
     /^\s*research_complete\s*-->\s*researching\s*:\s*evidence_gate_repair_requested\s*$/m,
   );
   expect(stateDiagram).toMatch(
-    /^\s*research_complete\s*-->\s*waiting_publication_approval\s*:\s*learning_artifact_draft_proposed\s*$/m,
+    /^\s*research_complete\s*-->\s*waiting_evaluator_resolution\s*:\s*evaluator_review_failed\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*waiting_evaluator_resolution\s*-->\s*waiting_publication_approval\s*:\s*learning_artifact_draft_proposed<br\/\>\(review retry succeeded \/ explicit skip\)\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*research_complete\s*-->\s*waiting_publication_approval\s*:\s*learning_artifact_draft_proposed<br\/\>\(review succeeded\)\s*$/m,
   );
   expect(stateDiagram).toMatch(
     /^\s*waiting_publication_approval\s*-->\s*ready_to_publish\s*:\s*publication_approved\s*$/m,
@@ -98,6 +109,9 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   );
   expect(stateDiagram).toMatch(
     /^\s*waiting_publication_approval\s*-->\s*cancelled\s*:\s*run_cancelled\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*waiting_evaluator_resolution\s*-->\s*cancelled\s*:\s*run_cancelled\s*$/m,
   );
   expect(markdown).toContain("budget_exhausted");
   expect(markdown).toContain("research_complete");

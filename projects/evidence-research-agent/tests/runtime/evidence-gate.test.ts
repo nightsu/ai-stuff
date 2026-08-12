@@ -49,7 +49,7 @@ describe("ResearchAgentRuntime evidence gate", () => {
       const claimed = await runtime.recordClaim({
         runId: fixture.runId,
         kind: "source_fact",
-        text: "来源明确说明 Journal 是 canonical history。",
+        text: "来源明确说明 Journal 是 canonical history。Projection 可由 Journal 重建。",
         evidenceIds: [evidence.evidenceId],
       });
 
@@ -68,7 +68,7 @@ describe("ResearchAgentRuntime evidence gate", () => {
         claims: [
           {
             kind: "source_fact",
-            text: "来源明确说明 Journal 是 canonical history。",
+            text: "来源明确说明 Journal 是 canonical history。Projection 可由 Journal 重建。",
             evidenceIds: [evidence.evidenceId],
           },
         ],

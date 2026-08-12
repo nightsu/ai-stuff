@@ -7,17 +7,24 @@ import {
   sourceSnapshotHasMatchingContentIdentity,
 } from "./integrity.js";
 import { hasPreRenderedCitationToken } from "./citation-safety.js";
+import { isSingleSentenceConclusion } from "./learning-artifact.js";
 import type {
   Claim,
   EvidenceGateRepair,
   EvidenceRecord,
   ExperimentIdentity,
+  EvaluatorIdentity,
+  EvaluatorReview,
+  EvaluatorReviewFailure,
+  EvaluatorReviewRequest,
+  PublicationEvaluation,
   LearningArtifactProposal,
   ModelTurn,
   RetryAttempt,
   PlanApprovalBinding,
   PlanApprovalReceipt,
   PublicationApprovalBinding,
+  PublicationApprovalSummary,
   PublicationApprovalReceipt,
   PublicationTarget,
   PublishedLearningArtifact,
@@ -289,6 +296,10 @@ const learningArtifactProposalSchema = z
       .trim()
       .min(1)
       .refine(
+        isSingleSentenceConclusion,
+        "Conclusion 必须是单行单句",
+      )
+      .refine(
         (summary) => !hasPreRenderedCitationToken(summary),
         "摘要不能包含预渲染 citation",
       ),
@@ -296,6 +307,97 @@ const learningArtifactProposalSchema = z
   })
   .strict()
   .transform((proposal): LearningArtifactProposal => proposal);
+
+const evaluatorIdentitySchema = z.object({
+  provider: z.string().trim().min(1),
+  model: z.string().trim().min(1),
+  promptVersion: z.string().trim().min(1),
+}).strict().transform((identity): EvaluatorIdentity => identity);
+
+const evaluatorVerdictSchema = z.enum([
+  "supported",
+  "partially_supported",
+  "unsupported",
+  "contradicted",
+  "uncertain",
+]);
+
+const evaluatorReviewSchema = z.object({
+  verdicts: z.array(z.object({
+    claimId: z.string().trim().min(1),
+    verdict: evaluatorVerdictSchema,
+  }).strict()),
+}).strict().transform((review): EvaluatorReview => review);
+
+const evaluatorReviewRequestSchema = z.object({
+  question: z.string().trim().min(1),
+  claims: z.array(z.object({
+    claimId: z.string().trim().min(1),
+    kind: z.enum(["source_fact", "inference", "design_recommendation"]),
+    text: z.string().trim().min(1),
+    evidence: z.array(z.object({
+      evidenceId: z.string().trim().min(1),
+      sourceSnapshotId: z.string().trim().min(1),
+      relativePath: z.string().trim().min(1),
+      startLine: z.number().int().positive(),
+      endLine: z.number().int().positive(),
+      excerpt: z.string(),
+    }).strict()),
+  }).strict()),
+}).strict().transform((request): EvaluatorReviewRequest => request);
+
+const evaluatorReviewFailureSchema = z.object({
+  attempt: z.number().int().positive(),
+  code: z.literal("evaluation_failed"),
+  failedAt: z.iso.datetime(),
+}).strict().transform((failure): EvaluatorReviewFailure => failure);
+
+const publicationEvaluationSchema = z.union([
+  z.object({
+    kind: z.literal("reviewed"),
+    review: evaluatorReviewSchema,
+    reviewArtifact: artifactReferenceSchema,
+    identity: z.object({
+      provider: z.string().trim().min(1),
+      model: z.string().trim().min(1),
+      promptVersion: z.string().trim().min(1),
+      inputHash: sha256Schema,
+      reviewArtifactHash: sha256Schema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    kind: z.literal("skipped"),
+    identity: z.object({
+      skipId: z.string().trim().min(1),
+      skippedBy: z.literal("user-command"),
+      skippedAt: z.iso.datetime(),
+    }).strict(),
+  }).strict(),
+]).transform((evaluation): PublicationEvaluation => evaluation);
+
+const publicationApprovalSummarySchema = z.object({
+  hardGate: z.object({
+    status: z.literal("passed"),
+    claimCount: z.number().int().positive(),
+    evidenceCount: z.number().int().nonnegative(),
+  }).strict(),
+  advisoryWarnings: z.array(z.union([
+    z.object({
+      kind: z.literal("claim_verdict"),
+      claimId: z.string().trim().min(1),
+      verdict: z.enum([
+        "partially_supported",
+        "unsupported",
+        "contradicted",
+        "uncertain",
+      ]),
+    }).strict(),
+    z.object({
+      kind: z.literal("evaluator_skipped"),
+      skipId: z.string().trim().min(1),
+    }).strict(),
+  ])),
+}).strict().transform((summary): PublicationApprovalSummary => summary);
 
 const publicationTargetSchema = z
   .object({
@@ -318,6 +420,8 @@ const publicationTargetSchema = z
 const publicationApprovalBindingSchema = z
   .object({
     draftHash: sha256Schema,
+    evaluationKind: z.enum(["reviewed", "skipped"]),
+    evaluationHash: sha256Schema,
     outputRootCanonicalPath: z
       .string()
       .min(1)
@@ -342,6 +446,8 @@ const publicationApprovalReceiptSchema = z
     approvedBy: z.literal("user-command"),
     approvedAt: z.iso.datetime(),
     draftHash: sha256Schema,
+    evaluationKind: z.enum(["reviewed", "skipped"]),
+    evaluationHash: sha256Schema,
     outputRootCanonicalPath: z
       .string()
       .min(1)
@@ -614,8 +720,10 @@ const publicationCommonStateFields = {
   claims: z.array(claimSchema),
   draftArtifact: artifactReferenceSchema,
   proposal: learningArtifactProposalSchema,
+  evaluation: publicationEvaluationSchema,
   publicationTarget: publicationTargetSchema,
   publicationBinding: publicationApprovalBindingSchema,
+  publicationApprovalSummary: publicationApprovalSummarySchema,
 };
 
 const legacyExplicitPublicationFields = {
@@ -659,6 +767,17 @@ const researchCompleteRunStateSchema = z.object({
   completion: researchCompletionSchema,
 });
 
+const evaluatorPendingCommonFields = {
+  proposal: learningArtifactProposalSchema,
+  publicationTarget: publicationTargetSchema,
+  evaluatorInputHash: sha256Schema,
+  evaluatorIdentity: evaluatorIdentitySchema,
+  evaluatorFailures: z.tuple(
+    [evaluatorReviewFailureSchema],
+    evaluatorReviewFailureSchema,
+  ),
+};
+
 const readyToPublishRunStateSchema = z.union([
   z.object({
     type: z.literal("ready_to_publish"),
@@ -692,6 +811,24 @@ const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
   }),
   researchingRunStateSchema,
   researchCompleteRunStateSchema,
+  z.object({
+    type: z.literal("waiting_evaluator_resolution"),
+    ...legacyExplicitPublicationFields,
+    ...evaluatorPendingCommonFields,
+  }).omit({
+    draftArtifact: true,
+    evaluation: true,
+    publicationBinding: true,
+  }).strict(),
+  z.object({
+    type: z.literal("waiting_evaluator_resolution"),
+    ...researchLoopPublicationFields,
+    ...evaluatorPendingCommonFields,
+  }).omit({
+    draftArtifact: true,
+    evaluation: true,
+    publicationBinding: true,
+  }).strict(),
   z.object({
     type: z.literal("budget_exhausted"),
     ...evidenceBackedStateFields,
@@ -775,6 +912,24 @@ const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
       }),
       researchingRunStateSchema,
       researchCompleteRunStateSchema,
+      z.object({
+        type: z.literal("waiting_evaluator_resolution"),
+        ...legacyExplicitPublicationFields,
+        ...evaluatorPendingCommonFields,
+      }).omit({
+        draftArtifact: true,
+        evaluation: true,
+        publicationBinding: true,
+      }).strict(),
+      z.object({
+        type: z.literal("waiting_evaluator_resolution"),
+        ...researchLoopPublicationFields,
+        ...evaluatorPendingCommonFields,
+      }).omit({
+        draftArtifact: true,
+        evaluation: true,
+        publicationBinding: true,
+      }).strict(),
       z.object({
         type: z.literal("budget_exhausted"),
         ...evidenceBackedStateFields,
@@ -979,6 +1134,17 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
   }).strict(),
   z.object({
     ...eventEnvelopeSchema,
+    type: z.literal("evaluator_review_failed"),
+    payload: z.object({
+      proposal: learningArtifactProposalSchema,
+      publicationTarget: publicationTargetSchema,
+      evaluatorInputHash: sha256Schema,
+      evaluatorIdentity: evaluatorIdentitySchema,
+      failure: evaluatorReviewFailureSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
     type: z.literal("run_budget_exhausted"),
     payload: z.object({
       exhaustedDimension: z.enum([
@@ -1022,8 +1188,10 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
         .object({
           draftArtifact: artifactReferenceSchema,
           proposal: learningArtifactProposalSchema,
+          evaluation: publicationEvaluationSchema,
           publicationTarget: publicationTargetSchema,
           publicationBinding: publicationApprovalBindingSchema,
+          publicationApprovalSummary: publicationApprovalSummarySchema,
         })
         .strict(),
     })
@@ -1068,6 +1236,16 @@ export function parseLearningArtifactProposal(
   input: unknown,
 ): LearningArtifactProposal {
   return learningArtifactProposalSchema.parse(input);
+}
+
+export function parseEvaluatorReview(input: unknown): EvaluatorReview {
+  return evaluatorReviewSchema.parse(input);
+}
+
+export function parseEvaluatorReviewRequest(
+  input: unknown,
+): EvaluatorReviewRequest {
+  return evaluatorReviewRequestSchema.parse(input);
 }
 
 export function parseRunBudget(input: unknown): RunBudget {

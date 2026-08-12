@@ -886,6 +886,9 @@ function collectArtifactReferences(
     }
     if (event.type === "learning_artifact_draft_proposed") {
       references.push(event.payload.draftArtifact);
+      if (event.payload.evaluation.kind === "reviewed") {
+        references.push(event.payload.evaluation.reviewArtifact);
+      }
     }
     if (
       event.type === "research_tool_observed" &&

@@ -2,6 +2,9 @@ import type {
   Claim,
   EvidenceRecord,
   ExperimentIdentity,
+  EvaluatorIdentity,
+  EvaluatorReview,
+  EvaluatorReviewRequest,
   LearningArtifactProposal,
   ModelTurn,
   ModelView,
@@ -122,6 +125,17 @@ export interface ModelPort {
     view: ModelView,
     options?: ModelCallOptions,
   ): Promise<Omit<ModelTurn, "turnId" | "completedAt">>;
+}
+
+/** Advisory review 的独立模型边界；它永远不接收 Model View 或 Run Journal。 */
+export interface EvaluatorPort {
+  /** 可持久化且不含 credential 的 evaluator model/prompt identity。 */
+  readonly identity: EvaluatorIdentity;
+  /** 对 exact Claims 与 cited Evidence 返回每条 Claim 的结构化 verdict。 */
+  reviewClaims(
+    request: EvaluatorReviewRequest,
+    options?: ModelCallOptions,
+  ): Promise<EvaluatorReview>;
 }
 
 /** Harness 调度 `search_sources` 时依赖的可注入本地 discovery 边界。 */

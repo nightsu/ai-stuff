@@ -12,16 +12,22 @@ import {
   ModelGenerationAbortedError,
 } from "../application/ports.js";
 import type {
+  EvaluatorPort,
   LearningArtifactProposalRequest,
   ModelCallOptions,
   ModelPort,
   PlanRequest,
 } from "../application/ports.js";
 import {
+  parseEvaluatorReview,
   parseLearningArtifactProposal,
   parseResearchPlan,
 } from "../domain/schemas.js";
+import { isSingleSentenceConclusion } from "../domain/learning-artifact.js";
 import type {
+  EvaluatorIdentity,
+  EvaluatorReview,
+  EvaluatorReviewRequest,
   ExperimentIdentity,
   LearningArtifactProposal,
   ModelTurn,
@@ -37,6 +43,8 @@ export interface OpenAiCompatibleModelConfig extends ExperimentIdentity {
   readonly baseUrl: string;
   /** 仅交给 provider transport 的 bearer credential。 */
   readonly apiKey: string;
+  /** 独立 Evaluator Review system prompt 的版本 identity。 */
+  readonly evaluatorPromptVersion?: string | undefined;
 }
 
 /** 读取 live provider 配置时使用的环境变量映射。 */
@@ -55,6 +63,8 @@ export interface OpenAiCompatibleModelEnvironment {
   readonly EVIDENCE_MODEL_PROMPT_VERSION?: string | undefined;
   /** Research Tool schema 集合版本。 */
   readonly EVIDENCE_MODEL_TOOL_SCHEMA_VERSION?: string | undefined;
+  /** 独立 Evaluator Review prompt 版本。 */
+  readonly EVIDENCE_EVALUATOR_PROMPT_VERSION?: string | undefined;
 }
 
 /** adapter 可消费的 AI SDK stream event 最小投影。 */
@@ -162,6 +172,7 @@ export class OpenAiCompatibleModelResponseError extends Error {
 const DEFAULT_ADAPTER_VERSION = "openai-compatible-adapter-v1";
 const DEFAULT_PROMPT_VERSION = "evidence-research-prompts-v1";
 const DEFAULT_TOOL_SCHEMA_VERSION = "research-tools-v2";
+const DEFAULT_EVALUATOR_PROMPT_VERSION = "evidence-evaluator-v1";
 const evidenceGapsSchema = z.array(z.string().trim().min(1)).default([]);
 const researchToolSchemas = {
   search_sources: z.object({
@@ -225,16 +236,36 @@ const artifactTool = {
     description: "从请求中已有的 Claim identities 选择并组织 Learning Artifact。",
     inputSchema: z.object({
       title: z.string().trim().min(1),
-      summary: z.string().trim().min(1),
+      summary: z.string().trim().min(1).refine(isSingleSentenceConclusion),
       claimIds: z.array(z.string().trim().min(1)).min(1),
     }).strict(),
   },
 };
 
+const evaluatorTool = {
+  submit_evaluator_review: {
+    description: "为每个输入 Claim 提交一个 advisory support verdict。",
+    inputSchema: z.object({
+      verdicts: z.array(z.object({
+        claimId: z.string().trim().min(1),
+        verdict: z.enum([
+          "supported",
+          "partially_supported",
+          "unsupported",
+          "contradicted",
+          "uncertain",
+        ]),
+      }).strict()),
+    }).strict(),
+  },
+};
+
 /** 用 AI SDK Core 单步 streaming 隔离 OpenAI-compatible provider 的 Model Port。 */
-export class OpenAiCompatibleModelPort implements ModelPort {
+export class OpenAiCompatibleModelPort implements ModelPort, EvaluatorPort {
   /** 可持久化且明确排除 API key/base URL 的实验身份。 */
   public readonly experimentIdentity: ExperimentIdentity;
+  /** 独立 Evaluator 的 model 与 versioned prompt identity。 */
+  public readonly identity: EvaluatorIdentity;
   /** provider factory 创建的 language model；credential 只封装在其 transport closure。 */
   readonly #model: unknown;
   /** 用于拒绝 provider 意外回显 credential 的内存内 secret。 */
@@ -253,6 +284,12 @@ export class OpenAiCompatibleModelPort implements ModelPort {
       adapterVersion: parsed.adapterVersion,
       promptVersion: parsed.promptVersion,
       toolSchemaVersion: parsed.toolSchemaVersion,
+    });
+    this.identity = Object.freeze({
+      provider: parsed.provider,
+      model: parsed.model,
+      promptVersion:
+        parsed.evaluatorPromptVersion ?? DEFAULT_EVALUATOR_PROMPT_VERSION,
     });
     this.#model = createOpenAICompatible({
       name: parsed.provider,
@@ -292,6 +329,21 @@ export class OpenAiCompatibleModelPort implements ModelPort {
     return parseLearningArtifactProposal(call.input);
   }
 
+  public async reviewClaims(
+    request: EvaluatorReviewRequest,
+    options: ModelCallOptions = {},
+  ): Promise<EvaluatorReview> {
+    const call = await this.#completeToolCall(
+      "submit_evaluator_review",
+      evaluatorTool,
+      JSON.stringify(request),
+      options,
+      evaluatorInstructions(this.identity),
+    );
+    assertSecretAbsent(call.input, this.#apiKey);
+    return parseEvaluatorReview(call.input);
+  }
+
   public async generateResearchTurn(
     view: ModelView,
     options: ModelCallOptions = {},
@@ -320,8 +372,14 @@ export class OpenAiCompatibleModelPort implements ModelPort {
     tools: Record<string, Record<string, unknown>>,
     prompt: string,
     options: ModelCallOptions,
+    customInstructions?: string,
   ): Promise<CompletedToolCall> {
-    const completed = await this.#consume(tools, prompt, options);
+    const completed = await this.#consume(
+      tools,
+      prompt,
+      options,
+      customInstructions,
+    );
     const call = completed.calls[0];
     if (
       completed.finishReason !== "tool-calls" ||
@@ -337,6 +395,7 @@ export class OpenAiCompatibleModelPort implements ModelPort {
     tools: Record<string, Record<string, unknown>>,
     prompt: string,
     options: ModelCallOptions,
+    customInstructions?: string,
   ): Promise<CompletedGeneration> {
     const textParts: string[] = [];
     const argumentDeltas = new Map<string, string>();
@@ -346,7 +405,7 @@ export class OpenAiCompatibleModelPort implements ModelPort {
     try {
       const result = this.#dependencies.streamText({
         model: this.#model,
-        instructions: instructions(this.experimentIdentity),
+        instructions: customInstructions ?? instructions(this.experimentIdentity),
         prompt,
         tools,
         maxRetries: 0,
@@ -420,6 +479,10 @@ export function createOpenAiCompatibleModelPortFromEnv(
       environment.EVIDENCE_MODEL_TOOL_SCHEMA_VERSION,
       DEFAULT_TOOL_SCHEMA_VERSION,
     ),
+    evaluatorPromptVersion: optionalEnvironmentValue(
+      environment.EVIDENCE_EVALUATOR_PROMPT_VERSION,
+      DEFAULT_EVALUATOR_PROMPT_VERSION,
+    ),
   });
 }
 
@@ -477,6 +540,7 @@ function parseConfig(config: OpenAiCompatibleModelConfig): OpenAiCompatibleModel
     adapterVersion: z.string().trim().min(1),
     promptVersion: z.string().trim().min(1),
     toolSchemaVersion: z.string().trim().min(1),
+    evaluatorPromptVersion: z.string().trim().min(1).optional(),
   }).strict().safeParse(config);
   if (!parsed.success) throw new OpenAiCompatibleModelConfigurationError();
   return parsed.data;
@@ -591,6 +655,15 @@ function instructions(identity: ExperimentIdentity): string {
     `Tool schema version: ${identity.toolSchemaVersion}`,
     "只进行一次 generation；选择一个或多个 schema 工具表达下一步，不执行工具。",
     "每个工具调用都填写 evidenceGaps；不要输出 credential、环境变量或 provider payload。",
+  ].join("\n");
+}
+
+function evaluatorInstructions(identity: EvaluatorIdentity): string {
+  return [
+    `Evaluator prompt version: ${identity.promptVersion}`,
+    "只根据请求中的 Claims 与各自 cited Evidence 做 advisory review。",
+    "不要推断 Research Loop history、不要授权发布、不要输出自由文本或 credential。",
+    "每个 Claim 恰好返回 supported、partially_supported、unsupported、contradicted 或 uncertain 之一。",
   ].join("\n");
 }
 

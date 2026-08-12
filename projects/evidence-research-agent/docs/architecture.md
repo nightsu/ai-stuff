@@ -1,8 +1,8 @@
-# Evidence Research Agent 架构（Issue #12）
+# Evidence Research Agent 架构（Issue #13）
 
-当前 slice 把 Claim-to-Evidence lineage 提升为完整确定性协议：Claim 显式分类为 `source_fact`、`inference` 或 `design_recommendation`；Gate 从私有 CAS 重新验证 immutable Source Snapshot 的完整 bytes、精确范围、excerpt hash、成功 tool-call lineage、Source Scope、审批与预算。失败会追加 typed `evidence_gate_repair_requested` 事实并回到 Research Loop，下一 Model View 得到稳定 code 和具体修复动作。Run Operation control plane 仍只保护 command ownership，永远不能替代 canonical Run Journal。
+当前 slice 在完整 Claim-to-Evidence Gate 之后增加独立 Evaluator Review：`EvaluatorPort` 只接收用户问题、Gate 选中的 Claims 与各自 cited Evidence 摘录；成功 review 写入私有 JSON CAS，失败进入 durable `waiting_evaluator_resolution`。retry 保持 exact proposal/input/target，显式 skip 记录用户事实但不伪造 verdict。最终 renderer 生成 publish-ready report，并把 review artifact hash 或 skip identity hash 绑定进 publication approval。
 
-外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。只有开头连续的 `search_sources` / `read_source` sibling batch 可以并发；Evidence、Claim、completion 与 publication crash reconciliation 分别保持顺序或留给后续 ticket。
+外层 workflow 仍由 Harness 确定性控制。Research Model 与 Evaluator 都不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。Evaluator 也不能看到 Model View、Run Journal 或 Research Loop history。
 
 ## 组件、端口与单向能力流
 
@@ -87,7 +87,11 @@ flowchart LR
   Caller --> Control["pause / resume / cancel<br/>extend-budget"]
   Control --> Journal
   Projection --> ResearchComplete["research_complete"]
-  Gate["Evidence Gate + deterministic renderer"]
+  Gate["Deterministic Evidence Gate"]
+  Evaluator["Evaluator Port<br/>isolated claims + cited evidence"]
+  ReviewArtifact["Private JSON review Artifact<br/>model + prompt + input + content identity"]
+  Resolution["Evaluator Resolution<br/>retry exact review / explicit skip"]
+  Renderer["Deterministic publish-ready renderer"]
   Publisher["LearningArtifactPublisher<br/>same-directory no-clobber publish"]
   Trace["Run Trace projection"]
 
@@ -97,7 +101,16 @@ flowchart LR
   Claim --> Gate
   Gate -->|"evidence_gate_repair_requested"| Journal
   Repair --> View
-  Gate --> Draft
+  Gate --> Evaluator
+  Evaluator -->|"valid structured verdicts"| ReviewArtifact
+  ReviewArtifact --> Registry
+  Evaluator -->|"evaluator_review_failed"| Journal
+  Journal --> Resolution
+  Resolution -->|"retry exact input"| Evaluator
+  Resolution -->|"explicit skip identity"| Renderer
+  ReviewArtifact --> Renderer
+  Gate --> Renderer
+  Renderer --> Draft
   Draft --> Approval
   Approval --> Publisher
   Publisher --> Journal
@@ -129,7 +142,8 @@ Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_tu
 3. **Claim** 解决“要在学习工件中表达什么”。`source_fact` 与 `inference` 至少引用一个既有 Evidence；`design_recommendation` 可以无 Evidence，若提供则仍必须有效。分类决定 Gate/renderer 语义，不能把 inference 或 recommendation 渲染成未标注的上游事实。
 4. **Evidence Gate** 在 `research_complete` 后先检查 Claim/Evidence IDs、分类与计划审批，再把 Evidence 逐字段连接到 completed `read_source` observation。它随后按 content identity 安全读取私有 Snapshot bytes，独立重算 UTF-8 logical lines、1-based inclusive range 与 excerpt hash；live source 后续变化不参与验证。Gate 同时从 Journal 重算 model turns（包括已完成但失败的 Artifact proposal）、Research Tool calls、不同 Source Snapshots、source bytes 与 Research Loop wall time。
 5. **Repair loop** 在 Gate 失败时追加 `evidence_gate_repair_requested`：事实包含稳定 code、确定性 summary/action，以及是否已消耗 Artifact proposal Model Turn。completed result 即使未通过 proposal schema，也会用 `proposal_invalid` 计入模型预算；Source Root path/device/inode 失配则在模型调用前产生 `approval_invalid`，要求新的 Run 与审批。Reducer 验证该映射后把 `research_complete` 恢复为 `researching`；下一 Model View 固定保留 repair，不将它伪装成 Research Tool call 或 runtime failure。
-6. **确定性 renderer** 是唯一产生 `【Evidence: <id>】` 的位置。每个 Claim 行显示 Claim ID 与分类；Evidence Index 对共享 Evidence 去重，并在同一项展示 Snapshot identity、精确范围与 `read_source` tool-call identity。Trace 的 Claim event 同时暴露 kind 与 Evidence IDs，因此 artifact Claim 可以沿 Evidence、Snapshot、tool call 直接 join 到 Journal Trace。publication 执行前会再次读取 CAS Snapshot 并重跑同一 lineage 验证，防止 draft/approval 之后的私有 bytes 损坏绕过 Gate。
+6. **Evaluator Review** 使用独立 port、独立 versioned prompt 和最小输入。每个 Claim 必须恰好得到一个同序 `supported`、`partially_supported`、`unsupported`、`contradicted` 或 `uncertain` verdict。成功结果进入私有 JSON Artifact；identity 同时绑定 evaluator model、prompt version、exact input hash 与 review artifact hash。failure 只持久化安全代码，进入 `waiting_evaluator_resolution`；retry 不重采样 Artifact proposal，skip 只记录 user-command identity。确定性测试也把 `ScriptedModel` 与 `ScriptedEvaluator` 分为两个 port；同一 live adapter 兼任两种能力时，仍通过不同 prompt 和最小 request 隔离 generation。
+7. **确定性 renderer** 是唯一产生 `【Evidence: <id>】` 的位置。它要求 proposal summary 恰好一句话并渲染为 Conclusion，同时输出 Scope、分类 Claims/verdict、Uncertainty、Evidence Index 与 compact tool summary。Evidence Index 对共享 Evidence 去重，并展示 Snapshot/range/`read_source` lineage；tool summary 从 Journal 的 durable observations 分别计算五类 Research Tool calls，不能用 selected Evidence 数量代替。publication 执行前会再次读取 CAS Snapshot 和 review JSON，重验 bytes/hash、verdict coverage/order 与 input/review identity。
 
 Search result 与 Markdown draft 都写入私有通用 artifact namespace，并分别和引用它们的 `research_tool_observed` / `learning_artifact_draft_proposed` 事件在同一个 SQLite 事务中注册。store 会拒绝“事件引用却没有匹配 artifact registry 行”的批次；Projection cache 与 Trace 仍从 canonical Journal 派生，且不复制 search 行正文。
 
@@ -154,7 +168,10 @@ stateDiagram-v2
   researching --> failed: run_failed
   research_complete --> budget_exhausted: run_budget_exhausted
   research_complete --> researching: evidence_gate_repair_requested
-  research_complete --> waiting_publication_approval: learning_artifact_draft_proposed
+  research_complete --> waiting_evaluator_resolution: evaluator_review_failed
+  waiting_evaluator_resolution --> waiting_evaluator_resolution: evaluator_review_failed (retry failed)
+  waiting_evaluator_resolution --> waiting_publication_approval: learning_artifact_draft_proposed<br/>(review retry succeeded / explicit skip)
+  research_complete --> waiting_publication_approval: learning_artifact_draft_proposed<br/>(review succeeded)
   waiting_publication_approval --> ready_to_publish: publication_approved
   ready_to_publish --> completed: learning_artifact_published
 
@@ -172,6 +189,7 @@ stateDiagram-v2
   waiting_plan_approval --> cancelled: run_cancelled
   researching --> cancelled: run_cancelled
   research_complete --> cancelled: run_cancelled
+  waiting_evaluator_resolution --> cancelled: run_cancelled
   budget_exhausted --> cancelled: run_cancelled
   retry_exhausted --> cancelled: run_cancelled
   waiting_publication_approval --> cancelled: run_cancelled
@@ -214,8 +232,14 @@ stateDiagram-v2
   end note
 
   note right of waiting_publication_approval
-    binding = draftHash + Output Root identity
+    binding = draftHash + review hash / skip hash
+    + Output Root identity
     + canonical target path + parent device/inode
+  end note
+
+  note right of waiting_evaluator_resolution
+    exact proposal/input/target are frozen
+    ordinary resume cannot bypass this wait
   end note
 
   note right of ready_to_publish
@@ -226,7 +250,7 @@ stateDiagram-v2
 
 `research_complete` 不是最终 terminal `completed`：它只表示模型通过 `complete_research` 显式结束调查并保存 unresolved questions，可以进入确定性 Gate。Gate failure 也不是 terminal `failed`；durable repair 会回到 `researching`，并把已完成的 Artifact proposal generation 计入模型预算。完成工具返回后 Runtime 会在 completion 的同一个 `occurredAt` 用 canonical budget calculator 再检查 Model Turn 与 wall time，并把 durable `completion.completedAt` 冻结为 Research Loop 的计费终点；之后的用户空闲或重复 `advanceResearch` 不会让合法完成的 Run 追溯耗尽。若 completion 当拍刚好耗尽，`research_completed` 与 `run_budget_exhausted` 会在同一个 SQLite transaction 中追加，最终 Run 直接成为 `budget_exhausted`，并以 `researchOutcome: research_complete` 保留 completion provenance。更早暂停保存 `researchOutcome: incomplete`。新的 Run Budget version 必须逐维不缩减、至少提高一维，并由绑定前后 canonical hashes 的用户 Receipt 授权；恢复后分别回到精确的 `researching` 或 `research_complete` origin，已有 usage 不清零。
 
-`SuspendedRunState` 包含 plan/publication approval waits、`budget_exhausted`、`retry_exhausted` 与 `user_paused`。approval waits 由各自的显式 approval 命令继续；普通 `resumeRun` 只接受 `user_paused`。user pause 和 budget exhaustion 的停留时间累加到 `suspendedDurationMs`，不计入 Research Loop wall time。`completed`、`cancelled` 与 `failed` 是不可恢复 terminal states。
+`SuspendedRunState` 包含 plan/publication approval waits、`waiting_evaluator_resolution`、`budget_exhausted`、`retry_exhausted` 与 `user_paused`。Evaluator wait 只能由 exact retry 或 explicit skip 继续；普通 `resumeRun` 只接受 `user_paused`。user pause 和 budget exhaustion 的停留时间累加到 `suspendedDurationMs`，不计入 Research Loop wall time。`completed`、`cancelled` 与 `failed` 是不可恢复 terminal states。
 
 取消可以先于并发外部结果成为 Journal fact。`cancelRun` 先在独立 control table 持久化 cancellation request；active owner 的 heartbeat/poll safe-point 原子提交 `run_cancelled` 与 request consumption，再 abort 当前 operation 的 provider signal。若请求者或 owner 崩溃，下一 mutation 在做业务工作前先消费 pending request。若 Model Turn、Search/read observation、Evidence、Claim、completion 或 aborted Retry Attempt 已经完整形成，Runtime 仍可把该结果追加到 `cancelledState` 供审计；reducer 始终保留外层 `cancelled`，不会执行 queued tool、进入 Gate 或推进 publication。partial stream 从未形成 completed result，因而只闭合已 durable started 的 attempt，不持久化 delta。
 
@@ -262,9 +286,9 @@ mutating public commands validate their input, then acquire one per-run durable 
 
 publication 状态以 `researchOrigin` 判别 provenance：Issue #5 的零 Research Loop Model Turn 显式教学路径只能是 `legacy_explicit`，真正多轮路径只能是 `research_loop` 且结构上必须同时保留非空 Model Turns、tool observations、`researchStartedAt` 与 `completion`。因此 schema 和 reducer 都无法表达“有 Research Loop turns 但没有完成事实”或“零 turn 凭空带 completion”的非法组合。
 
-`publication_approved` 也不是“文件已经写好”的断言。用户命令只批准等待状态中显示的 `draftHash`、canonical Output Root、`targetCanonicalPath`、父目录 `device` 和 `inode` 的精确聚合 hash。Runtime 在接受 receipt 前重新捕获 root 与 target parent identity；若目录被替换、target 逃出 root 或 canonical target 改变，旧 binding 失效。receipt 进入 `ready_to_publish` 后，只有显式 `publishLearningArtifact` 才会调用外部 publisher；正常 publisher 返回后才追加 `learning_artifact_published` 并进入 terminal `completed`。
+`publication_approved` 也不是“文件已经写好”的断言。等待状态的 `publicationApprovalSummary` 同时显示 deterministic hard Gate 已通过的 Claim/Evidence 计数，以及 advisory evaluator warnings 或 explicit skip warning；用户无需从 verdict 反推 Gate 是否成功。用户命令批准 `draftHash`、review artifact hash 或 explicit skip identity hash、canonical Output Root、`targetCanonicalPath`、父目录 `device` 和 `inode` 的精确聚合 hash。Runtime 在接受 receipt 前重新捕获 root 与 target parent identity；若任一 component 变化，旧 binding 失效。receipt 进入 `ready_to_publish` 后，只有显式 `publishLearningArtifact` 才会调用外部 publisher；写出前重新读取 CAS review JSON 与 Source Snapshots，正常 publisher 返回后才追加 `learning_artifact_published` 并进入 terminal `completed`。
 
-Trace 先暴露非秘密 Experiment Identity，再依次暴露不含秘密的 lineage：每个 attempt 的 Retry Sequence kind/identity、序号、outcome、duration、Retry Policy version、failure category/code 与 retry delay；`read_source` 的 observation/tool call/Snapshot；**每个 Evidence 的相同 observation/tool call/Snapshot**；Claim ID/kind/Evidence IDs；Evidence Gate repair code；draft artifact ID、publication receipt ID 与最终 Markdown SHA-256。schema error、permission denial、stale state、ordinary tool execution、infrastructure transient、model permanent 与 invariant violation均使用 stable category/code，不包含绝对来源路径、provider payload、摘录正文、私有 Runtime Home 或 OS 错误。
+Trace 先暴露非秘密 Experiment Identity，再依次暴露不含秘密的 lineage：每个 attempt 的 Retry Sequence facts；`read_source` 的 observation/tool call/Snapshot；Evidence 与 Claim lineage；Evidence Gate repair code；Evaluator failure attempt/code/input/model/prompt identity；review artifact 或 explicit skip identity；draft evaluation hash、publication receipt ID 与最终 Markdown SHA-256。它不包含 evaluator request/review正文、绝对来源路径、provider payload、摘录正文、私有 Runtime Home 或 OS 错误。
 
 ## 正常发布语义与未实现的 crash 边界
 

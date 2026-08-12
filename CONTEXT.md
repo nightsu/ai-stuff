@@ -128,6 +128,10 @@ _Avoid_: Evidence, paragraph, model assertion
 An advisory, independently prompted model assessment of whether each Claim is supported, partial, unsupported, contradicted, or uncertain given only its cited evidence. It produces review evidence for the user but cannot mutate research facts or authorize publication.
 _Avoid_: Evidence Gate, fact checker, publication approval
 
+**Evaluator Resolution**:
+A durable user decision made after an Evaluator Review fails: retry the exact isolated review without regenerating the Artifact proposal, or explicitly skip review without fabricating a verdict. Ordinary resume is not an Evaluator Resolution.
+_Avoid_: Evaluator verdict, retry sequence, user pause
+
 **Approval Receipt**:
 A durable record that authorizes one exact version and scope, identified by stable IDs and hashes. Plan approval and publication approval are separate receipts; neither grants blanket permission to changed content, expanded sources, or a different target path.
 _Avoid_: Approved flag, user confirmation, permanent permission

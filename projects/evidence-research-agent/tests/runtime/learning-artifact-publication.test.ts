@@ -11,6 +11,7 @@ import {
   formatRunTrace,
   hashCanonicalJson,
   ResearchAgentRuntime,
+  ScriptedEvaluator,
   ScriptedModel,
 } from "../../src/index.js";
 import { hashUtf8Text } from "../../src/domain/integrity.js";
@@ -38,6 +39,353 @@ afterEach(async () => {
 });
 
 describe("ResearchAgentRuntime Learning Artifact publication", () => {
+  it("runs an isolated advisory Evaluator Review before exposing a publish-ready report", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "evaluated-report.md");
+
+    try {
+      const waiting = await fixture.runtime.proposeLearningArtifact({
+        runId: fixture.runId,
+        targetPath,
+      });
+      expect(waiting.state).toMatchObject({
+        type: "waiting_publication_approval",
+        evaluation: {
+          kind: "reviewed",
+          identity: {
+            provider: "scripted",
+            model: "scripted-evaluator",
+            promptVersion: "evidence-evaluator-v1",
+            inputHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+            reviewArtifactHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+          },
+          review: {
+            verdicts: [{
+              claimId: "claim-event-007",
+              verdict: "supported",
+            }],
+          },
+        },
+        publicationBinding: {
+          evaluationKind: "reviewed",
+          evaluationHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+        publicationApprovalSummary: {
+          hardGate: {
+            status: "passed",
+            claimCount: 1,
+            evidenceCount: 1,
+          },
+          advisoryWarnings: [],
+        },
+      });
+      if (waiting.state.type !== "waiting_publication_approval") {
+        throw new Error("测试要求等待 publication approval");
+      }
+      const ready = await fixture.runtime.approvePublication({
+        runId: fixture.runId,
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      });
+      expect(ready.state).toMatchObject({
+        type: "ready_to_publish",
+        publicationReceipt: {
+          evaluationKind: "reviewed",
+          evaluationHash: waiting.state.publicationBinding.evaluationHash,
+        },
+      });
+      await fixture.runtime.publishLearningArtifact({ runId: fixture.runId });
+
+      const markdown = await readFile(targetPath, "utf8");
+      expect(markdown).toContain("## Conclusion");
+      expect(markdown).toContain("## Scope");
+      expect(markdown).toContain("## Uncertainty");
+      expect(markdown).toContain("Evaluator: supported");
+      expect(markdown).toContain("source.md lines 2-3");
+      expect(markdown).toContain("read_source tool-call-001");
+      expect(markdown).toContain("- search_sources: 0");
+      expect(markdown).toContain("- read_source: 1");
+      expect(markdown).toContain("- record_evidence: 0");
+      expect(markdown).toContain("- propose_claim: 0");
+      expect(markdown).toContain("- complete_research: 0");
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("suspends on Evaluator failure and retries the exact review without regenerating the proposal", async () => {
+    const fixture = await createEvidenceReadyRun();
+    fixture.runtime.close();
+    const model = new ScriptedModel([], [{
+      title: "Evaluator retry",
+      summary: "失败后只重试 isolated review。",
+      claimIds: ["claim-event-007"],
+    }]);
+    const evaluator = new ScriptedEvaluator([
+      new Error("private provider body"),
+      {
+        verdicts: [{
+          claimId: "claim-event-007",
+          verdict: "uncertain",
+        }],
+      },
+    ], {
+      provider: "scripted",
+      model: "flaky-evaluator",
+      promptVersion: "evidence-evaluator-v1",
+    });
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      ids: createIds(100),
+      model,
+      evaluator,
+    });
+    const targetPath = join(fixture.outputDirectory, "retry-review.md");
+
+    try {
+      await expect(
+        runtime.proposeLearningArtifact({ runId: fixture.runId, targetPath }),
+      ).rejects.toThrow(/Evaluator Review/);
+      const suspended = await runtime.inspectRun({ runId: fixture.runId });
+      expect(suspended.state).toMatchObject({
+        type: "waiting_evaluator_resolution",
+        proposal: { title: "Evaluator retry" },
+        evaluatorFailures: [{ attempt: 1, code: "evaluation_failed" }],
+      });
+
+      const waiting = await runtime.retryEvaluatorReview({ runId: fixture.runId });
+      expect(waiting.state).toMatchObject({
+        type: "waiting_publication_approval",
+        evaluation: {
+          kind: "reviewed",
+          review: {
+            verdicts: [{
+              claimId: "claim-event-007",
+              verdict: "uncertain",
+            }],
+          },
+        },
+      });
+      expect(model.learningArtifactRequests).toHaveLength(1);
+      expect(evaluator.requests).toHaveLength(2);
+      const trace = await runtime.traceRun({ runId: fixture.runId });
+      expect(trace.events.slice(-2)).toEqual([
+        expect.objectContaining({
+          type: "evaluator_review_failed",
+          evaluatorAttempt: 1,
+          evaluatorFailureCode: "evaluation_failed",
+          evaluatorInputHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+          evaluatorModel: "flaky-evaluator",
+          evaluatorPromptVersion: "evidence-evaluator-v1",
+        }),
+        expect.objectContaining({
+          type: "learning_artifact_draft_proposed",
+          evaluationKind: "reviewed",
+          evaluatorReviewArtifactId: expect.stringMatching(/^sha256:/),
+          evaluationHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+      ]);
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("rejects an Evaluator result outside the closed verdict contract", async () => {
+    const fixture = await createEvidenceReadyRun();
+    fixture.runtime.close();
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      ids: createIds(150),
+      model: new ScriptedModel([], [{
+        title: "Closed evaluator verdicts",
+        summary: "非法 verdict 不能进入 publication state。",
+        claimIds: ["claim-event-007"],
+      }]),
+      evaluator: new ScriptedEvaluator([{
+        verdicts: [{
+          claimId: "claim-event-007",
+          verdict: "approved",
+          explanation: "raw provider payload",
+        }],
+      } as never], {
+        provider: "custom",
+        model: "unsafe-evaluator",
+        promptVersion: "evidence-evaluator-v1",
+      }),
+    });
+
+    try {
+      await expect(runtime.proposeLearningArtifact({
+        runId: fixture.runId,
+        targetPath: join(fixture.outputDirectory, "invalid-verdict.md"),
+      })).rejects.toThrow(/Evaluator Review/);
+      await expect(
+        runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "waiting_evaluator_resolution",
+          evaluatorFailures: [{ attempt: 1, code: "evaluation_failed" }],
+        },
+      });
+      await expect(
+        readFile(join(fixture.outputDirectory, "invalid-verdict.md"), "utf8"),
+      ).rejects.toThrow();
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("allows an explicit audited Evaluator skip without fabricating verdicts", async () => {
+    const fixture = await createEvidenceReadyRun();
+    fixture.runtime.close();
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      ids: createIds(200),
+      model: new ScriptedModel([], [{
+        title: "Explicit skip",
+        summary: "用户可审计地跳过 advisory review。",
+        claimIds: ["claim-event-007"],
+      }]),
+      evaluator: new ScriptedEvaluator(
+        [new Error("evaluation unavailable")],
+        {
+          provider: "scripted",
+          model: "failed-evaluator",
+          promptVersion: "evidence-evaluator-v1",
+        },
+      ),
+    });
+    const targetPath = join(fixture.outputDirectory, "skipped-review.md");
+
+    try {
+      await expect(
+        runtime.proposeLearningArtifact({ runId: fixture.runId, targetPath }),
+      ).rejects.toThrow(/Evaluator Review/);
+      const waiting = await runtime.skipEvaluatorReview({ runId: fixture.runId });
+      expect(waiting.state).toMatchObject({
+        type: "waiting_publication_approval",
+        evaluation: {
+          kind: "skipped",
+          identity: {
+            skipId: expect.stringContaining("event-"),
+            skippedBy: "user-command",
+          },
+        },
+        publicationBinding: {
+          evaluationKind: "skipped",
+          evaluationHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+        publicationApprovalSummary: {
+          hardGate: { status: "passed", claimCount: 1, evidenceCount: 1 },
+          advisoryWarnings: [{
+            kind: "evaluator_skipped",
+            skipId: expect.stringContaining("event-"),
+          }],
+        },
+      });
+      if (waiting.state.type !== "waiting_publication_approval") {
+        throw new Error("测试要求等待 publication approval");
+      }
+      if (waiting.state.evaluation.kind !== "skipped") {
+        throw new Error("测试要求 explicit Evaluator skip");
+      }
+      await runtime.approvePublication({
+        runId: fixture.runId,
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      });
+      await runtime.publishLearningArtifact({ runId: fixture.runId });
+      const markdown = await readFile(targetPath, "utf8");
+      expect(markdown).toContain("Evaluator: skipped");
+      expect(markdown).not.toMatch(
+        /Evaluator: (supported|partially_supported|unsupported|contradicted|uncertain)/,
+      );
+      const trace = await runtime.traceRun({ runId: fixture.runId });
+      expect(trace.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "learning_artifact_draft_proposed",
+          evaluationKind: "skipped",
+          evaluatorSkipId: waiting.state.evaluation.identity.skipId,
+          evaluationHash: waiting.state.publicationBinding.evaluationHash,
+        }),
+      ]));
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("keeps Evaluator resolution suspended until retry, skip, or terminal cancellation", async () => {
+    const fixture = await createEvidenceReadyRun();
+    fixture.runtime.close();
+    const evaluator = new ScriptedEvaluator(
+      [new Error("unavailable")],
+      {
+        provider: "scripted",
+        model: "unavailable-evaluator",
+        promptVersion: "evidence-evaluator-v1",
+      },
+    );
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      ids: createIds(300),
+      model: new ScriptedModel([], [{
+        title: "Evaluator control",
+        summary: "Evaluator wait 是独立 suspended state。",
+        claimIds: ["claim-event-007"],
+      }]),
+      evaluator,
+    });
+
+    try {
+      await expect(runtime.proposeLearningArtifact({
+        runId: fixture.runId,
+        targetPath: join(fixture.outputDirectory, "cancelled-review.md"),
+      })).rejects.toThrow(/Evaluator Review/);
+      await expect(runtime.pauseRun({ runId: fixture.runId })).rejects.toThrow();
+      await expect(runtime.resumeRun({ runId: fixture.runId })).rejects.toThrow();
+      const cancelled = await runtime.cancelRun({ runId: fixture.runId });
+      expect(cancelled.state).toMatchObject({
+        type: "cancelled",
+        cancelledState: { type: "waiting_evaluator_resolution" },
+      });
+      await expect(
+        runtime.retryEvaluatorReview({ runId: fixture.runId }),
+      ).rejects.toThrow();
+      await expect(
+        runtime.skipEvaluatorReview({ runId: fixture.runId }),
+      ).rejects.toThrow();
+      expect(evaluator.requests).toHaveLength(1);
+    } finally {
+      runtime.close();
+    }
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+    });
+    try {
+      await expect(
+        restarted.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "cancelled",
+          cancelledState: { type: "waiting_evaluator_resolution" },
+        },
+      });
+      await expect(
+        restarted.retryEvaluatorReview({ runId: fixture.runId }),
+      ).rejects.toThrow();
+      await expect(
+        restarted.skipEvaluatorReview({ runId: fixture.runId }),
+      ).rejects.toThrow();
+    } finally {
+      restarted.close();
+    }
+  });
+
   it("renders source facts, inferences, and design recommendations without treating interpretation as upstream fact", async () => {
     const fixture = await createEvidenceReadyRun({
       proposalClaimIds: [
@@ -93,10 +441,10 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         "claim-event-009 [design_recommendation]",
       );
       await expect(readFile(targetPath, "utf8")).resolves.toContain(
-        `claim-event-008 [inference]: 因此 Projection 可以作为可替换的派生视图。 【Evidence: ${evidence.evidenceId}】`,
+        `claim-event-008 [inference] (Evaluator: supported): 因此 Projection 可以作为可替换的派生视图。 【Evidence: ${evidence.evidenceId}】`,
       );
       await expect(readFile(targetPath, "utf8")).resolves.toContain(
-        "claim-event-009 [design_recommendation]: 建议只通过 Journal 事实恢复 Projection。",
+        "claim-event-009 [design_recommendation] (Evaluator: supported): 建议只通过 Journal 事实恢复 Projection。",
       );
       await expect(readFile(targetPath, "utf8")).resolves.not.toContain(
         "claim-event-009 [design_recommendation]: 建议只通过 Journal 事实恢复 Projection。 【Evidence:",
@@ -144,7 +492,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
       expect(markdown.match(new RegExp(`^\\- ${evidence.evidenceId}:`, "gm")))
         .toHaveLength(1);
       expect(markdown).toContain(
-        `${evidence.sourceSnapshotId} lines ${evidence.startLine}-${evidence.endLine}; read_source ${evidence.toolCallId}`,
+        `source.md lines ${evidence.startLine}-${evidence.endLine}; ${evidence.sourceSnapshotId}; read_source ${evidence.toolCallId}`,
       );
       expect(markdown.match(new RegExp(`【Evidence: ${evidence.evidenceId}】`, "g")))
         .toHaveLength(2);
@@ -286,6 +634,45 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
     await writeFile(
       join(fixture.runtimeHome, observation.sourceSnapshot.relativePath),
       "已被篡改的 Snapshot bytes。\n",
+      "utf8",
+    );
+
+    try {
+      await expect(
+        fixture.runtime.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Learning Artifact/);
+      await expect(readFile(targetPath, "utf8")).rejects.toThrow();
+      await expect(
+        fixture.runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "ready_to_publish" } });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("revalidates the private Evaluator Review artifact immediately before publication", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "tampered-review.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (
+      waiting.state.type !== "waiting_publication_approval" ||
+      waiting.state.evaluation.kind !== "reviewed"
+    ) {
+      throw new Error("测试夹具要求存在成功 Evaluator Review");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    await writeFile(
+      join(
+        fixture.runtimeHome,
+        waiting.state.evaluation.reviewArtifact.relativePath,
+      ),
+      '{"verdicts":[]}\n',
       "utf8",
     );
 
@@ -862,6 +1249,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         draftArtifact: forgedArtifact,
         publicationBinding: createPublicationApprovalBinding({
           draftHash: forgedSha256,
+          evaluation: draftEvent.payload.evaluation,
           publicationTarget: draftEvent.payload.publicationTarget,
         }),
       },
@@ -993,6 +1381,7 @@ async function createEvidenceReadyRun(options: {
     "utf8",
   );
   const ids = createIds();
+  const evaluator = new ScriptedEvaluator();
   const runtime = ResearchAgentRuntime.open({
     runtimeHome,
     outputRoot: outputDirectory,
@@ -1016,6 +1405,7 @@ async function createEvidenceReadyRun(options: {
         },
       ],
     ),
+    evaluator,
   });
   const waiting = await runtime.createRun({
     question: "为什么 Journal 可以驱动可恢复状态？",
@@ -1150,10 +1540,10 @@ function runBudget(overrides: Partial<RunBudget> = {}): RunBudget {
   };
 }
 
-function createIds(): IdGenerator {
-  let event = 0;
-  let toolCall = 0;
-  let observation = 0;
+function createIds(startAt = 0): IdGenerator {
+  let event = startAt;
+  let toolCall = startAt;
+  let observation = startAt;
   return {
     nextRunId: () => "run-artifact-001",
     nextEventId: () => `event-${String(++event).padStart(3, "0")}`,

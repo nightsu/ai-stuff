@@ -639,6 +639,7 @@ export interface UserPausedRunState {
 /** 所有保留 canonical continuation 且允许未来显式恢复的非终态。 */
 export type SuspendedRunState =
   | WaitingPlanApprovalRunState
+  | WaitingEvaluatorResolutionRunState
   | WaitingPublicationApprovalRunState
   | BudgetExhaustedRunState
   | RetryExhaustedRunState
@@ -653,6 +654,7 @@ export type CancellableRunState =
   | ResearchCompleteRunState
   | BudgetExhaustedRunState
   | RetryExhaustedRunState
+  | WaitingEvaluatorResolutionRunState
   | WaitingPublicationApprovalRunState
   | ReadyToPublishRunState
   | UserPausedRunState;
@@ -679,6 +681,7 @@ export type ResearchRunState =
   | FailedRunState
   | UserPausedRunState
   | CancelledRunState
+  | WaitingEvaluatorResolutionRunState
   | WaitingPublicationApprovalRunState
   | ReadyToPublishRunState
   | CompletedRunState;
@@ -718,6 +721,8 @@ export type RunOperationKind =
   | "record_evidence"
   | "record_claim"
   | "propose_learning_artifact"
+  | "retry_evaluator_review"
+  | "skip_evaluator_review"
   | "approve_publication"
   | "publish_learning_artifact"
   | "pause_run"
@@ -988,10 +993,186 @@ export interface EvidenceGateRepairRequestedPayload {
 export interface LearningArtifactProposal {
   /** 要渲染为 Markdown 一级标题的简短学习主题。 */
   readonly title: string;
-  /** 要渲染在 Claim 列表前的简短学习摘要。 */
+  /** 要渲染为一句话 Conclusion 的单行简短摘要。 */
   readonly summary: string;
   /** 模型选择的既有 Claim identities；顺序决定 Markdown 的展示顺序。 */
   readonly claimIds: readonly string[];
+}
+
+/** Advisory Evaluator 对单个 Claim 允许返回的封闭 verdict 集合。 */
+export type EvaluatorVerdict =
+  | "supported"
+  | "partially_supported"
+  | "unsupported"
+  | "contradicted"
+  | "uncertain";
+
+/** 可持久化且不含 credential 的独立 Evaluator 实验身份。 */
+export interface EvaluatorIdentity {
+  /** evaluator provider 的稳定非秘密名称。 */
+  readonly provider: string;
+  /** evaluator 使用的 provider model identity。 */
+  readonly model: string;
+  /** 独立 evaluator system prompt 的版本 identity。 */
+  readonly promptVersion: string;
+}
+
+/** Evaluator 可见的单条精确 Evidence，不包含 Research Loop history。 */
+export interface EvaluatorEvidenceInput {
+  /** 当前 Run 已登记且通过 Gate 的 Evidence identity。 */
+  readonly evidenceId: string;
+  /** Evidence 所属 immutable Source Snapshot identity。 */
+  readonly sourceSnapshotId: string;
+  /** Source Scope root 内的相对来源路径，不暴露 canonical root。 */
+  readonly relativePath: string;
+  /** Evidence 在 Snapshot 中的 1-based inclusive 起始行。 */
+  readonly startLine: number;
+  /** Evidence 在 Snapshot 中的 1-based inclusive 结束行。 */
+  readonly endLine: number;
+  /** completed read_source observation 当时返回的精确摘录。 */
+  readonly excerpt: string;
+}
+
+/** Evaluator 可见的一个 Claim 及其已验证 cited Evidence。 */
+export interface EvaluatorClaimInput {
+  /** 必须与 Learning Artifact proposal 选择一致的 durable Claim identity。 */
+  readonly claimId: string;
+  /** Claim 的事实/推断/建议分类。 */
+  readonly kind: Claim["kind"];
+  /** 要接受 advisory support review 的完整 Claim 文本。 */
+  readonly text: string;
+  /** 仅包含该 Claim 实际引用且已通过 Gate 的 Evidence。 */
+  readonly evidence: readonly EvaluatorEvidenceInput[];
+}
+
+/** 独立 Evaluator Port 的完整、最小且可哈希输入。 */
+export interface EvaluatorReviewRequest {
+  /** 用户最初提交的技术问题，用于限定 verdict 语境。 */
+  readonly question: string;
+  /** 按最终 Artifact 展示顺序排列的 Claims 与 cited Evidence。 */
+  readonly claims: readonly EvaluatorClaimInput[];
+}
+
+/** Advisory Evaluator 对一个 exact Claim identity 的结构化判断。 */
+export interface EvaluatorClaimVerdict {
+  /** verdict 对应且必须在输入中恰好出现一次的 Claim identity。 */
+  readonly claimId: string;
+  /** 不授权 publication、只向用户提供 warning 的封闭 verdict。 */
+  readonly verdict: EvaluatorVerdict;
+}
+
+/** 一个完整 Evaluator generation 的结构化结果。 */
+export interface EvaluatorReview {
+  /** 每个输入 Claim 恰好一个、并保持输入顺序的 verdict。 */
+  readonly verdicts: readonly EvaluatorClaimVerdict[];
+}
+
+/** 成功 review 的输入与私有 artifact content identity。 */
+export interface EvaluatorReviewIdentity extends EvaluatorIdentity {
+  /** 对 exact EvaluatorReviewRequest canonical JSON 的 SHA-256。 */
+  readonly inputHash: string;
+  /** 私有 JSON review artifact 精确 bytes 的 SHA-256。 */
+  readonly reviewArtifactHash: string;
+}
+
+/** 成功 advisory review 及其可重放 identity。 */
+export interface ReviewedPublicationEvaluation {
+  /** 判别字段；表示存在真实结构化 verdict artifact。 */
+  readonly kind: "reviewed";
+  /** 小型 verdict 投影，必须与 review artifact 内容完全一致。 */
+  readonly review: EvaluatorReview;
+  /** 私有 Artifact Store 中的 exact review JSON 引用。 */
+  readonly reviewArtifact: ArtifactReference;
+  /** evaluator model/prompt/input/review artifact 的完整身份。 */
+  readonly identity: EvaluatorReviewIdentity;
+}
+
+/** 用户显式放弃 advisory review 时持久化的精确事实。 */
+export interface EvaluatorSkipIdentity {
+  /** 由承载事件 identity 派生、跨重放稳定的 skip identity。 */
+  readonly skipId: string;
+  /** 唯一允许的 skip 主体，明确排除 evaluator 与 Research Tool。 */
+  readonly skippedBy: "user-command";
+  /** skip 成为 Run Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly skippedAt: string;
+}
+
+/** 明确没有 verdict、但由用户可审计地允许继续 publication 的结果。 */
+export interface SkippedPublicationEvaluation {
+  /** 判别字段；不得伪造 supported/uncertain verdict。 */
+  readonly kind: "skipped";
+  /** 用户 exact skip command 的 durable identity。 */
+  readonly identity: EvaluatorSkipIdentity;
+}
+
+/** publication approval 必须绑定的 reviewed 或 explicitly skipped evaluation。 */
+export type PublicationEvaluation =
+  | ReviewedPublicationEvaluation
+  | SkippedPublicationEvaluation;
+
+/** Publication approval 面展示的 deterministic Evidence Gate 通过摘要。 */
+export interface PublicationHardGateSummary {
+  /** Gate 已完成且没有可绕过的 hard failure。 */
+  readonly status: "passed";
+  /** 最终 draft 选择且通过 Gate 的 Claim 数。 */
+  readonly claimCount: number;
+  /** 被这些 Claims 引用并通过 lineage 校验的去重 Evidence 数。 */
+  readonly evidenceCount: number;
+}
+
+/** 非 supported verdict 在 approval 面形成的 advisory warning。 */
+export interface EvaluatorVerdictWarning {
+  /** 判别字段；该 warning 来自真实 Evaluator verdict。 */
+  readonly kind: "claim_verdict";
+  /** warning 对应的 exact Claim identity。 */
+  readonly claimId: string;
+  /** 只允许非 supported verdict，避免把通过项伪装成 warning。 */
+  readonly verdict: Exclude<EvaluatorVerdict, "supported">;
+}
+
+/** 用户 explicit skip 在 approval 面形成的 advisory warning。 */
+export interface EvaluatorSkippedWarning {
+  /** 判别字段；明确表示本次没有 Evaluator verdict。 */
+  readonly kind: "evaluator_skipped";
+  /** 与 publication evaluation 完全一致的 durable skip identity。 */
+  readonly skipId: string;
+}
+
+/** Publication approval 面允许展示的封闭 advisory warning 集合。 */
+export type PublicationAdvisoryWarning =
+  | EvaluatorVerdictWarning
+  | EvaluatorSkippedWarning;
+
+/** 用户批准 exact publication binding 前可同时核验的 Gate 与 advisory 摘要。 */
+export interface PublicationApprovalSummary {
+  /** 不可由 Evaluator 覆盖的 deterministic Gate 结果。 */
+  readonly hardGate: PublicationHardGateSummary;
+  /** 按 Claim 顺序排列的非阻断 warning；空数组表示无 advisory warning。 */
+  readonly advisoryWarnings: readonly PublicationAdvisoryWarning[];
+}
+
+/** Learning Artifact 展示的五个模型可见 Research Tools durable usage。 */
+export interface LearningArtifactToolUsage {
+  /** 已形成 durable observation 的 `search_sources` 调用数。 */
+  readonly searchSources: number;
+  /** 已形成 durable source read observation 的 `read_source` 调用数。 */
+  readonly readSource: number;
+  /** 已成功登记为 durable Evidence Record 的 `record_evidence` 调用数。 */
+  readonly recordEvidence: number;
+  /** 已成功登记为 durable Claim 的 `propose_claim` 调用数。 */
+  readonly proposeClaim: number;
+  /** 已形成 durable completion observation 的 `complete_research` 调用数。 */
+  readonly completeResearch: number;
+}
+
+/** Evaluator generation 未形成合法 review 时的安全 durable 失败事实。 */
+export interface EvaluatorReviewFailure {
+  /** 同一 exact input 的第几次 evaluator 尝试，从 1 开始。 */
+  readonly attempt: number;
+  /** 不泄露 provider payload 的稳定失败代码。 */
+  readonly code: "evaluation_failed";
+  /** 失败进入 Run Journal 的 ISO 8601 UTC 时间。 */
+  readonly failedAt: string;
 }
 
 /** 一个经 canonical parent realpath 与 inode 绑定、可被用户批准的 Markdown 目标。 */
@@ -1014,6 +1195,10 @@ export interface PublicationTarget {
 export interface PublicationApprovalBinding {
   /** 私有持久化 Markdown draft 精确 UTF-8 内容的 SHA-256 摘要。 */
   readonly draftHash: string;
+  /** 绑定 reviewed artifact hash 或 explicit skip identity hash 的类别。 */
+  readonly evaluationKind: PublicationEvaluation["kind"];
+  /** 对 exact review artifact 或 skip identity 的审批摘要。 */
+  readonly evaluationHash: string;
   /** 绑定 target 所属的 canonical Output Root，排除 Runtime Home 或任意外部目录。 */
   readonly outputRootCanonicalPath: string;
   /** 绑定 Output Root 的审批时设备号。 */
@@ -1042,6 +1227,10 @@ export interface PublicationApprovalReceipt {
   readonly approvedAt: string;
   /** Receipt 所授权 Markdown draft 的精确内容 SHA-256。 */
   readonly draftHash: string;
+  /** Receipt 授权的是 reviewed artifact 还是 explicit skip。 */
+  readonly evaluationKind: PublicationEvaluation["kind"];
+  /** Receipt 精确授权的 review artifact/skip identity 摘要。 */
+  readonly evaluationHash: string;
   /** Receipt 所授权 target 所属的 canonical Output Root 路径。 */
   readonly outputRootCanonicalPath: string;
   /** Receipt 所授权 Output Root 的设备号。 */
@@ -1112,16 +1301,44 @@ export type PublicationResearchData =
   | LegacyExplicitPublicationResearchData
   | ResearchLoopPublicationResearchData;
 
+/** Proposal 已 Gate 通过但 Evaluator 尚未产生 review 时共享的事实。 */
+export interface EvaluatorPendingStateData {
+  /** 已完成 proposal generation、后续 retry 不得重新采样的 exact 提案。 */
+  readonly proposal: LearningArtifactProposal;
+  /** 由 Runtime 捕获且 evaluator retry/skip 不得改变的 publication target。 */
+  readonly publicationTarget: PublicationTarget;
+  /** 执行 evaluator 前对最小隔离输入计算的 canonical SHA-256。 */
+  readonly evaluatorInputHash: string;
+  /** 本次 review 固定的 evaluator provider/model/prompt identity。 */
+  readonly evaluatorIdentity: EvaluatorIdentity;
+  /** 对同一 exact input 按发生顺序保留的全部安全失败。 */
+  readonly evaluatorFailures: readonly [
+    EvaluatorReviewFailure,
+    ...EvaluatorReviewFailure[],
+  ];
+}
+
+/** Evaluator 失败后等待用户 retry 或 explicit skip 的 Suspended Run。 */
+export type WaitingEvaluatorResolutionRunState = PublicationResearchData &
+  EvaluatorPendingStateData & {
+  /** 判别字段；普通 publication approval 不能越过该等待。 */
+  readonly type: "waiting_evaluator_resolution";
+};
+
 /** draft、target 与 binding 在全部 publication 状态共享的事实。 */
 export interface PublicationStateData {
   /** 已存入私有 Artifact Store、可由 reducer 重新渲染验证的 Markdown draft。 */
   readonly draftArtifact: ArtifactReference;
   /** 提供标题、摘要和 Claim 展示顺序的有界模型提案。 */
   readonly proposal: LearningArtifactProposal;
+  /** advisory review 或用户 explicit skip，必须进入 draft 与审批 binding。 */
+  readonly evaluation: PublicationEvaluation;
   /** 由 Runtime 捕获并将成为用户审批主体的 canonical Markdown 目标。 */
   readonly publicationTarget: PublicationTarget;
   /** 精确绑定 draft 内容与 publication target identity 的审批摘要。 */
   readonly publicationBinding: PublicationApprovalBinding;
+  /** 同一 approval 面展示的 hard Gate 通过事实与 advisory warnings。 */
+  readonly publicationApprovalSummary: PublicationApprovalSummary;
 }
 
 /** 模型提案已被 Evidence Gate 接受、但仍等待用户精确发布审批的 Run 状态。 */
@@ -1159,10 +1376,28 @@ export interface LearningArtifactDraftProposedPayload {
   readonly draftArtifact: ArtifactReference;
   /** 只含标题、摘要与既有 Claim 选择的有界模型提案。 */
   readonly proposal: LearningArtifactProposal;
+  /** 已完成 review 或用户 explicit skip 的完整 publication evaluation。 */
+  readonly evaluation: PublicationEvaluation;
   /** 由 Runtime 解析而非模型输出的 canonical publication target。 */
   readonly publicationTarget: PublicationTarget;
   /** 逐字段绑定 draft 与 target 的等待审批摘要。 */
   readonly publicationBinding: PublicationApprovalBinding;
+  /** 用户签发 approval 前同时核验的 Gate 与 Evaluator 摘要。 */
+  readonly publicationApprovalSummary: PublicationApprovalSummary;
+}
+
+/** `evaluator_review_failed` 事件冻结 exact input 与可恢复失败等待。 */
+export interface EvaluatorReviewFailedPayload {
+  /** 已 Gate 通过且 retry 不得重新生成的 proposal。 */
+  readonly proposal: LearningArtifactProposal;
+  /** evaluator resolution 期间不可改变的 canonical target。 */
+  readonly publicationTarget: PublicationTarget;
+  /** exact isolated evaluator input 的 canonical SHA-256。 */
+  readonly evaluatorInputHash: string;
+  /** 本次 evaluator model 与 prompt 的非秘密 identity。 */
+  readonly evaluatorIdentity: EvaluatorIdentity;
+  /** 当前 attempt 的安全失败事实。 */
+  readonly failure: EvaluatorReviewFailure;
 }
 
 /** `publication_approved` 事件携带的用户审批事实。 */
@@ -1218,6 +1453,7 @@ export type ResearchRunEvent =
       "evidence_gate_repair_requested",
       EvidenceGateRepairRequestedPayload
     >
+  | RunEvent<"evaluator_review_failed", EvaluatorReviewFailedPayload>
   | RunEvent<
       "learning_artifact_draft_proposed",
       LearningArtifactDraftProposedPayload
@@ -1347,6 +1583,26 @@ export interface RunTraceEvent {
   readonly evidenceGateRepairCode?: EvidenceGateRepairCode;
   /** 仅 draft proposal 事件暴露的私有 content-addressed Markdown artifact identity。 */
   readonly draftArtifactId?: string;
+  /** Evaluator failure 与 reviewed draft 暴露的 exact isolated input SHA-256。 */
+  readonly evaluatorInputHash?: string;
+  /** Evaluator failure 暴露的非秘密 provider identity。 */
+  readonly evaluatorProvider?: string;
+  /** Evaluator failure 暴露的非秘密 model identity。 */
+  readonly evaluatorModel?: string;
+  /** Evaluator failure 暴露的独立 prompt version。 */
+  readonly evaluatorPromptVersion?: string;
+  /** Evaluator failure 在同一 exact input 上从 1 开始的尝试序号。 */
+  readonly evaluatorAttempt?: number;
+  /** Evaluator failure 的稳定安全代码，不含 provider payload。 */
+  readonly evaluatorFailureCode?: EvaluatorReviewFailure["code"];
+  /** draft proposal 暴露 reviewed 或 explicitly skipped 的判别值。 */
+  readonly evaluationKind?: PublicationEvaluation["kind"];
+  /** reviewed draft 暴露的私有 JSON review artifact identity。 */
+  readonly evaluatorReviewArtifactId?: string;
+  /** explicit skip draft 暴露的 durable user-command identity。 */
+  readonly evaluatorSkipId?: string;
+  /** publication approval binding 对 review artifact 或 skip identity 的摘要。 */
+  readonly evaluationHash?: string;
   /** 仅 publication approval 事件暴露的 durable receipt identity。 */
   readonly publicationApprovalId?: string;
   /** 仅完成发布事件暴露的已写入 Markdown 内容 SHA-256。 */

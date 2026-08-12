@@ -47,6 +47,36 @@ export function formatRunTrace(
         event.draftArtifactId === undefined
           ? undefined
           : `draft=${event.draftArtifactId}`,
+        event.evaluatorInputHash === undefined
+          ? undefined
+          : `evaluator-input=${event.evaluatorInputHash}`,
+        event.evaluatorProvider === undefined
+          ? undefined
+          : `evaluator-provider=${event.evaluatorProvider}`,
+        event.evaluatorModel === undefined
+          ? undefined
+          : `evaluator-model=${event.evaluatorModel}`,
+        event.evaluatorPromptVersion === undefined
+          ? undefined
+          : `evaluator-prompt=${event.evaluatorPromptVersion}`,
+        event.evaluatorAttempt === undefined
+          ? undefined
+          : `evaluator-attempt=${event.evaluatorAttempt}`,
+        event.evaluatorFailureCode === undefined
+          ? undefined
+          : `evaluator-failure=${event.evaluatorFailureCode}`,
+        event.evaluationKind === undefined
+          ? undefined
+          : `evaluation=${event.evaluationKind}`,
+        event.evaluatorReviewArtifactId === undefined
+          ? undefined
+          : `review=${event.evaluatorReviewArtifactId}`,
+        event.evaluatorSkipId === undefined
+          ? undefined
+          : `evaluator-skip=${event.evaluatorSkipId}`,
+        event.evaluationHash === undefined
+          ? undefined
+          : `evaluation-hash=${event.evaluationHash}`,
         event.publicationApprovalId === undefined
           ? undefined
           : `publication-approval=${event.publicationApprovalId}`,

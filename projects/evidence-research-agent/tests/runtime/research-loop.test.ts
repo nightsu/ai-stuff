@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,6 +10,7 @@ import {
   ModelViewTooLargeError,
   ResearchAgentRuntime,
   ResearchLoopError,
+  ScriptedEvaluator,
   ScriptedModel,
   formatRunTrace,
 } from "../../src/index.js";
@@ -186,7 +187,7 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
     }
   });
 
-  it("durably charges a completed Artifact proposal generation whose schema is invalid", async () => {
+  it("durably charges a multi-sentence Artifact proposal that cannot become the Conclusion", async () => {
     const fixture = await createApprovedLoopRun([
       turn("read", "read_source", {
         rootIndex: 0,
@@ -217,7 +218,11 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
         },
         proposeLearningArtifact: async () => {
           proposalCalls += 1;
-          return { title: "缺少 summary 与 claimIds" } as never;
+          return {
+            title: "多句结论",
+            summary: "第一句结论。第二句不能进入 Conclusion。",
+            claimIds: ["claim-event-010"],
+          };
         },
       },
     });
@@ -226,7 +231,7 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
       await expect(
         restarted.proposeLearningArtifact({
           runId: fixture.runId,
-          targetPath: join(fixture.outputRoot, "invalid-proposal.md"),
+          targetPath: join(fixture.outputRoot, "multi-sentence-proposal.md"),
         }),
       ).rejects.toThrow(/Evidence/);
       expect(proposalCalls).toBe(1);
@@ -1577,6 +1582,7 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
       runtimeHome,
       outputRoot,
       model,
+      evaluator: new ScriptedEvaluator(),
       clock: fixedClock(),
       ids: sequentialIds(),
     });
@@ -1656,8 +1662,30 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
           type: "waiting_publication_approval",
           researchOrigin: "research_loop",
           completion: { unresolvedQuestions: [] },
+          publicationApprovalSummary: {
+            hardGate: { status: "passed", claimCount: 1, evidenceCount: 1 },
+            advisoryWarnings: [],
+          },
         },
       });
+      await expect(
+        readFile(join(outputRoot, "journal-learning.md"), "utf8"),
+      ).rejects.toThrow();
+      if (publicationWaiting.state.type !== "waiting_publication_approval") {
+        throw new Error("测试要求等待 publication approval");
+      }
+      const reportBytes = await readFile(
+        join(
+          runtimeHome,
+          publicationWaiting.state.draftArtifact.relativePath,
+        ),
+        "utf8",
+      );
+      expect(reportBytes).toContain("- search_sources: 1");
+      expect(reportBytes).toContain("- read_source: 1");
+      expect(reportBytes).toContain("- record_evidence: 1");
+      expect(reportBytes).toContain("- propose_claim: 1");
+      expect(reportBytes).toContain("- complete_research: 1");
       const missingCompletion = structuredClone(publicationWaiting) as unknown as Record<
         string,
         unknown
@@ -3026,6 +3054,7 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
       runtimeHome,
       outputRoot,
       model,
+      evaluator: new ScriptedEvaluator(),
       clock,
       ids: sequentialIds(),
     });
