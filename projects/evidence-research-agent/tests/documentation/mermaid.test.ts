@@ -18,7 +18,7 @@ it("parses every architecture Mermaid block", async () => {
   }
 });
 
-it("documents the private source snapshot flow without leaving researching", async () => {
+it("documents the Evidence-backed publication flow without introducing a research loop", async () => {
   const markdown = await readArchitecture();
   const stateDiagram = extractMermaidDiagrams(markdown).find((diagram) =>
     /^stateDiagram-v2\b/m.test(diagram),
@@ -34,17 +34,36 @@ it("documents the private source snapshot flow without leaving researching", asy
   );
   expect(markdown).toContain("Reader --> Snapshot");
   expect(markdown).toContain("Snapshot --> Registry");
-  expect(markdown).toContain("Registry --> Journal");
+  expect(markdown).toContain("Registry --> Observation");
   expect(markdown).toContain(
-    'Policy -->|"denied or failed<br/>no snapshot"| Journal',
+    'Policy -->|"denied or failed<br/>no snapshot"| Observation',
   );
   expect(markdown).toContain("Journal --> Projection");
   expect(markdown).toContain("Journal --> Trace");
+  expect(markdown).toContain("Observation --> Evidence");
+  expect(markdown).toContain("Evidence --> Claim");
+  expect(markdown).toContain("Claim --> Gate");
+  expect(markdown).toContain("Gate --> Draft");
+  expect(markdown).toContain("Draft --> Approval");
+  expect(markdown).toContain("Approval --> Publisher");
+  expect(markdown).toContain("Output Root");
   expect(stateDiagram).toMatch(
     /^\s*researching\s*-->\s*researching\s*:\s*source_read_observed\s*$/m,
   );
-  expect(stateDiagram).not.toMatch(
-    /^\s*researching\s*-->\s*completed(?:\s*:\s*.*)?\s*$/im,
+  expect(stateDiagram).toMatch(
+    /^\s*researching\s*-->\s*researching\s*:\s*evidence_recorded\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*researching\s*-->\s*researching\s*:\s*claim_recorded\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*researching\s*-->\s*waiting_publication_approval\s*:\s*learning_artifact_draft_proposed\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*waiting_publication_approval\s*-->\s*ready_to_publish\s*:\s*publication_approved\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*ready_to_publish\s*-->\s*completed\s*:\s*learning_artifact_published\s*$/m,
   );
   expect(stateDiagram).not.toMatch(/\bsearch_sources\b/i);
 
