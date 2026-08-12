@@ -138,6 +138,9 @@ export class RunOperationLeaseLostError extends Error {}
 /** Journal mutation 发现更早 durable 的未消费 cancellation request。 */
 export class RunCancellationPendingError extends Error {}
 
+/** cancellation request 竞争时发现 Run 已先进入 terminal state。 */
+export class RunCancellationTerminalError extends Error {}
+
 export class SourceSnapshotRegistrationError extends Error {
   public constructor() {
     super("Source Snapshot registry 完整性校验失败");
@@ -528,9 +531,20 @@ export class SqliteRunStore {
 
   public requestRunCancellation(
     request: RunCancellationRequest,
-  ): RunCancellationRequest {
+  ): RunCancellationRequest | undefined {
     const transaction = this.#database.transaction(() => {
       this.#assertRunExists(request.runId);
+      const projection = reduceRunEvents(this.readEvents(request.runId));
+      if (projection.state.type === "cancelled") return undefined;
+      if (
+        projection.state.type === "completed" ||
+        projection.state.type === "failed"
+      ) {
+        // request insert 与 Journal append 都用 IMMEDIATE 短事务排序：若 terminal
+        // event 先提交，取消不能留下永远无法消费的 control-plane 残留；若 request
+        // 先提交，appendEvents 的 pending-request fence 会让取消先结算。
+        throw new RunCancellationTerminalError();
+      }
       const existing = this.#readCancellationRequestRow(request.runId);
       if (existing !== undefined) return cancellationRequestFromRow(existing);
       this.#database.prepare(

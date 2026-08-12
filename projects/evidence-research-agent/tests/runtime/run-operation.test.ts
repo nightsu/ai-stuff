@@ -332,6 +332,64 @@ describe("ResearchAgentRuntime durable Run Operations", () => {
       recovering.close();
     }
   });
+
+  it("does not leave a pending cancellation request when completion wins the request race", async () => {
+    const runtimeHome = await temporaryDirectory("run-cancel-terminal-race-");
+    const sourceRoot = await temporaryDirectory("run-cancel-terminal-source-");
+    let allowRequest: (() => void) | undefined;
+    let requestPaused: (() => void) | undefined;
+    const paused = new Promise<void>((resolve) => {
+      requestPaused = resolve;
+    });
+    const allowed = new Promise<void>((resolve) => {
+      allowRequest = resolve;
+    });
+    const setup = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: completionModel(),
+    });
+    let runId: string;
+    try {
+      runId = await createApprovedRun(setup, sourceRoot);
+      await setup.advanceResearch({ runId });
+    } finally {
+      setup.close();
+    }
+    const requester = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: completionModel(),
+      runOperationHooks: {
+        beforeCancellationRequested: async () => {
+          requestPaused?.();
+          await allowed;
+        },
+      },
+    });
+    const publisher = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: completionModel(),
+    });
+
+    try {
+      // research_complete 不是 terminal；用 cancelled 作为“另一取消已先结算”的
+      // race winner，证明请求事务会重读 canonical state 而非相信旧快照。
+      const delayedCancel = requester.cancelRun({ runId });
+      await paused;
+      await publisher.cancelRun({ runId });
+      allowRequest?.();
+      await expect(delayedCancel).resolves.toMatchObject({
+        state: { type: "cancelled" },
+      });
+      await expect(publisher.inspectRunOperation({ runId })).resolves.toMatchObject({
+        lease: undefined,
+        cancellationRequest: { consumedAt: expect.any(String) },
+      });
+    } finally {
+      allowRequest?.();
+      requester.close();
+      publisher.close();
+    }
+  });
 });
 
 async function temporaryDirectory(prefix: string): Promise<string> {

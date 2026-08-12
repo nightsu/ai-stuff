@@ -77,6 +77,7 @@ import {
 import {
   ConcurrentRunWriteError,
   RunCancellationPendingError,
+  RunCancellationTerminalError,
   RunNotFoundError,
   RunOperationBusyError,
   SourceSnapshotRegistrationError,
@@ -136,6 +137,8 @@ export interface OpenRuntimeOptions {
 export interface RunOperationLifecycleHooks {
   /** lease 已 durable 获取、业务恢复或外部 I/O 尚未执行前运行。 */
   readonly afterLeaseAcquired?: () => void | Promise<void>;
+  /** 初读 Run state 后、durable cancellation request 事务前运行。 */
+  readonly beforeCancellationRequested?: () => void | Promise<void>;
   /** cancellation request 已 durable、canonical `run_cancelled` 尚未提交前运行。 */
   readonly afterCancellationRequested?: () => void | Promise<void>;
 }
@@ -1042,7 +1045,7 @@ export class ResearchAgentRuntime {
       ) {
         // 两个 process-like 命令都可能在竞争前消费 clock/ID，但只有赢家事件成为
         // durable fact；输家重读同一 Receipt 即实现语义幂等。尝试态 identity 不写
-        // Journal，也不值得提前引入 Issue #10 的 durable operation 协议。
+        // Journal；durable lease 已经保证竞争者不能同时进入审批副作用。
         return persisted;
       }
 
@@ -1252,7 +1255,7 @@ export class ResearchAgentRuntime {
       } catch (error) {
         if (error instanceof ModelGenerationAbortedError) {
           // Retry Attempt 已在外部 I/O 前成为 durable fact；明确取消必须同样以
-          // completed outcome 闭合，但 #9 才决定是否把整个 Run 终止或暂停。
+          // completed outcome 闭合；Run cancellation 由独立 durable request 决定。
           this.#commitAbortedAttempt(
             started.projection,
             this.#completeFailedAttempt(
@@ -3031,12 +3034,25 @@ export class ResearchAgentRuntime {
     if (current.state.type === "completed" || current.state.type === "failed") {
       throw new Error("terminal Run 不能再次取消");
     }
+    await this.#runOperationHook(
+      this.#runOperationHooks.beforeCancellationRequested,
+      "Run Operation 在 cancellation request 前中断",
+    );
     const requestedAt = this.#operationClock.now();
-    const request = this.#store.requestRunCancellation({
-      runId,
-      requestId: `cancellation-${randomUUID()}`,
-      requestedAt,
-    });
+    let request: RunCancellationRequest | undefined;
+    try {
+      request = this.#store.requestRunCancellation({
+        runId,
+        requestId: `cancellation-${randomUUID()}`,
+        requestedAt,
+      });
+    } catch (error) {
+      if (error instanceof RunCancellationTerminalError) {
+        throw new Error("terminal Run 不能再次取消");
+      }
+      throw error;
+    }
+    if (request === undefined) return this.#store.readProjection(runId);
     await this.#runOperationHook(
       this.#runOperationHooks.afterCancellationRequested,
       "Run Operation 在 durable cancellation request 后中断",
@@ -3100,7 +3116,7 @@ export class ResearchAgentRuntime {
     });
     // Journal terminal fact 必须先成功提交，再中止当前 Runtime 进程里的 provider
     // stream；否则 abort 已发生但 cancellation 未 durable 时，重启可能错误恢复工作。
-    // 跨进程 durable request 与 stale owner recovery 明确由后继 Issue #10 交付。
+    // 跨进程 request、expiry takeover 与 operation fencing 由当前 control plane 保证。
     this.#activeOperationControllers.get(request.runId)?.abort();
     return cancelled;
   }
