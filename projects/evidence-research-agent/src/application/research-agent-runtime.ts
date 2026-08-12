@@ -23,7 +23,7 @@ import {
   renderLearningArtifact,
 } from "../domain/learning-artifact.js";
 import { hasPreRenderedCitationToken } from "../domain/citation-safety.js";
-import { buildRunTrace } from "../domain/reducer.js";
+import { buildRunTrace, reduceRunEvents } from "../domain/reducer.js";
 import {
   parseResearchPlan,
   parseLearningArtifactProposal,
@@ -106,6 +106,22 @@ export interface ResearchLoopLifecycleHooks {
   readonly afterSearchResultArtifactWrite?: () => void | Promise<void>;
   /** search observation 与 Artifact registry 已同事务提交后运行。 */
   readonly afterSearchObservationJournalAppend?: () => void | Promise<void>;
+  /** read_source 的 Source Snapshot 已写入 CAS、但 Journal 尚未引用前运行。 */
+  readonly afterReadSourceSnapshotWrite?: () => void | Promise<void>;
+  /** read_source observation 与 Snapshot registry 已同事务提交后运行。 */
+  readonly afterReadObservationJournalAppend?: () => void | Promise<void>;
+  /** Evidence 领域事件追加 Journal 前运行。 */
+  readonly beforeEvidenceJournalAppend?: () => void | Promise<void>;
+  /** Evidence 领域事件 durable 提交后运行。 */
+  readonly afterEvidenceJournalAppend?: () => void | Promise<void>;
+  /** Claim 领域事件追加 Journal 前运行。 */
+  readonly beforeClaimJournalAppend?: () => void | Promise<void>;
+  /** Claim 领域事件 durable 提交后运行。 */
+  readonly afterClaimJournalAppend?: () => void | Promise<void>;
+  /** completion 及其必要预算暂停 event batch 追加 Journal 前运行。 */
+  readonly beforeCompletionJournalAppend?: () => void | Promise<void>;
+  /** completion event batch durable 提交后运行。 */
+  readonly afterCompletionJournalAppend?: () => void | Promise<void>;
 }
 
 /** 创建新 Research Run 的应用命令。 */
@@ -812,7 +828,7 @@ export class ResearchAgentRuntime {
         );
         return exhausted === undefined
           ? current
-          : this.#suspendForBudget(current, exhausted);
+          : this.#suspendForBudget(current, "model");
       }
       if (current.state.type !== "researching") {
         throw new ResearchLoopError();
@@ -824,7 +840,10 @@ export class ResearchAgentRuntime {
         current.state.pendingToolIntents.length === 0 ? "model" : "tool",
       );
       if (exhausted !== undefined) {
-        return this.#suspendForBudget(current, exhausted);
+        return this.#suspendForBudget(
+          current,
+          current.state.pendingToolIntents.length === 0 ? "model" : "tool",
+        );
       }
       if (current.state.pendingToolIntents.length !== 0) {
         await this.#executePendingResearchIntent(current);
@@ -1101,7 +1120,7 @@ export class ResearchAgentRuntime {
     }
     const remaining = this.#remainingBudget(current, this.#clock.now());
     if (remaining.sourceBytes === 0) {
-      this.#suspendForBudget(current, "source_bytes");
+      this.#suspendForBudget(current, "tool");
       return;
     }
     await this.#readSource(
@@ -1121,7 +1140,8 @@ export class ResearchAgentRuntime {
         { runId: current.runId, ...parsed.data },
         intent,
       );
-    } catch {
+    } catch (error) {
+      if (error instanceof ResearchLoopError) throw error;
       this.#appendGenericToolObservation(current, intent, "failed", "stale_observation");
     }
   }
@@ -1137,7 +1157,8 @@ export class ResearchAgentRuntime {
         { runId: current.runId, ...parsed.data },
         intent,
       );
-    } catch {
+    } catch (error) {
+      if (error instanceof ResearchLoopError) throw error;
       this.#appendGenericToolObservation(current, intent, "failed", "claim_rejected");
     }
   }
@@ -1166,7 +1187,7 @@ export class ResearchAgentRuntime {
       { unresolvedQuestions: parsed.data.unresolvedQuestions },
       occurredAt,
     );
-    const event: ResearchRunEvent = {
+    const completionEvent: ResearchRunEvent = {
       eventId: this.#ids.nextEventId(),
       runId: current.runId,
       sequence: current.lastEventSequence + 1,
@@ -1177,7 +1198,42 @@ export class ResearchAgentRuntime {
         observation,
       },
     };
-    this.#store.appendEvents(current.runId, current.lastEventSequence, [event]);
+    const completedProjection = reduceRunEvents([
+      ...this.#store.readEvents(current.runId),
+      completionEvent,
+    ]);
+    const remainingBudget = this.#remainingBudget(
+      completedProjection,
+      occurredAt,
+    );
+    const exhaustedDimension = firstExhaustedRunBudgetDimension(
+      remainingBudget,
+      "model",
+    );
+    const events: ResearchRunEvent[] = [completionEvent];
+    if (exhaustedDimension !== undefined) {
+      // completion 与由它暴露出的预算暂停必须在同一 SQLite transaction 提交；
+      // 崩溃不能留下一个已耗尽却仍可进入 Gate 的 research_complete Journal。
+      events.push({
+        eventId: this.#ids.nextEventId(),
+        runId: current.runId,
+        sequence: current.lastEventSequence + 2,
+        type: "run_budget_exhausted",
+        occurredAt,
+        payload: { exhaustedDimension, remainingBudget },
+      });
+    }
+    await this.#runResearchLoopHook(
+      this.#researchLoopHooks.beforeCompletionJournalAppend,
+    );
+    this.#store.appendEvents(
+      current.runId,
+      current.lastEventSequence,
+      events,
+    );
+    await this.#runResearchLoopHook(
+      this.#researchLoopHooks.afterCompletionJournalAppend,
+    );
   }
 
   #appendResearchObservationOnly(
@@ -1254,12 +1310,19 @@ export class ResearchAgentRuntime {
 
   #suspendForBudget(
     current: RunProjection,
-    exhaustedDimension: "model_turns" | "tool_calls" | "distinct_sources" | "source_bytes" | "wall_time",
+    phase: "model" | "tool",
   ): RunProjection {
     const occurredAt = this.#clock.now();
-    // payload 必须用 event 自己的 occurredAt 重算；若复用更早一拍的 Model View
-    // 余额，真实递增时钟会让 reducer replay 得到不同 wall-time 并拒绝事件。
+    // dimension 与 payload 必须都从 event 自己的 occurredAt 重算；若前一拍是
+    // model_turns、后一拍 wall_time 先耗尽，复用旧 dimension 会让 replay 拒绝。
     const remainingBudget = this.#remainingBudget(current, occurredAt);
+    const exhaustedDimension = firstExhaustedRunBudgetDimension(
+      remainingBudget,
+      phase,
+    );
+    if (exhaustedDimension === undefined) {
+      throw new ResearchLoopError();
+    }
     return this.#store.appendEvents(current.runId, current.lastEventSequence, [
       {
         eventId: this.#ids.nextEventId(),
@@ -1336,7 +1399,13 @@ export class ResearchAgentRuntime {
             observedAt,
           ),
         );
-      } catch {
+        if (researchIntent !== undefined) {
+          await this.#runResearchLoopHook(
+            this.#researchLoopHooks.afterReadSourceSnapshotWrite,
+          );
+        }
+      } catch (error) {
+        if (error instanceof ResearchLoopError) throw error;
         throw new SourceReadPersistenceError();
       }
       const {
@@ -1407,14 +1476,21 @@ export class ResearchAgentRuntime {
     };
 
     try {
-      return this.#store.appendEvents(
+      const projection = this.#store.appendEvents(
         runId,
         current.lastEventSequence,
         [event],
         [],
         persistedSourceSnapshot === undefined ? [] : [persistedSourceSnapshot],
       );
+      if (researchIntent !== undefined) {
+        await this.#runResearchLoopHook(
+          this.#researchLoopHooks.afterReadObservationJournalAppend,
+        );
+      }
+      return projection;
     } catch (error) {
+      if (error instanceof ResearchLoopError) throw error;
       if (error instanceof ConcurrentRunWriteError) {
         // CAS bytes 可能已在冲突前原子落盘，成为可由未来 GC 回收的 orphan；
         // Journal 仍是事实源，冲突后绝不能重读 live file 或伪称 observation 已提交。
@@ -1512,8 +1588,24 @@ export class ResearchAgentRuntime {
     };
 
     try {
-      return this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+      if (researchIntent !== undefined) {
+        await this.#runResearchLoopHook(
+          this.#researchLoopHooks.beforeEvidenceJournalAppend,
+        );
+      }
+      const projection = this.#store.appendEvents(
+        runId,
+        current.lastEventSequence,
+        [event],
+      );
+      if (researchIntent !== undefined) {
+        await this.#runResearchLoopHook(
+          this.#researchLoopHooks.afterEvidenceJournalAppend,
+        );
+      }
+      return projection;
     } catch (error) {
+      if (error instanceof ResearchLoopError) throw error;
       if (error instanceof ConcurrentRunWriteError) {
         throw new EvidenceWriteConflictError();
       }
@@ -1588,8 +1680,24 @@ export class ResearchAgentRuntime {
     };
 
     try {
-      return this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+      if (researchIntent !== undefined) {
+        await this.#runResearchLoopHook(
+          this.#researchLoopHooks.beforeClaimJournalAppend,
+        );
+      }
+      const projection = this.#store.appendEvents(
+        runId,
+        current.lastEventSequence,
+        [event],
+      );
+      if (researchIntent !== undefined) {
+        await this.#runResearchLoopHook(
+          this.#researchLoopHooks.afterClaimJournalAppend,
+        );
+      }
+      return projection;
     } catch (error) {
+      if (error instanceof ResearchLoopError) throw error;
       if (error instanceof ConcurrentRunWriteError) {
         throw new EvidenceWriteConflictError();
       }

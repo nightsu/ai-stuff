@@ -183,7 +183,7 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 
 ## Journal、Trace 与恢复边界
 
-Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim、research completion/budget suspension、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。`ResearchLoopLifecycleHooks` 可在 Model Turn 与 search Artifact/Journal 的命名 durable seam 注入中断，恢复测试据此证明 committed pending work 不重复 generation、孤立 CAS 对象不冒充 Journal 事实。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文或 OS 错误。
+Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim、research completion/budget suspension、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。`ResearchLoopLifecycleHooks` 在 Model Turn 以及五个 Research Tool 的命名 durable seam 注入中断：search/read 覆盖 CAS Artifact/Snapshot 写入后与 Journal 事务提交后，Evidence/Claim/completion 覆盖 Journal commit 前后。恢复测试据此证明未提交 intent 会保留并重试、已提交工具不会重复执行、孤立 CAS 对象不冒充 Journal 事实。`complete_research` 若在同一时刻暴露预算耗尽，会把 `research_completed` 与 `run_budget_exhausted` 放进一个 SQLite event batch，崩溃无法留下 exhausted 但可发布的单独 `research_complete`。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文或 OS 错误。
 
 `publication_approved` 只表示用户授权了精确 draft/target，状态为 `ready_to_publish`。重启不会自动写文件；只有显式 `publishLearningArtifact` 成功返回后才追加 `learning_artifact_published` 并进入 `completed`。如果进程在外部写入尝试和该 Journal 事件之间崩溃，当前实现不会把“文件可能存在”猜成完成；完整 effect crash reconciliation 留给 Issue #14。
 

@@ -14,6 +14,7 @@ import type {
   Clock,
   IdGenerator,
   OpenRuntimeOptions,
+  ResearchLoopLifecycleHooks,
   ResearchRunEvent,
   ResearchToolIntent,
   RunBudget,
@@ -615,6 +616,320 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
     }
   });
 
+  it("retries read_source after interruption between Snapshot CAS and Journal commit", async () => {
+    let interruptOnce = true;
+    const fixture = await createApprovedLoopRun(
+      [turn("read", "read_source", {
+        rootIndex: 0,
+        relativePath: "journal.md",
+        startLine: 1,
+        endLine: 1,
+      })],
+      {},
+      {
+        researchLoopHooks: {
+          afterReadSourceSnapshotWrite: () => {
+            if (interruptOnce) {
+              interruptOnce = false;
+              throw new Error("interrupt after orphan Source Snapshot write");
+            }
+          },
+        },
+      },
+    );
+    try {
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).rejects.toBeInstanceOf(ResearchLoopError);
+      await expect(
+        fixture.runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "researching",
+          pendingToolIntents: [expect.objectContaining({ intentId: "read" })],
+          sourceReadObservations: [],
+        },
+      });
+    } finally {
+      fixture.runtime.close();
+    }
+
+    await writeFile(
+      join(fixture.sourceRoot, "journal.md"),
+      "Run Projection 从 Journal 重建。\n",
+      "utf8",
+    );
+    const restartedModel = new ScriptedModel([], [], [
+      turn("complete", "complete_research", { unresolvedQuestions: [] }),
+    ]);
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputRoot,
+      model: restartedModel,
+      clock: fixedClock(),
+      ids: sequentialIds(100),
+    });
+    try {
+      const completed = await restarted.advanceResearch({ runId: fixture.runId });
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        sourceReadObservations: [expect.objectContaining({
+          status: "succeeded",
+          excerpt: "Run Projection 从 Journal 重建。",
+        })],
+      });
+      expect(restartedModel.researchViews).toHaveLength(1);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("does not repeat read_source after its observation committed before interruption", async () => {
+    let interruptOnce = true;
+    const fixture = await createApprovedLoopRun(
+      [turn("read", "read_source", {
+        rootIndex: 0,
+        relativePath: "journal.md",
+        startLine: 1,
+        endLine: 1,
+      })],
+      {},
+      {
+        researchLoopHooks: {
+          afterReadObservationJournalAppend: () => {
+            if (interruptOnce) {
+              interruptOnce = false;
+              throw new Error("interrupt after durable read observation");
+            }
+          },
+        },
+      },
+    );
+    try {
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).rejects.toBeInstanceOf(ResearchLoopError);
+    } finally {
+      fixture.runtime.close();
+    }
+
+    await writeFile(
+      join(fixture.sourceRoot, "journal.md"),
+      "这份新内容不能覆盖已提交的 observation。\n",
+      "utf8",
+    );
+    const restartedModel = new ScriptedModel([], [], [
+      turn("complete", "complete_research", { unresolvedQuestions: [] }),
+    ]);
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputRoot,
+      model: restartedModel,
+      clock: fixedClock(),
+      ids: sequentialIds(100),
+    });
+    try {
+      const completed = await restarted.advanceResearch({ runId: fixture.runId });
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        sourceReadObservations: [expect.objectContaining({
+          status: "succeeded",
+          excerpt: "Run Journal 是 canonical history。",
+        })],
+      });
+      if (completed.state.type !== "research_complete") {
+        throw new Error("测试要求 research_complete");
+      }
+      expect(completed.state.sourceReadObservations).toHaveLength(1);
+      expect(completed.state.researchToolObservations.filter(
+        (observation) => observation.toolName === "read_source",
+      )).toEqual([expect.objectContaining({ status: "succeeded" })]);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it.each(structuredResearchToolRecoveryCases)(
+    "retries $toolName after interruption before its Journal commit",
+    async ({ toolName, turns, intentId, collection, beforeHook }) => {
+      const fixture = await createApprovedLoopRun(turns, {}, {
+        researchLoopHooks: lifecycleInterrupt(
+          beforeHook,
+          `interrupt before ${toolName} commit`,
+        ),
+      });
+      try {
+        await expect(
+          fixture.runtime.advanceResearch({ runId: fixture.runId }),
+        ).rejects.toBeInstanceOf(ResearchLoopError);
+        const interrupted = await fixture.runtime.inspectRun({
+          runId: fixture.runId,
+        });
+        if (interrupted.state.type !== "researching") {
+          throw new Error("测试要求 researching");
+        }
+        expect(interrupted.state.pendingToolIntents).toEqual([
+          expect.objectContaining({ intentId }),
+        ]);
+        expect(interrupted.state[collection]).toEqual([]);
+      } finally {
+        fixture.runtime.close();
+      }
+
+      const { runtime: restarted, model: restartedModel } = restartLoop(fixture);
+      try {
+        const completed = await restarted.advanceResearch({ runId: fixture.runId });
+        if (completed.state.type !== "research_complete") {
+          throw new Error("测试要求 research_complete");
+        }
+        expect(completed.state[collection]).toHaveLength(1);
+        expect(restartedModel.researchViews).toHaveLength(1);
+      } finally {
+        restarted.close();
+      }
+    },
+  );
+
+  it.each(structuredResearchToolRecoveryCases)(
+    "does not repeat $toolName after its Journal event committed",
+    async ({ toolName, turns, collection, afterHook }) => {
+      const fixture = await createApprovedLoopRun(turns, {}, {
+        researchLoopHooks: lifecycleInterrupt(
+          afterHook,
+          `interrupt after ${toolName} commit`,
+        ),
+      });
+      try {
+        await expect(
+          fixture.runtime.advanceResearch({ runId: fixture.runId }),
+        ).rejects.toBeInstanceOf(ResearchLoopError);
+      } finally {
+        fixture.runtime.close();
+      }
+
+      const { runtime: restarted } = restartLoop(fixture);
+      try {
+        const completed = await restarted.advanceResearch({ runId: fixture.runId });
+        if (completed.state.type !== "research_complete") {
+          throw new Error("测试要求 research_complete");
+        }
+        expect(completed.state[collection]).toHaveLength(1);
+        expect(completed.state.researchToolObservations.filter(
+          (observation) => observation.toolName === toolName,
+        )).toEqual([expect.objectContaining({ status: "succeeded" })]);
+      } finally {
+        restarted.close();
+      }
+    },
+  );
+
+  it("retries complete_research after interruption before its Journal commit", async () => {
+    let interruptOnce = true;
+    const fixture = await createApprovedLoopRun(
+      [turn("complete", "complete_research", { unresolvedQuestions: [] })],
+      {},
+      {
+        researchLoopHooks: {
+          beforeCompletionJournalAppend: () => {
+            if (interruptOnce) {
+              interruptOnce = false;
+              throw new Error("interrupt before completion commit");
+            }
+          },
+        },
+      },
+    );
+    try {
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).rejects.toBeInstanceOf(ResearchLoopError);
+      await expect(
+        fixture.runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "researching",
+          pendingToolIntents: [expect.objectContaining({ intentId: "complete" })],
+        },
+      });
+    } finally {
+      fixture.runtime.close();
+    }
+
+    const restartedModel = new ScriptedModel([], [], []);
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputRoot,
+      model: restartedModel,
+      clock: fixedClock(),
+      ids: sequentialIds(100),
+    });
+    try {
+      await expect(
+        restarted.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "research_complete" } });
+      expect(restartedModel.researchViews).toEqual([]);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("atomically commits completion and budget exhaustion before post-commit interruption", async () => {
+    let interruptOnce = true;
+    const fixture = await createApprovedLoopRun(
+      [turn("complete", "complete_research", { unresolvedQuestions: [] })],
+      { maxModelTurns: 2 },
+      {
+        researchLoopHooks: {
+          afterCompletionJournalAppend: () => {
+            if (interruptOnce) {
+              interruptOnce = false;
+              throw new Error("interrupt after completion batch commit");
+            }
+          },
+        },
+      },
+    );
+    try {
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).rejects.toBeInstanceOf(ResearchLoopError);
+      await expect(
+        fixture.runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "budget_exhausted",
+          researchOutcome: "research_complete",
+          exhaustedDimension: "model_turns",
+          completion: { unresolvedQuestions: [] },
+        },
+      });
+      const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+      expect(trace.events.slice(-2).map((event) => event.type)).toEqual([
+        "research_completed",
+        "run_budget_exhausted",
+      ]);
+    } finally {
+      fixture.runtime.close();
+    }
+
+    const restartedModel = new ScriptedModel([], [], []);
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputRoot,
+      model: restartedModel,
+      clock: fixedClock(),
+      ids: sequentialIds(100),
+    });
+    try {
+      await expect(
+        restarted.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "budget_exhausted" } });
+      expect(restartedModel.researchViews).toEqual([]);
+    } finally {
+      restarted.close();
+    }
+  });
+
   it("rejects a generic success observation that tries to impersonate read_source", async () => {
     const fixture = await createApprovedLoopRun([]);
     fixture.runtime.close();
@@ -973,6 +1288,45 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
     }
   });
 
+  it("recomputes the exhausted dimension when wall time overtakes model turns", async () => {
+    let clockCalls = 0;
+    const clock: Clock = {
+      now: () =>
+        clockCalls++ < 6
+          ? "2026-08-12T08:00:00.000Z"
+          : "2026-08-12T08:00:00.001Z",
+    };
+    const fixture = await createApprovedLoopRun(
+      [turn("search", "search_sources", { query: "canonical", maxResults: 5 })],
+      { maxModelTurns: 2, maxWallTimeMs: 1 },
+      { clock },
+    );
+    try {
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "budget_exhausted",
+          exhaustedDimension: "wall_time",
+          remainingBudget: {
+            modelTurns: 0,
+            wallTimeMs: 0,
+          },
+        },
+      });
+      await expect(
+        fixture.runtime.rebuildRunProjection({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "budget_exhausted",
+          exhaustedDimension: "wall_time",
+        },
+      });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
   it("suspends after explicit completion when the final Model Turn exhausts the budget", async () => {
     const fixture = await createApprovedLoopRun(
       [
@@ -1147,6 +1501,92 @@ function turn(
     evidenceGaps: [],
     finishReason: "tool_calls" as const,
     toolIntents: [{ intentId, name, input }],
+  };
+}
+
+const structuredResearchToolRecoveryCases = [
+  {
+    toolName: "record_evidence",
+    intentId: "evidence",
+    collection: "evidenceRecords",
+    beforeHook: "beforeEvidenceJournalAppend",
+    afterHook: "afterEvidenceJournalAppend",
+    turns: [
+      turn("read", "read_source", {
+        rootIndex: 0,
+        relativePath: "journal.md",
+        startLine: 1,
+        endLine: 1,
+      }),
+      turn("evidence", "record_evidence", { observationId: "observation-001" }),
+    ],
+  },
+  {
+    toolName: "propose_claim",
+    intentId: "claim",
+    collection: "claims",
+    beforeHook: "beforeClaimJournalAppend",
+    afterHook: "afterClaimJournalAppend",
+    turns: [
+      turn("read", "read_source", {
+        rootIndex: 0,
+        relativePath: "journal.md",
+        startLine: 1,
+        endLine: 1,
+      }),
+      turn("evidence", "record_evidence", { observationId: "observation-001" }),
+      turn("claim", "propose_claim", {
+        kind: "source_fact",
+        text: "Run Journal 是 canonical history。",
+        evidenceIds: ["evidence-event-008"],
+      }),
+    ],
+  },
+] as const satisfies readonly {
+  /** 本恢复用例覆盖的模型可见 Research Tool。 */
+  readonly toolName: "record_evidence" | "propose_claim";
+  /** 中断时必须仍由 Projection 暴露的 durable pending intent identity。 */
+  readonly intentId: string;
+  /** commit 前后用于断言领域事实数量的 Projection collection。 */
+  readonly collection: "evidenceRecords" | "claims";
+  /** 领域 Journal event 尚未提交时触发中断的命名 Fault Injection Point。 */
+  readonly beforeHook: keyof ResearchLoopLifecycleHooks;
+  /** 领域 Journal event 已 durable 提交后触发中断的命名 Fault Injection Point。 */
+  readonly afterHook: keyof ResearchLoopLifecycleHooks;
+  /** 到达目标工具所需的确定性 Scripted Model turns。 */
+  readonly turns: ConstructorParameters<typeof ScriptedModel>[2];
+}[];
+
+function lifecycleInterrupt(
+  hook: keyof ResearchLoopLifecycleHooks,
+  message: string,
+): ResearchLoopLifecycleHooks {
+  let interruptOnce = true;
+  return {
+    [hook]: () => {
+      if (interruptOnce) {
+        interruptOnce = false;
+        throw new Error(message);
+      }
+    },
+  };
+}
+
+function restartLoop(
+  fixture: Awaited<ReturnType<typeof createApprovedLoopRun>>,
+) {
+  const model = new ScriptedModel([], [], [
+    turn("complete", "complete_research", { unresolvedQuestions: [] }),
+  ]);
+  return {
+    model,
+    runtime: ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputRoot,
+      model,
+      clock: fixedClock(),
+      ids: sequentialIds(100),
+    }),
   };
 }
 
