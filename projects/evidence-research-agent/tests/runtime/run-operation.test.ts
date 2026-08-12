@@ -425,12 +425,8 @@ describe("ResearchAgentRuntime durable Run Operations", () => {
       "2026-08-12T10:00:00.000Z",
     );
     let enterStream: (() => void) | undefined;
-    let releaseStream: (() => void) | undefined;
     const entered = new Promise<void>((resolve) => {
       enterStream = resolve;
-    });
-    const released = new Promise<void>((resolve) => {
-      releaseStream = resolve;
     });
     const runtime = ResearchAgentRuntime.open({
       runtimeHome,
@@ -442,19 +438,16 @@ describe("ResearchAgentRuntime durable Run Operations", () => {
         proposeLearningArtifact: async () => {
           throw new Error("测试不会生成 Learning Artifact");
         },
-        generateResearchTurn: async () => {
+        generateResearchTurn: async (_view, options) => {
           enterStream?.();
-          await released;
-          return {
-            text: "过期 owner 返回时 Run 已被 durable 取消。",
-            evidenceGaps: [],
-            finishReason: "tool_calls",
-            toolIntents: [{
-              intentId: "expired-owner-complete",
-              name: "complete_research",
-              input: { unresolvedQuestions: [] },
-            }],
-          };
+          await new Promise<void>((_resolve, reject) => {
+            options?.abortSignal?.addEventListener(
+              "abort",
+              () => reject(new ModelGenerationAbortedError()),
+              { once: true },
+            );
+          });
+          throw new Error("unreachable");
         },
       },
     });
@@ -469,10 +462,9 @@ describe("ResearchAgentRuntime durable Run Operations", () => {
         lastEventSequence: 5,
         state: { type: "cancelled" },
       });
-      releaseStream?.();
-      await expect(staleAdvance).rejects.toMatchObject({
-        name: "ResearchLoopError",
-      });
+      await expect(staleAdvance).rejects.toBeInstanceOf(
+        ModelGenerationAbortedError,
+      );
       await expect(runtime.inspectRunOperation({ runId })).resolves.toMatchObject({
         lease: undefined,
         cancellationRequest: {
@@ -481,7 +473,6 @@ describe("ResearchAgentRuntime durable Run Operations", () => {
         },
       });
     } finally {
-      releaseStream?.();
       runtime.close();
     }
   });
