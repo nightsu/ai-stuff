@@ -39,6 +39,30 @@ export function formatRunTrace(
         event.learningArtifactSha256 === undefined
           ? undefined
           : `published-sha256=${event.learningArtifactSha256}`,
+        event.operationId === undefined
+          ? undefined
+          : `operation=${event.operationId}`,
+        event.operationKind === undefined
+          ? undefined
+          : `operation-kind=${event.operationKind}`,
+        event.attemptNumber === undefined
+          ? undefined
+          : `attempt=${event.attemptNumber}`,
+        event.attemptOutcome === undefined
+          ? undefined
+          : `outcome=${event.attemptOutcome}`,
+        event.attemptDurationMs === undefined
+          ? undefined
+          : `duration-ms=${event.attemptDurationMs}`,
+        event.retryPolicyVersion === undefined
+          ? undefined
+          : `retry-policy=${event.retryPolicyVersion}`,
+        event.failureCategory === undefined || event.failureCode === undefined
+          ? undefined
+          : `failure=${event.failureCategory}/${event.failureCode}`,
+        event.retryDelayMs === undefined
+          ? undefined
+          : `retry-delay-ms=${event.retryDelayMs}`,
       ].filter((value): value is string => value !== undefined);
       return `#${event.sequence} ${event.type} → ${event.stateAfter} (${event.occurredAt})${lineage.length === 0 ? "" : ` [${lineage.join(" ")}]`}`;
     }),

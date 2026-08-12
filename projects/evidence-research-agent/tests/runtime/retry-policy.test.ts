@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createPlanApprovalBinding,
+  formatRunTrace,
   InfrastructureFailureError,
   ResearchAgentRuntime,
 } from "../../src/index.js";
@@ -160,6 +161,9 @@ describe("ResearchAgentRuntime retry policy", () => {
           attemptOutcome: "succeeded",
         }),
       ]));
+      expect(formatRunTrace(trace, "human")).toContain(
+        "operation-kind=model_turn attempt=1 outcome=retryable_failure duration-ms=5 retry-policy=retry-v1 failure=infrastructure_transient/rate_limited retry-delay-ms=250",
+      );
     } finally {
       runtime.close();
     }
