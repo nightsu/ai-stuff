@@ -353,6 +353,62 @@ describe("ResearchAgentRuntime durable Run control", () => {
     }
   });
 
+  it("actively aborts an in-flight model stream after cancelRun commits the terminal fact", async () => {
+    const runtimeHome = await temporaryDirectory("run-active-cancel-stream-");
+    const sourceRoot = await temporaryDirectory("run-active-cancel-source-");
+    let enteredStream: (() => void) | undefined;
+    const streamStarted = new Promise<void>((resolve) => {
+      enteredStream = resolve;
+    });
+    let receivedSignal: AbortSignal | undefined;
+    const model: ModelPort = {
+      proposePlan: async () => learningPlan(),
+      proposeLearningArtifact: async () => {
+        throw new Error("测试不会生成 Learning Artifact");
+      },
+      generateResearchTurn: async (_view, options) => {
+        receivedSignal = options?.abortSignal;
+        enteredStream?.();
+        await new Promise<void>((_resolve, reject) => {
+          options?.abortSignal?.addEventListener(
+            "abort",
+            () => reject(new ModelGenerationAbortedError()),
+            { once: true },
+          );
+        });
+        throw new Error("unreachable");
+      },
+    };
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      clock: fixedClock(),
+      ids: sequentialIds(),
+    });
+
+    try {
+      const waiting = await createWaitingRun(runtime, sourceRoot);
+      if (waiting.state.type !== "waiting_plan_approval") {
+        throw new Error("测试夹具没有等待计划审批");
+      }
+      await runtime.approvePlan({
+        runId: waiting.runId,
+        bindingHash: waiting.state.approvalBinding.bindingHash,
+      });
+
+      const advancing = runtime.advanceResearch({ runId: waiting.runId });
+      await streamStarted;
+      const cancelled = await runtime.cancelRun({ runId: waiting.runId });
+      expect(cancelled.state.type).toBe("cancelled");
+      await expect(advancing).rejects.toBeInstanceOf(ModelGenerationAbortedError);
+      expect(receivedSignal?.aborted).toBe(true);
+      await expect(runtime.advanceResearch({ runId: waiting.runId }))
+        .resolves.toMatchObject({ state: { type: "cancelled" } });
+    } finally {
+      runtime.close();
+    }
+  });
+
   it("closes the durable Retry Attempt when cancellation aborts a model stream", async () => {
     const runtimeHome = await temporaryDirectory("run-cancel-retry-stream-");
     const sourceRoot = await temporaryDirectory("run-cancel-retry-source-");
@@ -810,6 +866,66 @@ describe("ResearchAgentRuntime durable Run control", () => {
       });
     } finally {
       runtime.close();
+    }
+  });
+
+  it("reopens and rebuilds a cancelled completed-origin budget suspension", async () => {
+    const runtimeHome = await temporaryDirectory("run-budget-cancel-reopen-");
+    const sourceRoot = await temporaryDirectory("run-budget-cancel-source-");
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: completionModel(true),
+      clock: fixedClock(),
+      ids: sequentialIds(),
+    });
+    let runId: string;
+    try {
+      const waiting = await createWaitingRunWithBudget(runtime, sourceRoot, {
+        maxToolCalls: 1,
+      });
+      runId = waiting.runId;
+      if (waiting.state.type !== "waiting_plan_approval") {
+        throw new Error("测试夹具没有等待计划审批");
+      }
+      await runtime.approvePlan({
+        runId,
+        bindingHash: waiting.state.approvalBinding.bindingHash,
+      });
+      const exhausted = await runtime.advanceResearch({ runId });
+      expect(exhausted.state).toMatchObject({
+        type: "budget_exhausted",
+        researchOutcome: "research_complete",
+      });
+      await runtime.cancelRun({ runId });
+    } finally {
+      runtime.close();
+    }
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: new ScriptedModel([]),
+    });
+    try {
+      await expect(restarted.inspectRun({ runId })).resolves.toMatchObject({
+        state: {
+          type: "cancelled",
+          cancelledState: {
+            type: "budget_exhausted",
+            researchOutcome: "research_complete",
+          },
+        },
+      });
+      await expect(restarted.rebuildRunProjection({ runId })).resolves.toMatchObject({
+        state: {
+          type: "cancelled",
+          cancelledState: {
+            type: "budget_exhausted",
+            researchOutcome: "research_complete",
+          },
+        },
+      });
+    } finally {
+      restarted.close();
     }
   });
 

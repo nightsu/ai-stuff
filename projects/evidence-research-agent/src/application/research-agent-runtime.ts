@@ -740,6 +740,8 @@ export class ResearchAgentRuntime {
   readonly #retryEnabled: boolean;
   /** 自动 retry 之间执行等待的可注入边界。 */
   readonly #retryScheduler: RetryScheduler;
+  /** 当前 Runtime 进程内由 `advanceResearch` 持有的 provider cancellation controllers。 */
+  readonly #activeResearchControllers = new Map<string, AbortController>();
 
   private constructor(options: OpenRuntimeOptions) {
     // 两个 store 只能收到同一次集中准备得到的 canonical Runtime Home，避免
@@ -946,10 +948,17 @@ export class ResearchAgentRuntime {
     }
     const { runId, steering, abortSignal } = parsedCommand.data;
 
+    const operationController = new AbortController();
+    const modelAbortSignal = abortSignal === undefined
+      ? operationController.signal
+      : AbortSignal.any([abortSignal, operationController.signal]);
+    this.#activeResearchControllers.set(runId, operationController);
+
     // 每个迭代只做三件事：从 Journal 重建视图、提交一个完整 Model Turn、
     // 顺序消费其 intents。任何一步崩溃后，canonical Projection 都能指出是该
     // 重新 generation，还是先完成已经 durable 的 pending intent。
-    while (true) {
+    try {
+      while (true) {
       const current = this.#store.readProjection(runId);
       if (
         current.state.type === "budget_exhausted" ||
@@ -1031,7 +1040,9 @@ export class ResearchAgentRuntime {
         let generated: z.infer<typeof researchTurnOutputSchema>;
         try {
           generated = researchTurnOutputSchema.parse(
-            await this.#model.generateResearchTurn(view, { abortSignal }),
+            await this.#model.generateResearchTurn(view, {
+              abortSignal: modelAbortSignal,
+            }),
           );
         } catch (error) {
           if (error instanceof ModelGenerationAbortedError) throw error;
@@ -1096,7 +1107,9 @@ export class ResearchAgentRuntime {
         generated = researchTurnOutputSchema.parse(
           // AbortSignal 只控制当前物理 provider attempt；Harness 不会把已收到但
           // 未完成的 delta 记作 Model Turn，重启仍从 durable attempt fact 恢复。
-          await this.#model.generateResearchTurn(view, { abortSignal }),
+          await this.#model.generateResearchTurn(view, {
+            abortSignal: modelAbortSignal,
+          }),
         );
       } catch (error) {
         if (error instanceof ModelGenerationAbortedError) {
@@ -1156,6 +1169,11 @@ export class ResearchAgentRuntime {
         );
       } catch {
         throw new ResearchLoopError();
+      }
+      }
+    } finally {
+      if (this.#activeResearchControllers.get(runId) === operationController) {
+        this.#activeResearchControllers.delete(runId);
       }
     }
   }
@@ -2775,7 +2793,7 @@ export class ResearchAgentRuntime {
     const current = this.#store.readProjection(runId);
     if (current.state.type === "cancelled") return current;
     const occurredAt = this.#clock.now();
-    return this.#store.appendEvents(runId, current.lastEventSequence, [{
+    const cancelled = this.#store.appendEvents(runId, current.lastEventSequence, [{
       eventId: this.#ids.nextEventId(),
       runId,
       sequence: current.lastEventSequence + 1,
@@ -2783,6 +2801,11 @@ export class ResearchAgentRuntime {
       occurredAt,
       payload: {},
     }]);
+    // Journal terminal fact 必须先成功提交，再中止当前 Runtime 进程里的 provider
+    // stream；否则 abort 已发生但 cancellation 未 durable 时，重启可能错误恢复工作。
+    // 跨进程 durable request 与 stale owner recovery 明确由后继 Issue #10 交付。
+    this.#activeResearchControllers.get(runId)?.abort();
+    return cancelled;
   }
 
   public async extendRunBudget(

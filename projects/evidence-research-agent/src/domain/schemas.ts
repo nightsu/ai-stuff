@@ -754,6 +754,16 @@ const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
         remainingBudget: remainingRunBudgetSchema,
       }),
       z.object({
+        type: z.literal("budget_exhausted"),
+        ...evidenceBackedStateFields,
+        researchOutcome: z.literal("research_complete"),
+        completion: researchCompletionSchema,
+        exhaustedDimension: z.enum([
+          "model_turns", "tool_calls", "distinct_sources", "source_bytes", "wall_time",
+        ]),
+        remainingBudget: remainingRunBudgetSchema,
+      }),
+      z.object({
         type: z.literal("retry_exhausted"),
         ...evidenceBackedStateFields,
         retrySequenceId: z.string().trim().min(1),
