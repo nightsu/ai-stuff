@@ -90,8 +90,22 @@ export interface OpenRuntimeOptions {
   readonly ids?: IdGenerator;
   /** 可选 Source Search Port；测试可替换 host `rg` 与 discovery 故障。 */
   readonly sourceSearch?: SourceSearchPort;
+  /** 可选 Research Loop 命名生命周期点；仅用于确定性崩溃/恢复测试。 */
+  readonly researchLoopHooks?: ResearchLoopLifecycleHooks;
   /** 单个 Model View 允许的确定性 JSON UTF-8 字节数；不足以容纳 pinned facts 时暂停。 */
   readonly maxModelViewBytes?: number;
+}
+
+/** Research Loop durable 边界上的命名故障注入点。 */
+export interface ResearchLoopLifecycleHooks {
+  /** 完整 Model Turn 已构造、但尚未追加 Journal 前运行。 */
+  readonly beforeModelTurnJournalAppend?: () => void | Promise<void>;
+  /** `model_turn_completed` 已 durable 提交、但 pending intent 尚未执行前运行。 */
+  readonly afterModelTurnJournalAppend?: () => void | Promise<void>;
+  /** search JSON Artifact 已写入 CAS、但尚未被 Journal/registry 引用前运行。 */
+  readonly afterSearchResultArtifactWrite?: () => void | Promise<void>;
+  /** search observation 与 Artifact registry 已同事务提交后运行。 */
+  readonly afterSearchObservationJournalAppend?: () => void | Promise<void>;
 }
 
 /** 创建新 Research Run 的应用命令。 */
@@ -584,6 +598,8 @@ export class ResearchAgentRuntime {
   readonly #publisher: LearningArtifactPublisher;
   /** 执行模型可见 `search_sources` 且可由测试注入的 discovery 边界。 */
   readonly #sourceSearch: SourceSearchPort;
+  /** durable 边界上的可选命名中断点；生产默认全部为空。 */
+  readonly #researchLoopHooks: ResearchLoopLifecycleHooks;
   /** 不依赖 tokenizer/provider 的确定性 JSON byte 上限。 */
   readonly #maxModelViewBytes: number;
 
@@ -604,6 +620,9 @@ export class ResearchAgentRuntime {
         : { outputRoot: options.outputRoot }),
     });
     this.#sourceSearch = options.sourceSearch ?? new RgSourceSearch();
+    this.#researchLoopHooks = Object.freeze({
+      ...(options.researchLoopHooks ?? {}),
+    });
   }
 
   public static open(options: OpenRuntimeOptions): ResearchAgentRuntime {
@@ -779,11 +798,21 @@ export class ResearchAgentRuntime {
     // 重新 generation，还是先完成已经 durable 的 pending intent。
     while (true) {
       const current = this.#store.readProjection(runId);
-      if (
-        current.state.type === "research_complete" ||
-        current.state.type === "budget_exhausted"
-      ) {
+      if (current.state.type === "budget_exhausted") {
         return current;
+      }
+      if (current.state.type === "research_complete") {
+        const remainingBudget = this.#remainingBudget(
+          current,
+          this.#clock.now(),
+        );
+        const exhausted = firstExhaustedRunBudgetDimension(
+          remainingBudget,
+          "model",
+        );
+        return exhausted === undefined
+          ? current
+          : this.#suspendForBudget(current, exhausted);
       }
       if (current.state.type !== "researching") {
         throw new ResearchLoopError();
@@ -839,7 +868,13 @@ export class ResearchAgentRuntime {
         },
       };
       try {
+        await this.#runResearchLoopHook(
+          this.#researchLoopHooks.beforeModelTurnJournalAppend,
+        );
         this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+        await this.#runResearchLoopHook(
+          this.#researchLoopHooks.afterModelTurnJournalAppend,
+        );
       } catch {
         throw new ResearchLoopError();
       }
@@ -986,17 +1021,32 @@ export class ResearchAgentRuntime {
       this.#appendGenericToolObservation(current, intent, "invalid", "invalid_tool_schema");
       return;
     }
+    let matches: readonly SourceSearchMatch[];
     try {
-      const matches = await this.#sourceSearch.search(
+      matches = await this.#sourceSearch.search(
         current.sourceScope,
         parsed.data,
       );
-      const observedAt = this.#clock.now();
-      const artifact = await this.#artifacts.putJson(
+    } catch {
+      this.#appendGenericToolObservation(current, intent, "failed", "search_failed");
+      return;
+    }
+    const observedAt = this.#clock.now();
+    let artifact: PersistedArtifact;
+    try {
+      artifact = await this.#artifacts.putJson(
         matches,
         "application/json",
         observedAt,
       );
+    } catch {
+      this.#appendGenericToolObservation(current, intent, "failed", "search_failed");
+      return;
+    }
+    await this.#runResearchLoopHook(
+      this.#researchLoopHooks.afterSearchResultArtifactWrite,
+    );
+    try {
       const observation = this.#createResearchObservation(
         intent,
         "succeeded",
@@ -1022,8 +1072,24 @@ export class ResearchAgentRuntime {
         [event],
         [artifact],
       );
+      await this.#runResearchLoopHook(
+        this.#researchLoopHooks.afterSearchObservationJournalAppend,
+      );
     } catch {
-      this.#appendGenericToolObservation(current, intent, "failed", "search_failed");
+      throw new ResearchLoopError();
+    }
+  }
+
+  async #runResearchLoopHook(
+    hook: (() => void | Promise<void>) | undefined,
+  ): Promise<void> {
+    if (hook === undefined) return;
+    try {
+      await hook();
+    } catch {
+      // hook 模拟的是进程在 durable seam 处中断；public boundary 只暴露稳定
+      // ResearchLoopError，测试通过重启后的 Journal 事实判断副作用是否已提交。
+      throw new ResearchLoopError();
     }
   }
 

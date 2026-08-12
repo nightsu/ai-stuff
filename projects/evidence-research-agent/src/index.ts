@@ -55,6 +55,7 @@ export type {
   ModelPort,
   PlanRequest,
   SourceSearchPort,
+  SourceSearchRequest,
 } from "./application/ports.js";
 export type {
   AdvanceResearchCommand,
@@ -69,6 +70,7 @@ export type {
   RecordClaimCommand,
   RecordEvidenceCommand,
   RebuildRunProjectionCommand,
+  ResearchLoopLifecycleHooks,
   TraceRunCommand,
 } from "./application/research-agent-runtime.js";
 export type {

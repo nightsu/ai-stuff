@@ -558,8 +558,11 @@ function applyRunEvent(
       };
     }
     case "run_budget_exhausted": {
-      if (current.state.type !== "researching") {
-        throw new IllegalRunEventError("只有 researching Run 可以因预算暂停");
+      if (
+        current.state.type !== "researching" &&
+        current.state.type !== "research_complete"
+      ) {
+        throw new IllegalRunEventError("只有 active Research Loop 可以因预算暂停");
       }
       const expectedRemaining = remainingBudgetFromProjection(
         current,
@@ -577,12 +580,22 @@ function applyRunEvent(
       }
       return {
         ...current,
-        state: {
-          ...current.state,
-          type: "budget_exhausted",
-          exhaustedDimension: event.payload.exhaustedDimension,
-          remainingBudget: event.payload.remainingBudget,
-        },
+        state:
+          current.state.type === "research_complete"
+            ? {
+                ...current.state,
+                type: "budget_exhausted",
+                researchOutcome: "research_complete",
+                exhaustedDimension: event.payload.exhaustedDimension,
+                remainingBudget: event.payload.remainingBudget,
+              }
+            : {
+                ...current.state,
+                type: "budget_exhausted",
+                researchOutcome: "incomplete",
+                exhaustedDimension: event.payload.exhaustedDimension,
+                remainingBudget: event.payload.remainingBudget,
+              },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
@@ -604,18 +617,65 @@ function applyRunEvent(
           "进入 Research Loop 后必须先显式完成研究",
         );
       }
+      if (
+        current.state.type === "research_complete" &&
+        (
+          current.state.modelTurns.length === 0 ||
+          current.state.researchToolObservations.length === 0 ||
+          current.state.researchStartedAt === undefined
+        )
+      ) {
+        throw new IllegalRunEventError("Research Loop publication provenance 不完整");
+      }
       validateLearningArtifactDraft(current, event.payload, event.occurredAt);
+      const publicationFields = {
+        planArtifact: current.state.planArtifact,
+        approvalReceipt: current.state.approvalReceipt,
+        sourceReadObservations: current.state.sourceReadObservations,
+        sourceBytesRead: current.state.sourceBytesRead,
+        evidenceRecords: current.state.evidenceRecords,
+        claims: current.state.claims,
+        draftArtifact: event.payload.draftArtifact,
+        proposal: event.payload.proposal,
+        publicationTarget: event.payload.publicationTarget,
+        publicationBinding: event.payload.publicationBinding,
+      } as const;
       return {
         ...current,
-        state: {
-          ...current.state,
-          type: "waiting_publication_approval",
-          draftArtifact: event.payload.draftArtifact,
-          proposal: event.payload.proposal,
-          publicationTarget: event.payload.publicationTarget,
-          publicationBinding: event.payload.publicationBinding,
-          proposedAt: event.occurredAt,
-        },
+        state:
+          current.state.type === "research_complete"
+            ? {
+                ...publicationFields,
+                type: "waiting_publication_approval",
+                researchOrigin: "research_loop",
+                modelTurns: current.state.modelTurns as readonly [
+                  (typeof current.state.modelTurns)[number],
+                  ...(typeof current.state.modelTurns)[number][],
+                ],
+                researchToolObservations:
+                  current.state.researchToolObservations as readonly [
+                    (typeof current.state.researchToolObservations)[number],
+                    ...(typeof current.state.researchToolObservations)[number][],
+                  ],
+                evidenceGaps: current.state.evidenceGaps,
+                pendingToolIntents: [],
+                ...(current.state.latestSteering === undefined
+                  ? {}
+                  : { latestSteering: current.state.latestSteering }),
+                researchStartedAt: current.state.researchStartedAt as string,
+                completion: current.state.completion,
+                proposedAt: event.occurredAt,
+              }
+            : {
+                ...publicationFields,
+                type: "waiting_publication_approval",
+                researchOrigin: "legacy_explicit",
+                modelTurns: [],
+                researchToolObservations: [],
+                evidenceGaps: [],
+                pendingToolIntents: [],
+                proposedAt: event.occurredAt,
+              },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
@@ -675,8 +735,11 @@ function remainingBudgetFromProjection(
   projection: RunProjection,
   evaluatedAt: string,
 ): import("./types.js").RemainingRunBudget {
-  if (projection.state.type !== "researching") {
-    throw new IllegalRunEventError("只有 researching Projection 可计算剩余预算");
+  if (
+    projection.state.type !== "researching" &&
+    projection.state.type !== "research_complete"
+  ) {
+    throw new IllegalRunEventError("只有 active Research Loop 可计算剩余预算");
   }
   try {
     return calculateRemainingRunBudget({

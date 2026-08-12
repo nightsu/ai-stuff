@@ -68,11 +68,14 @@ export interface SourceSearchPort {
   /** 在已批准 Source Scope 内返回原始顺序的有界匹配，不创建 Source Snapshot。 */
   search(
     scope: SourceScope,
-    request: {
-      /** 非空 literal query；实现不得把它解释为 shell 参数。 */
-      readonly query: string;
-      /** 全部 roots 合计允许返回的最大命中数。 */
-      readonly maxResults: number;
-    },
+    request: SourceSearchRequest,
   ): Promise<readonly SourceSearchMatch[]>;
+}
+
+/** `search_sources` Port 的 Harness-owned 有界请求。 */
+export interface SourceSearchRequest {
+  /** 非空 literal query；实现不得把它解释为 shell 参数。 */
+  readonly query: string;
+  /** 全部 roots 合计允许返回的最大命中数。 */
+  readonly maxResults: number;
 }

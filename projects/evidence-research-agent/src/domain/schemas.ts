@@ -25,6 +25,7 @@ import type {
   RequestedSourceScope,
   RunBudget,
   RunProjection,
+  ResearchRunState,
   SourceReadObservation,
   SourceScope,
   SourceSnapshotReference,
@@ -457,7 +458,44 @@ const researchCompletionSchema = z.object({
   completedAt: z.iso.datetime(),
 }).strict();
 
-const runStateSchema = z.discriminatedUnion("type", [
+const publicationCommonStateFields = {
+  planArtifact: artifactReferenceSchema,
+  approvalReceipt: planApprovalReceiptSchema,
+  sourceReadObservations: z.array(sourceReadObservationSchema),
+  sourceBytesRead: z.number().int().nonnegative(),
+  evidenceRecords: z.array(evidenceRecordSchema),
+  claims: z.array(claimSchema),
+  draftArtifact: artifactReferenceSchema,
+  proposal: learningArtifactProposalSchema,
+  publicationTarget: publicationTargetSchema,
+  publicationBinding: publicationApprovalBindingSchema,
+};
+
+const legacyExplicitPublicationFields = {
+  ...publicationCommonStateFields,
+  researchOrigin: z.literal("legacy_explicit"),
+  modelTurns: z.tuple([]),
+  researchToolObservations: z.tuple([]),
+  evidenceGaps: z.tuple([]),
+  pendingToolIntents: z.tuple([]),
+};
+
+const researchLoopPublicationFields = {
+  ...publicationCommonStateFields,
+  researchOrigin: z.literal("research_loop"),
+  modelTurns: z.tuple([modelTurnSchema], modelTurnSchema),
+  researchToolObservations: z.tuple(
+    [researchToolObservationSchema],
+    researchToolObservationSchema,
+  ),
+  evidenceGaps: z.array(z.string().trim().min(1)),
+  pendingToolIntents: z.tuple([]),
+  latestSteering: z.string().trim().min(1).optional(),
+  researchStartedAt: z.iso.datetime(),
+  completion: researchCompletionSchema,
+};
+
+const runStateSchema = z.union([
   z.object({ type: z.literal("created") }),
   z.object({
     type: z.literal("planning"),
@@ -481,6 +519,21 @@ const runStateSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("budget_exhausted"),
     ...evidenceBackedStateFields,
+    researchOutcome: z.literal("incomplete"),
+    exhaustedDimension: z.enum([
+      "model_turns",
+      "tool_calls",
+      "distinct_sources",
+      "source_bytes",
+      "wall_time",
+    ]),
+    remainingBudget: remainingRunBudgetSchema,
+  }),
+  z.object({
+    type: z.literal("budget_exhausted"),
+    ...evidenceBackedStateFields,
+    researchOutcome: z.literal("research_complete"),
+    completion: researchCompletionSchema,
     exhaustedDimension: z.enum([
       "model_turns",
       "tool_calls",
@@ -492,36 +545,37 @@ const runStateSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("waiting_publication_approval"),
-    ...evidenceBackedStateFields,
-    draftArtifact: artifactReferenceSchema,
-    proposal: learningArtifactProposalSchema,
-    publicationTarget: publicationTargetSchema,
-    publicationBinding: publicationApprovalBindingSchema,
+    ...legacyExplicitPublicationFields,
     proposedAt: z.iso.datetime(),
-    completion: researchCompletionSchema.optional(),
-  }),
+  }).strict(),
+  z.object({
+    type: z.literal("waiting_publication_approval"),
+    ...researchLoopPublicationFields,
+    proposedAt: z.iso.datetime(),
+  }).strict(),
   z.object({
     type: z.literal("ready_to_publish"),
-    ...evidenceBackedStateFields,
-    draftArtifact: artifactReferenceSchema,
-    proposal: learningArtifactProposalSchema,
-    publicationTarget: publicationTargetSchema,
-    publicationBinding: publicationApprovalBindingSchema,
+    ...legacyExplicitPublicationFields,
     publicationReceipt: publicationApprovalReceiptSchema,
-    completion: researchCompletionSchema.optional(),
-  }),
+  }).strict(),
+  z.object({
+    type: z.literal("ready_to_publish"),
+    ...researchLoopPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+  }).strict(),
   z.object({
     type: z.literal("completed"),
-    ...evidenceBackedStateFields,
-    draftArtifact: artifactReferenceSchema,
-    proposal: learningArtifactProposalSchema,
-    publicationTarget: publicationTargetSchema,
-    publicationBinding: publicationApprovalBindingSchema,
+    ...legacyExplicitPublicationFields,
     publicationReceipt: publicationApprovalReceiptSchema,
     learningArtifact: publishedLearningArtifactSchema,
-    completion: researchCompletionSchema.optional(),
-  }),
-]);
+  }).strict(),
+  z.object({
+    type: z.literal("completed"),
+    ...researchLoopPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    learningArtifact: publishedLearningArtifactSchema,
+  }).strict(),
+]).transform((state): ResearchRunState => state);
 
 const runProjectionSchema = z.object({
   runId: z.string().min(1),

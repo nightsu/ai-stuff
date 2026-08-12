@@ -20,6 +20,7 @@ import {
   IllegalRunEventError,
   reduceRunEvents,
 } from "../../src/domain/reducer.js";
+import { parseRunProjection } from "../../src/domain/schemas.js";
 import { SqliteRunStore } from "../../src/infrastructure/sqlite-run-store.js";
 
 const temporaryDirectories: string[] = [];
@@ -43,6 +44,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
     });
     expect(waiting.state).toMatchObject({
       type: "waiting_publication_approval",
+      researchOrigin: "legacy_explicit",
       draftArtifact: {
         mediaType: "text/markdown; charset=utf-8",
       },
@@ -54,6 +56,22 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
     if (waiting.state.type !== "waiting_publication_approval") {
       throw new Error("测试要求等待 publication approval");
     }
+    const fabricatedCompletion = structuredClone(waiting) as unknown as Record<
+      string,
+      unknown
+    >;
+    const fabricatedCompletionState = fabricatedCompletion.state;
+    if (
+      typeof fabricatedCompletionState !== "object" ||
+      fabricatedCompletionState === null
+    ) {
+      throw new Error("测试要求 publication state object");
+    }
+    (fabricatedCompletionState as Record<string, unknown>).completion = {
+      unresolvedQuestions: [],
+      completedAt: "2026-08-12T08:00:00.000Z",
+    };
+    expect(() => parseRunProjection(fabricatedCompletion)).toThrow();
     const targetCanonicalPath = waiting.state.publicationTarget.targetCanonicalPath;
     fixture.runtime.close();
 

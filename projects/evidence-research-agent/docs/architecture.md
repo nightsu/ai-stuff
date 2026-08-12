@@ -83,7 +83,7 @@ flowchart LR
 
 `advanceResearch` 是当前主 seam。每轮开始时，Runtime 只从 Run Journal、derived Projection 和 plan artifact 构造新的 Model View；它不会把 Journal 或完整 `messages[]` 直接传给模型。fixed rules、批准计划、approval binding、预算版本与余额、pending intents、evidence gaps 和最新 steering 是 pinned facts。超过 Model View 字节上限时，Builder 先删除最旧 observations，再从尾部删除 Evidence；pinned facts 仍放不下便抛出 `ModelViewTooLargeError`，不请求 LLM 摘要隐藏约束。
 
-Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_turn_completed`。该事件同时把有序 tool intents 变为 durable pending work；重启后的 `advanceResearch` 会先消费这些 pending intents，而不是再次 generation。Issue #6 的 scheduler 刻意顺序执行全部 intents；safe sibling search/read 的并发和原始顺序回填留给 Issue #11。
+Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_turn_completed`。该事件同时把有序 tool intents 变为 durable pending work；重启后的 `advanceResearch` 会先消费这些 pending intents，而不是再次 generation。`ResearchLoopLifecycleHooks` 为测试暴露 Model Turn append 前/后、search Artifact 写入后和 search observation append 后四个命名中断点：若在 durable Model Turn 后中断，重启只执行 pending intent；若在 search CAS 写入但 Journal append 前中断，孤立 Artifact 不成为事实，重启重新执行仍 pending 的 search。Issue #6 的 scheduler 刻意顺序执行全部 intents；safe sibling search/read 的并发和原始顺序回填留给 Issue #11。
 
 `search_sources` 与 `read_source` 共享 Source Scope 权限边界。搜索通过可注入 `SourceSearchPort` 调用默认的固定参数 `rg` adapter，下推 extension、exclusion、secret 与 file-size 过滤，启动前复核批准 root identity，每个命中再过 realpath preflight。完整命中列表写入私有 JSON Artifact；Journal observation 只保存 artifact 引用和 `matchCount`，下一轮 Model View 再按需校验并展开最近结果。搜索仍不创建 Source Snapshot。只有成功 explicit read 才冻结完整原始 UTF-8 字节；`invalid`、`denied`、`stale` 与 `failed` 都只落安全 observation。Evidence Record 也没有读取 live file 的能力，只能由 Runtime 从已持久化的成功 observation 逐字段派生。
 
@@ -137,7 +137,9 @@ stateDiagram-v2
   end note
 ```
 
-`research_complete` 不是最终 terminal `completed`：它只表示模型通过 `complete_research` 显式结束调查并保存 unresolved questions，可以进入确定性 Gate。`budget_exhausted` 则是 suspended non-success；它保留 Model Turns、pending intents、observations、Evidence 与 Claims，但拒绝 draft/publication。Issue #9 才会加入新预算版本、重新审批和精确恢复。
+`research_complete` 不是最终 terminal `completed`：它只表示模型通过 `complete_research` 显式结束调查并保存 unresolved questions，可以进入确定性 Gate。完成工具返回后 Runtime 会用同一 canonical budget calculator 再检查 Model Turn 与 wall time；若此时刚好耗尽，Run 会进入 `budget_exhausted`，并以 `researchOutcome: research_complete` 保留 completion provenance，而不是伪装为可发布成功。更早暂停则保存 `researchOutcome: incomplete`。两者都是 suspended non-success，均拒绝 draft/publication；Issue #9 才会加入新预算版本、重新审批和精确恢复。
+
+publication 状态以 `researchOrigin` 判别 provenance：Issue #5 的零 Research Loop Model Turn 显式教学路径只能是 `legacy_explicit`，真正多轮路径只能是 `research_loop` 且结构上必须同时保留非空 Model Turns、tool observations、`researchStartedAt` 与 `completion`。因此 schema 和 reducer 都无法表达“有 Research Loop turns 但没有完成事实”或“零 turn 凭空带 completion”的非法组合。
 
 `publication_approved` 也不是“文件已经写好”的断言。用户命令只批准等待状态中显示的 `draftHash`、canonical Output Root、`targetCanonicalPath`、父目录 `device` 和 `inode` 的精确聚合 hash。Runtime 在接受 receipt 前重新捕获 root 与 target parent identity；若目录被替换、target 逃出 root 或 canonical target 改变，旧 binding 失效。receipt 进入 `ready_to_publish` 后，只有显式 `publishLearningArtifact` 才会调用外部 publisher；正常 publisher 返回后才追加 `learning_artifact_published` 并进入 terminal `completed`。
 

@@ -394,10 +394,13 @@ export interface ResearchCompleteRunState extends EvidenceBackedRunStateData {
   readonly completion: ResearchCompletion;
 }
 
-/** 一个预算维度耗尽后保留精确可恢复研究事实的 Suspended Run。 */
-export interface BudgetExhaustedRunState extends EvidenceBackedRunStateData {
+/** 预算暂停发生时 Research Loop 尚未显式完成的状态。 */
+export interface IncompleteBudgetExhaustedRunState
+  extends EvidenceBackedRunStateData {
   /** 判别字段；该状态不能发布，也不能伪装为研究成功。 */
   readonly type: "budget_exhausted";
+  /** 明确表示暂停前没有成功消费 `complete_research`。 */
+  readonly researchOutcome: "incomplete";
   /** 首个阻止继续推进的稳定预算维度。 */
   readonly exhaustedDimension:
     | "model_turns"
@@ -408,6 +411,31 @@ export interface BudgetExhaustedRunState extends EvidenceBackedRunStateData {
   /** 暂停发生时确定性计算的五维剩余预算。 */
   readonly remainingBudget: RemainingRunBudget;
 }
+
+/** 显式完成后才发现硬预算已耗尽的 Suspended Run。 */
+export interface CompletedResearchBudgetExhaustedRunState
+  extends EvidenceBackedRunStateData {
+  /** 判别字段；该状态仍是暂停而不是可发布成功。 */
+  readonly type: "budget_exhausted";
+  /** 明确表示 `complete_research` 已成功，但预算事实阻止进入 Gate。 */
+  readonly researchOutcome: "research_complete";
+  /** 预算暂停仍保留模型显式报告的未解决问题。 */
+  readonly completion: ResearchCompletion;
+  /** 首个阻止继续推进的稳定预算维度。 */
+  readonly exhaustedDimension:
+    | "model_turns"
+    | "tool_calls"
+    | "distinct_sources"
+    | "source_bytes"
+    | "wall_time";
+  /** 暂停发生时确定性计算的五维剩余预算。 */
+  readonly remainingBudget: RemainingRunBudget;
+}
+
+/** 一个硬预算维度耗尽后保留精确可恢复事实的 Suspended Run。 */
+export type BudgetExhaustedRunState =
+  | IncompleteBudgetExhaustedRunState
+  | CompletedResearchBudgetExhaustedRunState;
 
 /** 当前 planning slice 允许出现的最小 Run 状态联合。 */
 export type ResearchRunState =
@@ -653,11 +681,52 @@ export interface PublishedLearningArtifact {
   readonly publishedAt: string;
 }
 
-/** 模型提案已被 Evidence Gate 接受、但仍等待用户精确发布审批的 Run 状态。 */
-export interface WaitingPublicationApprovalRunState
+/** Issue #5 的显式命令路径在 publication 状态保留的研究 provenance。 */
+export interface LegacyExplicitPublicationResearchData
   extends EvidenceBackedRunStateData {
-  /** 判别字段；只有完整 Evidence-backed draft 可以进入该暂停状态。 */
-  readonly type: "waiting_publication_approval";
+  /** 判别字段；该路径未进入 Research Loop。 */
+  readonly researchOrigin: "legacy_explicit";
+  /** 显式命令路径没有 Research Loop Model Turn。 */
+  readonly modelTurns: readonly [];
+  /** 显式命令路径没有模型可见 Research Tool observation。 */
+  readonly researchToolObservations: readonly [];
+  /** 显式命令路径没有模型声明的 evidence gaps。 */
+  readonly evidenceGaps: readonly [];
+  /** 进入 publication 时不允许遗留 pending Research Tool intent。 */
+  readonly pendingToolIntents: readonly [];
+  /** 显式命令路径不能伪造 Research Loop steering。 */
+  readonly latestSteering?: never;
+  /** 显式命令路径没有 Research Loop wall-time 起点。 */
+  readonly researchStartedAt?: never;
+}
+
+/** `complete_research` 成功后的 publication 状态保留的研究 provenance。 */
+export interface ResearchLoopPublicationResearchData
+  extends EvidenceBackedRunStateData {
+  /** 判别字段；该路径由真正 Research Loop 显式完成。 */
+  readonly researchOrigin: "research_loop";
+  /** Research Loop publication 至少包含一个 durable Model Turn。 */
+  readonly modelTurns: readonly [ModelTurn, ...ModelTurn[]];
+  /** 完成工具本身保证至少存在一个模型可见 observation。 */
+  readonly researchToolObservations: readonly [
+    ResearchToolObservation,
+    ...ResearchToolObservation[],
+  ];
+  /** 进入 publication 时全部 durable intents 都已消费。 */
+  readonly pendingToolIntents: readonly [];
+  /** 第一个 Model Turn generation 开始时冻结的 wall-time 起点。 */
+  readonly researchStartedAt: string;
+  /** 显式完成时保留的未解决问题。 */
+  readonly completion: ResearchCompletion;
+}
+
+/** publication 状态只能来自旧显式路径或已完成 Research Loop 之一。 */
+export type PublicationResearchData =
+  | LegacyExplicitPublicationResearchData
+  | ResearchLoopPublicationResearchData;
+
+/** draft、target 与 binding 在全部 publication 状态共享的事实。 */
+export interface PublicationStateData {
   /** 已存入私有 Artifact Store、可由 reducer 重新渲染验证的 Markdown draft。 */
   readonly draftArtifact: ArtifactReference;
   /** 提供标题、摘要和 Claim 展示顺序的有界模型提案。 */
@@ -666,49 +735,36 @@ export interface WaitingPublicationApprovalRunState
   readonly publicationTarget: PublicationTarget;
   /** 精确绑定 draft 内容与 publication target identity 的审批摘要。 */
   readonly publicationBinding: PublicationApprovalBinding;
+}
+
+/** 模型提案已被 Evidence Gate 接受、但仍等待用户精确发布审批的 Run 状态。 */
+export type WaitingPublicationApprovalRunState = PublicationResearchData &
+  PublicationStateData & {
+  /** 判别字段；只有完整 Evidence-backed draft 可以进入该暂停状态。 */
+  readonly type: "waiting_publication_approval";
   /** draft 被正式写入 Run Journal 的 ISO 8601 UTC 时间。 */
   readonly proposedAt: string;
-  /** 若 draft 来自 Research Loop，保留显式完成时的不确定性；旧显式路径则省略。 */
-  readonly completion?: ResearchCompletion | undefined;
-}
+};
 
 /** 用户已批准 exact publication binding、等待显式正常写入命令的 Run 状态。 */
-export interface ReadyToPublishRunState extends EvidenceBackedRunStateData {
+export type ReadyToPublishRunState = PublicationResearchData &
+  PublicationStateData & {
   /** 判别字段；重启不会自动猜测或重放尚未确认的外部写入。 */
   readonly type: "ready_to_publish";
-  /** 等待时保存的不可变 Markdown draft artifact。 */
-  readonly draftArtifact: ArtifactReference;
-  /** 用于重建 draft 精确内容的有界模型提案。 */
-  readonly proposal: LearningArtifactProposal;
-  /** 已获批准、写入前仍需重新验证的 canonical publication target。 */
-  readonly publicationTarget: PublicationTarget;
-  /** 当初等待状态计算的 exact publication binding。 */
-  readonly publicationBinding: PublicationApprovalBinding;
   /** 已由用户命令持久化的精确 publication authorization。 */
   readonly publicationReceipt: PublicationApprovalReceipt;
-  /** 若 draft 来自 Research Loop，保留显式完成时的不确定性；旧显式路径则省略。 */
-  readonly completion?: ResearchCompletion | undefined;
-}
+};
 
 /** 正常 publisher 返回且 `learning_artifact_published` 已 durably append 后的终态。 */
-export interface CompletedRunState extends EvidenceBackedRunStateData {
+export type CompletedRunState = PublicationResearchData &
+  PublicationStateData & {
   /** 判别字段；不能从读取、Evidence 或 approval 事件直接跳入。 */
   readonly type: "completed";
-  /** 已发布前保持不变的私有 Markdown draft artifact。 */
-  readonly draftArtifact: ArtifactReference;
-  /** 用于审计实际 Markdown 内容来源的有界模型提案。 */
-  readonly proposal: LearningArtifactProposal;
-  /** 实际写入前已绑定且已重验的 canonical publication target。 */
-  readonly publicationTarget: PublicationTarget;
-  /** 实际发生 external write 前已批准的 exact publication binding。 */
-  readonly publicationBinding: PublicationApprovalBinding;
   /** 授权这次 external publication 的 durable user-command receipt。 */
   readonly publicationReceipt: PublicationApprovalReceipt;
   /** 外部 publisher 成功后写入 Journal 的已发布内容 identity。 */
   readonly learningArtifact: PublishedLearningArtifact;
-  /** 若 draft 来自 Research Loop，保留显式完成时的不确定性；旧显式路径则省略。 */
-  readonly completion?: ResearchCompletion | undefined;
-}
+};
 
 /** `learning_artifact_draft_proposed` 事件携带的 gated draft 与 publication binding。 */
 export interface LearningArtifactDraftProposedPayload {

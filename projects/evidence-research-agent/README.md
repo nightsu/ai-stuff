@@ -172,7 +172,7 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 
 - `advanceResearch` 每次都从 Run Journal、Projection 与批准 plan artifact 重建 Model View；Model View 不是 Journal，也不是完整 `messages[]`。完整 Model Turn 先 durable append，pending intents 再由 Harness 顺序消费，重启后不会要求模型猜测未决动作。
 - 五个模型可见工具之外的 approval、budget change、publication、shell 与任意写入都不进入 `ResearchToolIntent` 联合。参数 schema 错误、Source Scope denial、stale observation 和普通工具失败都会形成安全 observation，进入下一轮视图。
-- Run Budget 由 Harness 从 canonical facts 计算：计划 generation、Research Loop turns、Research Tool calls、不同 Source Snapshot、完整 source bytes 与 Research Loop wall time 分别记账。任何硬维度耗尽都会 durable 进入 `budget_exhausted`；该状态不能生成 draft 或伪装为完成。
+- Run Budget 由 Harness 与 reducer 共用一个 domain calculator 从 canonical facts 计算：计划 generation、Research Loop turns、Research Tool calls、不同 Source Snapshot、完整 source bytes 与 Research Loop wall time 分别记账。完成工具后也会再检查 Model Turn/wall time；任何硬维度耗尽都会 durable 进入带 `incomplete` 或 `research_complete` provenance 的 `budget_exhausted`，该状态不能生成 draft 或伪装为可发布完成。
 - `search_sources` 通过可注入 `SourceSearchPort` 使用默认固定参数 `rg` adapter；它在启动搜索前复核批准 root identity，并把 extensions、exclusions、共享 secret discovery globs 与 file-size bound 下推到 discovery，每个返回命中还会再走共享 realpath preflight。完整命中列表进入私有 JSON Artifact，Journal/Trace 只保留引用和数量，下一轮 Model View 再按需校验展开；搜索不会创建 Source Snapshot。
 - `readSource` 仍只接受 `{ rootIndex, relativePath, startLine, endLine }`。成功读取才会保存完整原始 UTF-8 字节到私有 `source-sha256:<hash>` Snapshot；`denied`/`failed` 只写安全 observation，不创建 Snapshot。
 - 一个 Evidence Record 只能逐字段绑定一个现有成功 observation 的 `observationId`、`toolCallId`、Snapshot identity、规范范围和 excerpt hash。一个 Claim 显式标为 `source_fact`，且只能引用当前 Run 已登记的 Evidence IDs。
@@ -183,7 +183,7 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 
 ## Journal、Trace 与恢复边界
 
-Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim、research completion/budget suspension、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文或 OS 错误。
+Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim、research completion/budget suspension、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。`ResearchLoopLifecycleHooks` 可在 Model Turn 与 search Artifact/Journal 的命名 durable seam 注入中断，恢复测试据此证明 committed pending work 不重复 generation、孤立 CAS 对象不冒充 Journal 事实。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文或 OS 错误。
 
 `publication_approved` 只表示用户授权了精确 draft/target，状态为 `ready_to_publish`。重启不会自动写文件；只有显式 `publishLearningArtifact` 成功返回后才追加 `learning_artifact_published` 并进入 `completed`。如果进程在外部写入尝试和该 Journal 事件之间崩溃，当前实现不会把“文件可能存在”猜成完成；完整 effect crash reconciliation 留给 Issue #14。
 

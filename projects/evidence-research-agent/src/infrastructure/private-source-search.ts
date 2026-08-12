@@ -6,7 +6,10 @@ import {
   sourcePathPolicyDenial,
 } from "../domain/source-policy.js";
 import type { SourceScope, SourceSearchMatch } from "../domain/types.js";
-import type { SourceSearchPort } from "../application/ports.js";
+import type {
+  SourceSearchPort,
+  SourceSearchRequest,
+} from "../application/ports.js";
 import {
   PrivateSourceAccess,
   sourceRootIdentityStillMatches,
@@ -14,18 +17,10 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-/** `search_sources` 的 Harness-owned 结构化参数。 */
-export interface SearchSourcesRequest {
-  /** 传给固定参数 `rg` 的非空 literal query。 */
-  readonly query: string;
-  /** 全部批准 roots 合计返回的最大命中数。 */
-  readonly maxResults: number;
-}
-
 /** 使用固定参数 `rg` 搜索批准本地文本，搜索命中本身不会创建 Source Snapshot。 */
 export async function searchApprovedSources(
   scope: SourceScope,
-  request: SearchSourcesRequest,
+  request: SourceSearchRequest,
 ): Promise<readonly SourceSearchMatch[]> {
   const matches: SourceSearchMatch[] = [];
   const access = new PrivateSourceAccess(scope);
@@ -108,7 +103,7 @@ export async function searchApprovedSources(
 export class RgSourceSearch implements SourceSearchPort {
   public search(
     scope: SourceScope,
-    request: SearchSourcesRequest,
+    request: SourceSearchRequest,
   ): Promise<readonly SourceSearchMatch[]> {
     return searchApprovedSources(scope, request);
   }
