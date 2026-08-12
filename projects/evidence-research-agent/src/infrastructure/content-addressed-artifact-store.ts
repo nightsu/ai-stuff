@@ -12,6 +12,7 @@ import type { FileHandle } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 
 import type {
+  ArtifactReference,
   PersistedArtifact,
   PersistedSourceSnapshot,
 } from "../domain/types.js";
@@ -89,6 +90,41 @@ export class ContentAddressedArtifactStore {
       relativePath: relative(runtimeHome, absolutePath),
       createdAt,
     };
+  }
+
+  /** 从已验证 registry 引用读取 JSON artifact；不会接受调用方任意相对路径。 */
+  public async readJson(reference: ArtifactReference): Promise<unknown> {
+    if (
+      reference.mediaType !== "application/json" ||
+      reference.relativePath !==
+        `artifacts/sha256/${reference.sha256.slice(0, 2)}/${reference.sha256}.json`
+    ) {
+      throw new ArtifactIntegrityError();
+    }
+    const absolutePath = join(this.#runtimeHome, reference.relativePath);
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(
+        absolutePath,
+        constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+      );
+      const metadata = await handle.stat({ bigint: true });
+      if (!metadata.isFile() || metadata.size !== BigInt(reference.byteLength)) {
+        throw new ArtifactIntegrityError();
+      }
+      const bytes = await handle.readFile();
+      if (hashBytes(bytes) !== reference.sha256) {
+        throw new ArtifactIntegrityError();
+      }
+      return JSON.parse(bytes.toString("utf8")) as unknown;
+    } catch (error) {
+      if (error instanceof ArtifactIntegrityError) {
+        throw error;
+      }
+      throw new ArtifactIntegrityError();
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
   }
 
   /** 把经过 Evidence Gate 的精确 Markdown draft 写入通用私有 artifact namespace。 */

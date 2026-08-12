@@ -11,6 +11,7 @@ import type {
   Claim,
   EvidenceRecord,
   LearningArtifactProposal,
+  ModelTurn,
   PlanApprovalBinding,
   PlanApprovalReceipt,
   PublicationApprovalBinding,
@@ -20,6 +21,7 @@ import type {
   ReadSourceRequest,
   ResearchPlan,
   ResearchRunEvent,
+  ResearchToolObservation,
   RequestedSourceScope,
   RunBudget,
   RunProjection,
@@ -375,6 +377,91 @@ const planApprovalReceiptSchema = z
   .strict()
   .transform((receipt): PlanApprovalReceipt => receipt);
 
+const researchToolIntentSchema = z
+  .object({
+    intentId: z.string().trim().min(1),
+    name: z.enum([
+      "search_sources",
+      "read_source",
+      "record_evidence",
+      "propose_claim",
+      "complete_research",
+    ]),
+    input: z.json(),
+  })
+  .strict();
+
+const modelTurnSchema = z
+  .object({
+    turnId: z.string().trim().min(1),
+    text: z.string(),
+    evidenceGaps: z.array(z.string().trim().min(1)),
+    finishReason: z.enum(["tool_calls", "stop"]),
+    toolIntents: z.array(researchToolIntentSchema).min(1),
+    completedAt: z.iso.datetime(),
+  })
+  .strict()
+  .transform((turn): ModelTurn => turn);
+
+const researchToolOutputSchema = z.union([
+  z.object({
+    matches: z.array(
+      z.object({
+        rootIndex: z.number().int().nonnegative(),
+        relativePath: z.string().min(1),
+        lineNumber: z.number().int().positive(),
+        lineText: z.string(),
+      }).strict(),
+    ),
+  }).strict(),
+  z.object({ sourceObservationId: z.string().trim().min(1) }).strict(),
+  z.object({ evidenceId: z.string().trim().min(1) }).strict(),
+  z.object({ claimId: z.string().trim().min(1) }).strict(),
+  z.object({ unresolvedQuestions: z.array(z.string().trim().min(1)) }).strict(),
+]);
+
+const researchToolObservationSchema = z
+  .object({
+    observationId: z.string().trim().min(1),
+    toolCallId: z.string().trim().min(1),
+    intentId: z.string().trim().min(1),
+    toolName: researchToolIntentSchema.shape.name,
+    status: z.enum(["succeeded", "invalid", "denied", "failed"]),
+    code: z.string().trim().min(1).optional(),
+    summary: z.string().trim().min(1),
+    output: researchToolOutputSchema.optional(),
+    observedAt: z.iso.datetime(),
+  })
+  .strict()
+  .transform((observation): ResearchToolObservation => observation);
+
+const remainingRunBudgetSchema = z.object({
+  modelTurns: z.number().int().nonnegative(),
+  toolCalls: z.number().int().nonnegative(),
+  distinctSources: z.number().int().nonnegative(),
+  sourceBytes: z.number().int().nonnegative(),
+  wallTimeMs: z.number().int().nonnegative(),
+}).strict();
+
+const evidenceBackedStateFields = {
+  planArtifact: artifactReferenceSchema,
+  approvalReceipt: planApprovalReceiptSchema,
+  sourceReadObservations: z.array(sourceReadObservationSchema),
+  sourceBytesRead: z.number().int().nonnegative(),
+  evidenceRecords: z.array(evidenceRecordSchema),
+  claims: z.array(claimSchema),
+  modelTurns: z.array(modelTurnSchema),
+  researchToolObservations: z.array(researchToolObservationSchema),
+  evidenceGaps: z.array(z.string().trim().min(1)),
+  pendingToolIntents: z.array(researchToolIntentSchema),
+  latestSteering: z.string().trim().min(1).optional(),
+  researchStartedAt: z.iso.datetime().optional(),
+  completion: z.object({
+    unresolvedQuestions: z.array(z.string().trim().min(1)),
+    completedAt: z.iso.datetime(),
+  }).strict().optional(),
+};
+
 const runStateSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("created") }),
   z.object({
@@ -389,21 +476,28 @@ const runStateSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("researching"),
-    planArtifact: artifactReferenceSchema,
-    approvalReceipt: planApprovalReceiptSchema,
-    sourceReadObservations: z.array(sourceReadObservationSchema),
-    sourceBytesRead: z.number().int().nonnegative(),
-    evidenceRecords: z.array(evidenceRecordSchema),
-    claims: z.array(claimSchema),
+    ...evidenceBackedStateFields,
+  }),
+  z.object({
+    type: z.literal("research_complete"),
+    ...evidenceBackedStateFields,
+    completion: evidenceBackedStateFields.completion.unwrap(),
+  }),
+  z.object({
+    type: z.literal("budget_exhausted"),
+    ...evidenceBackedStateFields,
+    exhaustedDimension: z.enum([
+      "model_turns",
+      "tool_calls",
+      "distinct_sources",
+      "source_bytes",
+      "wall_time",
+    ]),
+    remainingBudget: remainingRunBudgetSchema,
   }),
   z.object({
     type: z.literal("waiting_publication_approval"),
-    planArtifact: artifactReferenceSchema,
-    approvalReceipt: planApprovalReceiptSchema,
-    sourceReadObservations: z.array(sourceReadObservationSchema),
-    sourceBytesRead: z.number().int().nonnegative(),
-    evidenceRecords: z.array(evidenceRecordSchema),
-    claims: z.array(claimSchema),
+    ...evidenceBackedStateFields,
     draftArtifact: artifactReferenceSchema,
     proposal: learningArtifactProposalSchema,
     publicationTarget: publicationTargetSchema,
@@ -412,12 +506,7 @@ const runStateSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("ready_to_publish"),
-    planArtifact: artifactReferenceSchema,
-    approvalReceipt: planApprovalReceiptSchema,
-    sourceReadObservations: z.array(sourceReadObservationSchema),
-    sourceBytesRead: z.number().int().nonnegative(),
-    evidenceRecords: z.array(evidenceRecordSchema),
-    claims: z.array(claimSchema),
+    ...evidenceBackedStateFields,
     draftArtifact: artifactReferenceSchema,
     proposal: learningArtifactProposalSchema,
     publicationTarget: publicationTargetSchema,
@@ -426,12 +515,7 @@ const runStateSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("completed"),
-    planArtifact: artifactReferenceSchema,
-    approvalReceipt: planApprovalReceiptSchema,
-    sourceReadObservations: z.array(sourceReadObservationSchema),
-    sourceBytesRead: z.number().int().nonnegative(),
-    evidenceRecords: z.array(evidenceRecordSchema),
-    claims: z.array(claimSchema),
+    ...evidenceBackedStateFields,
     draftArtifact: artifactReferenceSchema,
     proposal: learningArtifactProposalSchema,
     publicationTarget: publicationTargetSchema,
@@ -496,6 +580,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
       payload: z
         .object({
           observation: sourceReadObservationSchema,
+          researchObservation: researchToolObservationSchema.optional(),
         })
         .strict(),
     })
@@ -507,6 +592,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
       payload: z
         .object({
           evidence: evidenceRecordSchema,
+          researchObservation: researchToolObservationSchema.optional(),
         })
         .strict(),
     })
@@ -518,10 +604,50 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
       payload: z
         .object({
           claim: claimSchema,
+          researchObservation: researchToolObservationSchema.optional(),
         })
         .strict(),
     })
     .strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("model_turn_completed"),
+    payload: z.object({
+      turn: modelTurnSchema,
+      generationStartedAt: z.iso.datetime(),
+      latestSteering: z.string().trim().min(1).optional(),
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("research_tool_observed"),
+    payload: z.object({ observation: researchToolObservationSchema }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("research_completed"),
+    payload: z.object({
+      completion: z.object({
+        unresolvedQuestions: z.array(z.string().trim().min(1)),
+        completedAt: z.iso.datetime(),
+      }).strict(),
+      observation: researchToolObservationSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("run_budget_exhausted"),
+    payload: z.object({
+      exhaustedDimension: z.enum([
+        "model_turns",
+        "tool_calls",
+        "distinct_sources",
+        "source_bytes",
+        "wall_time",
+      ]),
+      remainingBudget: remainingRunBudgetSchema,
+    }).strict(),
+  }).strict(),
   z
     .object({
       ...eventEnvelopeSchema,

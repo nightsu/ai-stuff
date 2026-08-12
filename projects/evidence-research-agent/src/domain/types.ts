@@ -148,6 +148,150 @@ export interface ResearchPlan {
   readonly steps: readonly PlanStep[];
 }
 
+/** Model Port 返回、但仍须由 Harness 调度和校验的单个 Research Tool intent。 */
+export interface ResearchToolIntent {
+  /** Model Turn 内稳定且非空的 intent identity，用于 observation 回填。 */
+  readonly intentId: string;
+  /** 五个模型可见 Research Tools 之一；治理与 publication 不在此联合中。 */
+  readonly name:
+    | "search_sources"
+    | "read_source"
+    | "record_evidence"
+    | "propose_claim"
+    | "complete_research";
+  /** 模型原样提出的 JSON-like 参数；Harness 必须按具体工具 schema 再校验。 */
+  readonly input: unknown;
+}
+
+/** 一次 provider-neutral、完整提交后才可进入 Run Journal 的 Model Turn。 */
+export interface ModelTurn {
+  /** 由 Harness 从承载该 turn 的 Journal event identity 派生的稳定 identity。 */
+  readonly turnId: string;
+  /** 模型本轮可见推理摘要；不是 canonical 状态或完整 messages history。 */
+  readonly text: string;
+  /** 模型声明仍待关闭的 evidence gaps；下一轮 Model View 会固定保留。 */
+  readonly evidenceGaps: readonly string[];
+  /** 完整 generation 的 provider-neutral 结束原因。 */
+  readonly finishReason: "tool_calls" | "stop";
+  /** 由 Harness 逐项调度的有序 Research Tool intents。 */
+  readonly toolIntents: readonly ResearchToolIntent[];
+  /** 完整 Model Turn 被提交为 Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly completedAt: string;
+}
+
+/** `search_sources` 返回给下一轮 Model View 的一个受 Source Scope 约束的命中。 */
+export interface SourceSearchMatch {
+  /** 命中所属批准 Source Root 的零基索引。 */
+  readonly rootIndex: number;
+  /** 相对于批准根且通过共享路径策略的 canonical POSIX 路径。 */
+  readonly relativePath: string;
+  /** 命中行的 1-based 行号。 */
+  readonly lineNumber: number;
+  /** `rg` 返回的单行 UTF-8 文本，最多保留固定长度。 */
+  readonly lineText: string;
+}
+
+/** Research Tool 成功时可暴露给下一轮模型的最小结构化结果。 */
+export type ResearchToolOutput =
+  | {
+      /** `search_sources` 按批准 root 与原始输出顺序返回的有界命中。 */
+      readonly matches: readonly SourceSearchMatch[];
+    }
+  | {
+      /** `read_source` 已 durable 写入的 Source Read Observation identity。 */
+      readonly sourceObservationId: string;
+    }
+  | {
+      /** `record_evidence` 新创建且可被后续 Claim 引用的 identity。 */
+      readonly evidenceId: string;
+    }
+  | {
+      /** `propose_claim` 新创建且可被 publication proposal 选择的 identity。 */
+      readonly claimId: string;
+    }
+  | {
+      /** `complete_research` 明确保留的未解决问题。 */
+      readonly unresolvedQuestions: readonly string[];
+    };
+
+/** Harness 对一个模型 intent 的安全、可回放 observation。 */
+export interface ResearchToolObservation {
+  /** observation 的跨进程稳定 identity，不与 event 或 intent identity 混用。 */
+  readonly observationId: string;
+  /** Harness 分配的逻辑 Research Tool call identity，用于预算和 Trace。 */
+  readonly toolCallId: string;
+  /** 被执行或拒绝的模型 intent identity。 */
+  readonly intentId: string;
+  /** 被 Harness 识别的五个模型可见工具名。 */
+  readonly toolName: ResearchToolIntent["name"];
+  /** 结果分类；schema 错误、denial 与普通失败不会伪装成成功。 */
+  readonly status: "succeeded" | "invalid" | "denied" | "failed";
+  /** 面向模型和 Trace 的稳定代码；成功 observation 不携带此字段。 */
+  readonly code?: string | undefined;
+  /** 不含绝对路径、秘密或原始异常的紧凑确定性摘要。 */
+  readonly summary: string;
+  /** 成功时的最小 typed output；失败或拒绝时省略。 */
+  readonly output?: ResearchToolOutput | undefined;
+  /** observation 进入 Run Journal 的 ISO 8601 UTC 时间。 */
+  readonly observedAt: string;
+}
+
+/** 每轮 generation 前由 canonical facts 确定性重建的模型可见预算余额。 */
+export interface RemainingRunBudget {
+  /** 尚可完成的 Model Turn 数；计划 generation 已由 Harness 计入。 */
+  readonly modelTurns: number;
+  /** 尚可提交的逻辑 Research Tool call 数。 */
+  readonly toolCalls: number;
+  /** 尚可首次纳入的不同 Source Snapshot 数。 */
+  readonly distinctSources: number;
+  /** 尚可读取并冻结的源字节数，单位为 byte。 */
+  readonly sourceBytes: number;
+  /** Research Loop 尚可消耗的墙钟时间，单位为毫秒。 */
+  readonly wallTimeMs: number;
+}
+
+/** 不等同于 Run Journal/messages、供一次 Research Loop generation 使用的派生视图。 */
+export interface ModelView {
+  /** 当前 Research Run identity。 */
+  readonly runId: string;
+  /** 用户批准边界内的原始技术问题。 */
+  readonly question: string;
+  /** Harness 固定拥有且每轮重新注入的 Research Loop 规则。 */
+  readonly fixedRules: readonly string[];
+  /** 从已批准 plan artifact 验证读取的精确研究计划。 */
+  readonly approvedPlan: ResearchPlan;
+  /** 当前 durable plan approval 的聚合 binding hash。 */
+  readonly approvalBindingHash: string;
+  /** 已批准且模型不能提高的 Run Budget 版本。 */
+  readonly budgetVersion: string;
+  /** 从 canonical usage facts 计算的五维剩余预算。 */
+  readonly remainingBudget: RemainingRunBudget;
+  /** 上一完整 Model Turn 声明、仍需模型处理的 evidence gaps。 */
+  readonly evidenceGaps: readonly string[];
+  /** 尚未获得 observation 的 durable tool intents；恢复时必须优先处理。 */
+  readonly pendingIntents: readonly ResearchToolIntent[];
+  /** 与当前 Claims/gaps 相关、且带精确摘录的有界 Evidence 视图。 */
+  readonly relevantEvidence: readonly ModelViewEvidence[];
+  /** 最近若干工具 observation；旧结果通过稳定 identities 保留而非完整 Journal。 */
+  readonly recentObservations: readonly ResearchToolObservation[];
+  /** 最近一次非空用户 steering；裁剪时不得删除。 */
+  readonly latestSteering?: string | undefined;
+}
+
+/** Model View 中从 durable Evidence 与成功读取 observation 派生的可见证据。 */
+export interface ModelViewEvidence {
+  /** 当前 Run 中稳定的 Evidence identity。 */
+  readonly evidenceId: string;
+  /** 可追到明确 Source Snapshot 的 canonical 相对路径。 */
+  readonly relativePath: string;
+  /** Evidence 摘录的 1-based inclusive 首行。 */
+  readonly startLine: number;
+  /** Evidence 摘录的 1-based inclusive 末行。 */
+  readonly endLine: number;
+  /** 从成功 observation 重用的精确摘录，不重新读取 live file。 */
+  readonly excerpt: string;
+}
+
 /** 内容寻址 Artifact Store 中一个不可变对象的稳定引用。 */
 export interface ArtifactReference {
   /** 由内容摘要派生的 artifact identity，格式为 `sha256:<hex>`。 */
@@ -202,6 +346,20 @@ export interface EvidenceBackedRunStateData {
   readonly evidenceRecords: readonly EvidenceRecord[];
   /** 按 Journal 顺序记录、并只能引用已有 Evidence Record 的待发布主张。 */
   readonly claims: readonly Claim[];
+  /** 按 Journal 顺序保存的完整 Research Loop Model Turns。 */
+  readonly modelTurns: readonly ModelTurn[];
+  /** 按完成顺序保存的 Research Tool observations。 */
+  readonly researchToolObservations: readonly ResearchToolObservation[];
+  /** 最近一个 Model Turn 声明的未决 evidence gaps。 */
+  readonly evidenceGaps: readonly string[];
+  /** 已 durable 提交但尚未得到 observation 的有序 tool intents。 */
+  readonly pendingToolIntents: readonly ResearchToolIntent[];
+  /** 最近一次进入 Model View 的非空用户 steering。 */
+  readonly latestSteering?: string | undefined;
+  /** 第一个 Research Loop Model Turn 的 ISO 8601 UTC 时间；审批等待不计入 wall time。 */
+  readonly researchStartedAt?: string | undefined;
+  /** 显式研究完成后在 Gate、审批与 publication 状态继续保留的不确定性。 */
+  readonly completion?: ResearchCompletion | undefined;
 }
 
 /** 精确计划已获用户批准、可以继续显式收集 Evidence 与 Claim 的 Run 状态。 */
@@ -210,12 +368,37 @@ export interface ResearchingRunState extends EvidenceBackedRunStateData {
   readonly type: "researching";
 }
 
+/** 模型已通过 `complete_research` 显式结束调查、可以进入外层 Gate 的状态。 */
+export interface ResearchCompleteRunState extends EvidenceBackedRunStateData {
+  /** 判别字段；它不是最终 completed，仍需验证、审批与 publication。 */
+  readonly type: "research_complete";
+  /** 模型显式保留的未解决问题；空数组表示没有已知未决项。 */
+  readonly completion: ResearchCompletion;
+}
+
+/** 一个预算维度耗尽后保留精确可恢复研究事实的 Suspended Run。 */
+export interface BudgetExhaustedRunState extends EvidenceBackedRunStateData {
+  /** 判别字段；该状态不能发布，也不能伪装为研究成功。 */
+  readonly type: "budget_exhausted";
+  /** 首个阻止继续推进的稳定预算维度。 */
+  readonly exhaustedDimension:
+    | "model_turns"
+    | "tool_calls"
+    | "distinct_sources"
+    | "source_bytes"
+    | "wall_time";
+  /** 暂停发生时确定性计算的五维剩余预算。 */
+  readonly remainingBudget: RemainingRunBudget;
+}
+
 /** 当前 planning slice 允许出现的最小 Run 状态联合。 */
 export type ResearchRunState =
   | CreatedRunState
   | PlanningRunState
   | WaitingPlanApprovalRunState
   | ResearchingRunState
+  | ResearchCompleteRunState
+  | BudgetExhaustedRunState
   | WaitingPublicationApprovalRunState
   | ReadyToPublishRunState
   | CompletedRunState;
@@ -264,10 +447,52 @@ export interface PlanApprovedPayload {
   readonly approvalReceipt: PlanApprovalReceipt;
 }
 
+/** `model_turn_completed` 事件携带的 provider-neutral generation 事实。 */
+export interface ModelTurnCompletedPayload {
+  /** 只有完整 generation 才能持久化的 Model Turn。 */
+  readonly turn: ModelTurn;
+  /** Harness 开始本次 generation 前捕获的 ISO 8601 UTC 时间，用于计入模型延迟。 */
+  readonly generationStartedAt: string;
+  /** 本轮构建 Model View 时采用的最新非空 steering。 */
+  readonly latestSteering?: string | undefined;
+}
+
+/** `research_tool_observed` 事件携带的 Harness 工具反馈。 */
+export interface ResearchToolObservedPayload {
+  /** 对一个 durable pending intent 的成功、无效、拒绝或失败 observation。 */
+  readonly observation: ResearchToolObservation;
+}
+
+/** 模型显式声明研究完成时提交的结构化不确定性。 */
+export interface ResearchCompletion {
+  /** 仍未解决、必须在最终工件中保持可见的简短问题列表。 */
+  readonly unresolvedQuestions: readonly string[];
+  /** completion 成为 Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly completedAt: string;
+}
+
+/** `research_completed` 事件同时关闭 pending completion intent 并记录完成事实。 */
+export interface ResearchCompletedPayload {
+  /** 显式完成研究时保留的不确定性。 */
+  readonly completion: ResearchCompletion;
+  /** `complete_research` tool 的成功 observation。 */
+  readonly observation: ResearchToolObservation;
+}
+
+/** `run_budget_exhausted` 事件记录不可被模型覆盖的暂停原因。 */
+export interface RunBudgetExhaustedPayload {
+  /** 首个达到硬上限并阻止继续执行的预算维度。 */
+  readonly exhaustedDimension: BudgetExhaustedRunState["exhaustedDimension"];
+  /** 事件时由 canonical usage facts 计算的剩余预算。 */
+  readonly remainingBudget: RemainingRunBudget;
+}
+
 /** `source_read_observed` 事件携带的完整、已消毒读取事实。 */
 export interface SourceReadObservedPayload {
   /** 成功、策略拒绝或稳定失败中的一个结构化 observation。 */
   readonly observation: SourceReadObservation;
+  /** 来自 Research Loop 时，对 durable read intent 的模型可见安全 observation。 */
+  readonly researchObservation?: ResearchToolObservation | undefined;
 }
 
 /** 一个从成功来源读取事实派生、不可由模型伪造的最小 Evidence Record。 */
@@ -314,12 +539,16 @@ export interface Claim {
 export interface EvidenceRecordedPayload {
   /** 只能由 Runtime 从 canonical Projection 生成的完整 Evidence Record。 */
   readonly evidence: EvidenceRecord;
+  /** 来自 Research Loop 时，对 durable Evidence intent 的成功 observation。 */
+  readonly researchObservation?: ResearchToolObservation | undefined;
 }
 
 /** `claim_recorded` 事件携带的、仅引用既有 Evidence 的 Claim 事实。 */
 export interface ClaimRecordedPayload {
   /** 待后续 Evidence Gate 审核的完整 Claim。 */
   readonly claim: Claim;
+  /** 来自 Research Loop 时，对 durable Claim intent 的成功 observation。 */
+  readonly researchObservation?: ResearchToolObservation | undefined;
 }
 
 /** 模型只能选择既有 Claim、不能自造 citation identity 的有界 Markdown 提案。 */
@@ -503,6 +732,10 @@ export type ResearchRunEvent =
   | RunEvent<"planning_started", Record<never, never>>
   | RunEvent<"plan_proposed", PlanProposedPayload>
   | RunEvent<"plan_approved", PlanApprovedPayload>
+  | RunEvent<"model_turn_completed", ModelTurnCompletedPayload>
+  | RunEvent<"research_tool_observed", ResearchToolObservedPayload>
+  | RunEvent<"research_completed", ResearchCompletedPayload>
+  | RunEvent<"run_budget_exhausted", RunBudgetExhaustedPayload>
   | RunEvent<"source_read_observed", SourceReadObservedPayload>
   | RunEvent<"evidence_recorded", EvidenceRecordedPayload>
   | RunEvent<"claim_recorded", ClaimRecordedPayload>

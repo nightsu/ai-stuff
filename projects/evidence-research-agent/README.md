@@ -1,8 +1,8 @@
 # Evidence Research Agent
 
-这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #5：一条已经 durable Plan Approval 的 Run 可以显式读取批准范围内的来源、冻结完整 private Source Snapshot、登记 `source_fact` Evidence Record 和 Claim、通过最小 Evidence Gate 生成 Markdown draft，再由用户精确批准 draft、Output Root 与 target，最后发布一份可读的 Learning Artifact。
+这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #6：一条已经 durable Plan Approval 的 Run 可以由 Scripted Model 驱动真正有界的多轮 Research Loop，经 Harness 调度五个模型可见 Research Tools，显式完成研究后通过 Evidence Gate、精确 publication approval 和 no-clobber publisher 产出 Learning Artifact。
 
-它不是自动研究流程。当前没有 `search_sources`、多轮 Research Loop、自动工具调度、retry、live model、`read-source` CLI 或 publication CLI。
+当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`。它仍不包含自动 retry、live model、并行 tool batch、预算扩展恢复、`read-source` CLI 或 publication CLI；这些属于后续 tickets。
 
 ## 快速开始：创建并批准计划
 
@@ -40,9 +40,51 @@ node dist/src/cli.js trace --runtime-home .runtime --run-id <run-id> --json
 
 计划审批是跨进程可恢复且幂等的。其 binding 覆盖 question、不可变 plan artifact、完整 Source Scope 与 Run Budget；模型输出、Research Tool 参数、环境变量或调用方自造 Receipt 都不能替代用户命令。
 
-## 从来源到 Learning Artifact 的 TypeScript API
+## 运行有界多轮 Research Loop
 
-Issue #5 的命令只从 TypeScript public seam 暴露。下面的顺序刻意显式：调用方先读取来源，再选择哪个成功 observation 成为 Evidence，再写 Claim；模型只在最后选择已有 Claim 的展示顺序，并不能创造 citation identity。
+`advanceResearch` 是 Issue #6 的主 seam。每轮先从 canonical Journal/Projection 和批准 plan artifact 重建 Model View；模型返回完整 Model Turn 后，Harness 才逐项验证并调度 intents。下面以 Scripted Model 展示确定性的三轮最短路径，完整五工具示例见 `tests/runtime/research-loop.test.ts`。
+
+```ts
+import { ResearchAgentRuntime, ScriptedModel } from "./src/index.js";
+
+const model = new ScriptedModel(
+  [],
+  [],
+  [
+    {
+      text: "读取已知来源。",
+      evidenceGaps: ["需要冻结精确来源版本"],
+      finishReason: "tool_calls",
+      toolIntents: [{
+        intentId: "read-1",
+        name: "read_source",
+        input: {
+          rootIndex: 0,
+          relativePath: "adr/0003-use-run-journal-and-derived-projections.md",
+          startLine: 1,
+          endLine: 3,
+        },
+      }],
+    },
+    // 后续 turns 从 observation 中取得 sourceObservationId / evidenceId，
+    // 再调用 record_evidence、propose_claim，最后 complete_research。
+  ],
+);
+
+const runtime = ResearchAgentRuntime.open({ runtimeHome: ".runtime", model });
+const result = await runtime.advanceResearch({
+  runId: "<approved-run-id>",
+  steering: "优先验证 Journal 与 Projection 的恢复关系。",
+});
+console.log(result.state.type); // research_complete 或 budget_exhausted
+runtime.close();
+```
+
+Model View 固定包含批准计划、approval binding、预算版本与余额、未决 evidence gaps、pending intents 和最新 steering。旧 observations 与 Evidence 按确定性顺序裁剪；若 pinned facts 本身仍放不下，Runtime 抛出 `ModelViewTooLargeError`，不会请求 LLM 自动摘要或静默删除约束。
+
+## 从来源到 Learning Artifact 的显式 TypeScript API
+
+Issue #5 的显式命令仍从 TypeScript public seam 暴露，方便独立学习每一个边界。Research Loop 内部复用同一 source/evidence/claim 领域规则，并不会绕过 reducer、SQLite 或 Evidence Gate。
 
 ```ts
 import { resolve } from "node:path";
@@ -128,6 +170,10 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 
 ## 关键不变量
 
+- `advanceResearch` 每次都从 Run Journal、Projection 与批准 plan artifact 重建 Model View；Model View 不是 Journal，也不是完整 `messages[]`。完整 Model Turn 先 durable append，pending intents 再由 Harness 顺序消费，重启后不会要求模型猜测未决动作。
+- 五个模型可见工具之外的 approval、budget change、publication、shell 与任意写入都不进入 `ResearchToolIntent` 联合。参数 schema 错误、Source Scope denial、stale observation 和普通工具失败都会形成安全 observation，进入下一轮视图。
+- Run Budget 由 Harness 从 canonical facts 计算：计划 generation、Research Loop turns、Research Tool calls、不同 Source Snapshot、完整 source bytes 与 Research Loop wall time 分别记账。任何硬维度耗尽都会 durable 进入 `budget_exhausted`；该状态不能生成 draft 或伪装为完成。
+- `search_sources` 只使用固定参数 `rg`，在启动搜索前复核批准 root identity，并把 extensions、exclusions、secret denylist 与 file-size bound 下推到 discovery；每个返回命中还会再走共享 realpath preflight。搜索命中不会创建 Source Snapshot。
 - `readSource` 仍只接受 `{ rootIndex, relativePath, startLine, endLine }`。成功读取才会保存完整原始 UTF-8 字节到私有 `source-sha256:<hash>` Snapshot；`denied`/`failed` 只写安全 observation，不创建 Snapshot。
 - 一个 Evidence Record 只能逐字段绑定一个现有成功 observation 的 `observationId`、`toolCallId`、Snapshot identity、规范范围和 excerpt hash。一个 Claim 显式标为 `source_fact`，且只能引用当前 Run 已登记的 Evidence IDs。
 - Evidence Gate 会拒绝空、未知或重复的 Claim/Evidence 关系，并从 Journal 重算已批准 Run Budget 的 model turns、tool calls、按 Source Snapshot identity 去重的 distinct sources、source bytes 与 wall time。它不通过时不创建 draft artifact、更不会触碰用户 target。
@@ -137,7 +183,7 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 
 ## Journal、Trace 与恢复边界
 
-Run Journal 是 canonical history；Projection cache 和 Trace 都可丢弃并从 Journal 重建。Trace 按顺序保留安全 lineage：来源读取的 observation/tool call/Snapshot，每个 Evidence 的相同 observation/tool call/Snapshot，再到 Claim ID、draft artifact ID、publication receipt ID 与最终 Markdown SHA-256；它不包含源正文、绝对来源路径、私有 Runtime Home 或 OS 错误。
+Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 completed Model Turns、工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim、research completion/budget suspension、draft、publication receipt 与最终 Markdown SHA-256；它不包含绝对来源路径、私有 Runtime Home 或 OS 错误。
 
 `publication_approved` 只表示用户授权了精确 draft/target，状态为 `ready_to_publish`。重启不会自动写文件；只有显式 `publishLearningArtifact` 成功返回后才追加 `learning_artifact_published` 并进入 `completed`。如果进程在外部写入尝试和该 Journal 事件之间崩溃，当前实现不会把“文件可能存在”猜成完成；完整 effect crash reconciliation 留给 Issue #14。
 
@@ -146,17 +192,20 @@ Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE
 ## 学习入口
 
 - `src/application/research-agent-runtime.ts`：public command seam、两层 user approval、Evidence Gate 之前的模型边界与外部 publication 调用点。
+- `src/infrastructure/private-source-search.ts`：固定参数 `rg`、root identity 复核、discovery 过滤与逐命中 realpath preflight。
 - `src/domain/reducer.ts`：追加 Journal 如何确定性派生 Evidence/Claim/draft/approval/completed 状态，并重新验证所有关联。
 - `src/domain/evidence-gate.ts` 与 `src/domain/learning-artifact.ts`：结构化引文授权和 deterministic Markdown renderer。
 - `src/infrastructure/private-source-access.ts`：canonical Source Scope、handle 读取与 Snapshot 前的 policy boundary。
 - `src/infrastructure/sqlite-run-store.ts`：Journal、Projection cache、Source Snapshot registry 与通用 artifact registry 的事务对应关系。
 - `src/infrastructure/learning-artifact-publisher.ts`：target identity、same-directory no-clobber atomic publication 与不同内容拒绝。
 - `tests/runtime/learning-artifact-publication.test.ts`：ScriptedModel happy path、Gate、target identity、direct replay tamper 与 Trace lineage。
+- `tests/runtime/research-loop.test.ts`：五工具多轮 happy path、错误 observation、五维预算暂停、steering/pinned Model View 与确定性裁剪。
 - `docs/architecture.md`：组件图、状态机、publication effect 的明确恢复边界。
 
 ## 尚未实现
 
-- Issue #6：真正的 `search_sources`、模型可见 Research Tools 与有界多轮 Research Loop。
 - Issue #7：明确错误分类、retry policy、attempt 记录和恢复状态。
 - Issue #8：Vercel AI SDK `streamText` 驱动的 OpenAI-compatible live Model Port；SDK 类型仍必须隔离在 `ModelPort` 后。
+- Issue #9：用户暂停、取消、预算版本扩展与从 `budget_exhausted` 精确恢复。
+- Issue #11：安全 search/read sibling batch 的有界并发与模型原始顺序回填。
 - Issue #14：publication 外部 effect 的 durable operation、crash reconciliation 与精确恢复协议。

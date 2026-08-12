@@ -9,6 +9,7 @@ import {
 } from "../domain/integrity.js";
 import {
   assertEvidenceGateBudget,
+  countLogicalToolCalls,
   EvidenceGateError,
   evaluateEvidenceGate,
 } from "../domain/evidence-gate.js";
@@ -40,6 +41,13 @@ import type {
   RunTrace,
   SourceReadObservation,
   SourceScope,
+  ModelTurn,
+  ModelView,
+  ResearchPlan,
+  ResearchToolIntent,
+  ResearchToolObservation,
+  RemainingRunBudget,
+  SucceededSourceReadObservation,
 } from "../domain/types.js";
 import { ContentAddressedArtifactStore } from "../infrastructure/content-addressed-artifact-store.js";
 import {
@@ -58,6 +66,7 @@ import {
   LearningArtifactPublisher,
   PublicationTargetPreparationError,
 } from "../infrastructure/learning-artifact-publisher.js";
+import { searchApprovedSources } from "../infrastructure/private-source-search.js";
 import type { Clock, IdGenerator, ModelPort } from "./ports.js";
 
 /** 打开一个 headless runtime 所需的基础设施与可控边界。 */
@@ -72,6 +81,8 @@ export interface OpenRuntimeOptions {
   readonly clock?: Clock;
   /** 可选 identity 边界；生产默认使用 UUID。 */
   readonly ids?: IdGenerator;
+  /** 单个 Model View 允许的确定性 JSON UTF-8 字节数；不足以容纳 pinned facts 时暂停。 */
+  readonly maxModelViewBytes?: number;
 }
 
 /** 创建新 Research Run 的应用命令。 */
@@ -136,6 +147,14 @@ export interface RecordClaimCommand {
   readonly text: string;
   /** 至少一个既有 Evidence identity，顺序是未来渲染的显式引用顺序。 */
   readonly evidenceIds: readonly string[];
+}
+
+/** 从 canonical facts 推进有界 Research Loop 的应用命令。 */
+export interface AdvanceResearchCommand {
+  /** 当前必须处于 researching 的 Research Run identity。 */
+  readonly runId: string;
+  /** 本次推进要固定进 Model View 的最新用户 steering；空白值会被拒绝。 */
+  readonly steering?: string;
 }
 
 /** 让模型在既有 Evidence-backed Claims 中选择 Markdown draft 的应用命令。 */
@@ -384,6 +403,22 @@ export class LearningArtifactPublicationError extends Error {
   }
 }
 
+/** Research Loop 无法从 canonical facts 安全推进时抛出的稳定应用错误。 */
+export class ResearchLoopError extends Error {
+  public constructor() {
+    super("Research Loop 无法安全推进");
+    this.name = "ResearchLoopError";
+  }
+}
+
+/** 确定性裁剪后仍无法容纳 pinned Model View 时抛出的显式停止错误。 */
+export class ModelViewTooLargeError extends Error {
+  public constructor() {
+    super("Model View 在确定性裁剪后仍超出上下文预算");
+    this.name = "ModelViewTooLargeError";
+  }
+}
+
 const createRunCommandSchema = z.object({
   question: z.string().trim().min(1),
   sourceScope: z.unknown(),
@@ -451,6 +486,61 @@ const publishLearningArtifactCommandSchema = z
   })
   .strict();
 
+const advanceResearchCommandSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+    steering: z.string().trim().min(1).optional(),
+  })
+  .strict();
+
+const researchTurnOutputSchema = z
+  .object({
+    text: z.string(),
+    evidenceGaps: z.array(z.string().trim().min(1)),
+    finishReason: z.enum(["tool_calls", "stop"]),
+    toolIntents: z
+      .array(
+        z
+          .object({
+            intentId: z.string().trim().min(1),
+            name: z.enum([
+              "search_sources",
+              "read_source",
+              "record_evidence",
+              "propose_claim",
+              "complete_research",
+            ]),
+            input: z.json(),
+          })
+          .strict(),
+      )
+      .min(1),
+  })
+  .strict();
+
+const searchSourcesInputSchema = z
+  .object({
+    query: z.string().trim().min(1).max(500),
+    maxResults: z.number().int().positive().max(50),
+  })
+  .strict();
+
+const recordEvidenceInputSchema = z
+  .object({ observationId: z.string().trim().min(1) })
+  .strict();
+
+const proposeClaimInputSchema = z
+  .object({
+    kind: z.literal("source_fact"),
+    text: z.string().trim().min(1),
+    evidenceIds: z.array(z.string().trim().min(1)).min(1),
+  })
+  .strict();
+
+const completeResearchInputSchema = z
+  .object({ unresolvedQuestions: z.array(z.string().trim().min(1)) })
+  .strict();
+
 const systemClock: Clock = {
   now: () => new Date().toISOString(),
 };
@@ -483,6 +573,8 @@ export class ResearchAgentRuntime {
   readonly #store: SqliteRunStore;
   /** 只接收 exact target binding 与 Markdown bytes 的外部 publication 边界。 */
   readonly #publisher: LearningArtifactPublisher;
+  /** 不依赖 tokenizer/provider 的确定性 JSON byte 上限。 */
+  readonly #maxModelViewBytes: number;
 
   private constructor(options: OpenRuntimeOptions) {
     // 两个 store 只能收到同一次集中准备得到的 canonical Runtime Home，避免
@@ -491,6 +583,7 @@ export class ResearchAgentRuntime {
     this.#clock = options.clock ?? systemClock;
     this.#ids = options.ids ?? uuidGenerator;
     this.#model = options.model;
+    this.#maxModelViewBytes = options.maxModelViewBytes ?? 32_768;
     this.#artifacts = new ContentAddressedArtifactStore(runtimeHome);
     this.#store = new SqliteRunStore(runtimeHome);
     this.#publisher = new LearningArtifactPublisher({
@@ -660,7 +753,421 @@ export class ResearchAgentRuntime {
     return buildRunTrace(this.#store.readEvents(runId));
   }
 
+  public async advanceResearch(
+    command: AdvanceResearchCommand,
+  ): Promise<RunProjection> {
+    const parsedCommand = advanceResearchCommandSchema.safeParse(command);
+    if (!parsedCommand.success || this.#model.generateResearchTurn === undefined) {
+      throw new ResearchLoopError();
+    }
+    const { runId, steering } = parsedCommand.data;
+
+    // 每个迭代只做三件事：从 Journal 重建视图、提交一个完整 Model Turn、
+    // 顺序消费其 intents。任何一步崩溃后，canonical Projection 都能指出是该
+    // 重新 generation，还是先完成已经 durable 的 pending intent。
+    while (true) {
+      const current = this.#store.readProjection(runId);
+      if (
+        current.state.type === "research_complete" ||
+        current.state.type === "budget_exhausted"
+      ) {
+        return current;
+      }
+      if (current.state.type !== "researching") {
+        throw new ResearchLoopError();
+      }
+      const now = this.#clock.now();
+      const remainingBudget = this.#remainingBudget(current, now);
+      const exhausted = firstExhaustedDimension(
+        remainingBudget,
+        current.state.pendingToolIntents.length === 0 ? "model" : "tool",
+      );
+      if (exhausted !== undefined) {
+        return this.#suspendForBudget(current, exhausted, remainingBudget);
+      }
+      if (current.state.pendingToolIntents.length !== 0) {
+        await this.#executePendingResearchIntent(current);
+        continue;
+      }
+
+      const approvedPlan = parseResearchPlan(
+        await this.#artifacts.readJson(current.state.planArtifact),
+      );
+      const view = this.#fitModelView(this.#buildModelView(
+        current,
+        approvedPlan,
+        remainingBudget,
+        steering ?? current.state.latestSteering,
+      ));
+      let generated: z.infer<typeof researchTurnOutputSchema>;
+      try {
+        generated = researchTurnOutputSchema.parse(
+          await this.#model.generateResearchTurn(view),
+        );
+      } catch {
+        throw new ResearchLoopError();
+      }
+      const occurredAt = this.#clock.now();
+      const eventId = this.#ids.nextEventId();
+      const turn: ModelTurn = {
+        turnId: `turn-${eventId}`,
+        ...generated,
+        completedAt: occurredAt,
+      };
+      const event: ResearchRunEvent = {
+        eventId,
+        runId,
+        sequence: current.lastEventSequence + 1,
+        type: "model_turn_completed",
+        occurredAt,
+        payload: {
+          turn,
+          generationStartedAt: now,
+          ...(steering === undefined ? {} : { latestSteering: steering }),
+        },
+      };
+      try {
+        this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+      } catch {
+        throw new ResearchLoopError();
+      }
+    }
+  }
+
+  #buildModelView(
+    current: RunProjection,
+    approvedPlan: ResearchPlan,
+    remainingBudget: RemainingRunBudget,
+    latestSteering: string | undefined,
+  ): ModelView {
+    if (
+      current.state.type !== "researching" &&
+      current.state.type !== "research_complete"
+    ) {
+      throw new ResearchLoopError();
+    }
+    const researching = current.state;
+    const relevantEvidence = researching.evidenceRecords.map((evidence) => {
+      const observation = researching.sourceReadObservations.find(
+        (candidate): candidate is SucceededSourceReadObservation =>
+          candidate.status === "succeeded" &&
+          candidate.observationId === evidence.observationId,
+      );
+      if (observation === undefined) throw new ResearchLoopError();
+      return {
+        evidenceId: evidence.evidenceId,
+        relativePath: evidence.relativePath,
+        startLine: evidence.startLine,
+        endLine: evidence.endLine,
+        excerpt: observation.excerpt,
+      };
+    });
+    return {
+      runId: current.runId,
+      question: current.question,
+      fixedRules: [
+        "只能使用五个 Research Tools，不能请求 shell、publication 或预算变更。",
+        "Evidence 和 Claim identities 只能来自 Harness observations。",
+        "完成研究必须显式调用 complete_research 并保留未解决问题。",
+      ],
+      approvedPlan,
+      approvalBindingHash: current.state.approvalReceipt.bindingHash,
+      budgetVersion: current.runBudget.version,
+      remainingBudget,
+      evidenceGaps: current.state.evidenceGaps,
+      pendingIntents: current.state.pendingToolIntents,
+      relevantEvidence,
+      recentObservations: current.state.researchToolObservations.slice(-8),
+      ...(latestSteering === undefined ? {} : { latestSteering }),
+    };
+  }
+
+  #fitModelView(view: ModelView): ModelView {
+    let candidate = view;
+    while (
+      Buffer.byteLength(JSON.stringify(candidate), "utf8") >
+        this.#maxModelViewBytes &&
+      candidate.recentObservations.length > 0
+    ) {
+      candidate = {
+        ...candidate,
+        recentObservations: candidate.recentObservations.slice(1),
+      };
+    }
+    while (
+      Buffer.byteLength(JSON.stringify(candidate), "utf8") >
+        this.#maxModelViewBytes &&
+      candidate.relevantEvidence.length > 0
+    ) {
+      candidate = {
+        ...candidate,
+        relevantEvidence: candidate.relevantEvidence.slice(0, -1),
+      };
+    }
+    if (
+      Buffer.byteLength(JSON.stringify(candidate), "utf8") >
+      this.#maxModelViewBytes
+    ) {
+      // fixed rules、批准计划、审批/预算、pending intents、gaps 与 steering 都是
+      // pinned facts。宁可明确停止，也不能用 LLM 摘要或静默删约束来“适配”窗口。
+      throw new ModelViewTooLargeError();
+    }
+    return candidate;
+  }
+
+  async #executePendingResearchIntent(current: RunProjection): Promise<void> {
+    if (current.state.type !== "researching") throw new ResearchLoopError();
+    const intent = current.state.pendingToolIntents[0];
+    if (intent === undefined) return;
+    switch (intent.name) {
+      case "search_sources":
+        await this.#executeSearchIntent(current, intent);
+        return;
+      case "read_source":
+        await this.#executeReadIntent(current, intent);
+        return;
+      case "record_evidence":
+        await this.#executeEvidenceIntent(current, intent);
+        return;
+      case "propose_claim":
+        await this.#executeClaimIntent(current, intent);
+        return;
+      case "complete_research":
+        await this.#executeCompletionIntent(current, intent);
+        return;
+    }
+  }
+
+  async #executeSearchIntent(
+    current: RunProjection,
+    intent: ResearchToolIntent,
+  ): Promise<void> {
+    const parsed = searchSourcesInputSchema.safeParse(intent.input);
+    if (!parsed.success) {
+      this.#appendGenericToolObservation(current, intent, "invalid", "invalid_tool_schema");
+      return;
+    }
+    try {
+      const matches = await searchApprovedSources(current.sourceScope, parsed.data);
+      this.#appendGenericToolObservation(
+        current,
+        intent,
+        "succeeded",
+        undefined,
+        `找到 ${matches.length} 个批准来源命中：${matches.map((match) => match.relativePath).join(", ") || "none"}`,
+        { matches },
+      );
+    } catch {
+      this.#appendGenericToolObservation(current, intent, "failed", "search_failed");
+    }
+  }
+
+  async #executeReadIntent(current: RunProjection, intent: ResearchToolIntent): Promise<void> {
+    const parsed = readSourceRequestSchema.safeParse(intent.input);
+    if (!parsed.success) {
+      this.#appendGenericToolObservation(current, intent, "invalid", "invalid_tool_schema");
+      return;
+    }
+    const remaining = this.#remainingBudget(current, this.#clock.now());
+    if (remaining.sourceBytes === 0) {
+      this.#suspendForBudget(current, "source_bytes", remaining);
+      return;
+    }
+    await this.#readSource(
+      { runId: current.runId, request: parsed.data },
+      intent,
+    );
+  }
+
+  async #executeEvidenceIntent(current: RunProjection, intent: ResearchToolIntent): Promise<void> {
+    const parsed = recordEvidenceInputSchema.safeParse(intent.input);
+    if (!parsed.success) {
+      this.#appendGenericToolObservation(current, intent, "invalid", "invalid_tool_schema");
+      return;
+    }
+    try {
+      await this.#recordEvidence(
+        { runId: current.runId, ...parsed.data },
+        intent,
+      );
+    } catch {
+      this.#appendGenericToolObservation(current, intent, "failed", "stale_observation");
+    }
+  }
+
+  async #executeClaimIntent(current: RunProjection, intent: ResearchToolIntent): Promise<void> {
+    const parsed = proposeClaimInputSchema.safeParse(intent.input);
+    if (!parsed.success) {
+      this.#appendGenericToolObservation(current, intent, "invalid", "invalid_tool_schema");
+      return;
+    }
+    try {
+      await this.#recordClaim(
+        { runId: current.runId, ...parsed.data },
+        intent,
+      );
+    } catch {
+      this.#appendGenericToolObservation(current, intent, "failed", "claim_rejected");
+    }
+  }
+
+  async #executeCompletionIntent(current: RunProjection, intent: ResearchToolIntent): Promise<void> {
+    const parsed = completeResearchInputSchema.safeParse(intent.input);
+    if (!parsed.success) {
+      this.#appendGenericToolObservation(current, intent, "invalid", "invalid_tool_schema");
+      return;
+    }
+    if (current.state.type !== "researching" || current.state.pendingToolIntents.length !== 1) {
+      this.#appendGenericToolObservation(
+        current,
+        intent,
+        "invalid",
+        "completion_not_last",
+      );
+      return;
+    }
+    const occurredAt = this.#clock.now();
+    const observation = this.#createResearchObservation(
+      intent,
+      "succeeded",
+      undefined,
+      `研究显式完成，保留 ${parsed.data.unresolvedQuestions.length} 个未解决问题`,
+      { unresolvedQuestions: parsed.data.unresolvedQuestions },
+      occurredAt,
+    );
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId: current.runId,
+      sequence: current.lastEventSequence + 1,
+      type: "research_completed",
+      occurredAt,
+      payload: {
+        completion: { ...parsed.data, completedAt: occurredAt },
+        observation,
+      },
+    };
+    this.#store.appendEvents(current.runId, current.lastEventSequence, [event]);
+  }
+
+  #appendResearchObservationOnly(
+    current: RunProjection,
+    observation: ResearchToolObservation,
+  ): RunProjection {
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId: current.runId,
+      sequence: current.lastEventSequence + 1,
+      type: "research_tool_observed",
+      occurredAt: observation.observedAt,
+      payload: { observation },
+    };
+    return this.#store.appendEvents(current.runId, current.lastEventSequence, [event]);
+  }
+
+  #appendGenericToolObservation(
+    current: RunProjection,
+    intent: ResearchToolIntent,
+    status: ResearchToolObservation["status"],
+    code?: string,
+    summary = `${intent.name} ${status}${code === undefined ? "" : `: ${code}`}`,
+    output?: ResearchToolObservation["output"],
+  ): RunProjection {
+    return this.#appendResearchObservationOnly(
+      current,
+      this.#createResearchObservation(intent, status, code, summary, output),
+    );
+  }
+
+  #createResearchObservation(
+    intent: ResearchToolIntent,
+    status: ResearchToolObservation["status"],
+    code: string | undefined,
+    summary: string,
+    output?: ResearchToolObservation["output"],
+    observedAt = this.#clock.now(),
+  ): ResearchToolObservation {
+    return {
+      observationId: this.#ids.nextObservationId(),
+      toolCallId: this.#ids.nextToolCallId(),
+      intentId: intent.intentId,
+      toolName: intent.name,
+      status,
+      ...(code === undefined ? {} : { code }),
+      summary,
+      ...(output === undefined ? {} : { output }),
+      observedAt,
+    };
+  }
+
+  #remainingBudget(current: RunProjection, evaluatedAt: string): RemainingRunBudget {
+    if (
+      current.state.type !== "researching" &&
+      current.state.type !== "research_complete" &&
+      current.state.type !== "budget_exhausted"
+    ) {
+      throw new ResearchLoopError();
+    }
+    const distinctSources = new Set(
+      current.state.sourceReadObservations.flatMap((observation) =>
+        observation.status === "succeeded"
+          ? [observation.sourceSnapshot.snapshotId]
+          : [],
+      ),
+    ).size;
+    const elapsedMs =
+      current.state.researchStartedAt === undefined
+        ? 0
+        : Math.max(0, Date.parse(evaluatedAt) - Date.parse(current.state.researchStartedAt));
+    return {
+      modelTurns: Math.max(
+        0,
+        current.runBudget.maxModelTurns - 1 - current.state.modelTurns.length,
+      ),
+      toolCalls: Math.max(
+        0,
+        current.runBudget.maxToolCalls - countLogicalToolCalls(
+          current.state.sourceReadObservations,
+          current.state.researchToolObservations,
+        ),
+      ),
+      distinctSources: Math.max(
+        0,
+        current.runBudget.maxDistinctSources - distinctSources,
+      ),
+      sourceBytes: Math.max(
+        0,
+        current.runBudget.maxSourceBytes - current.state.sourceBytesRead,
+      ),
+      wallTimeMs: Math.max(0, current.runBudget.maxWallTimeMs - elapsedMs),
+    };
+  }
+
+  #suspendForBudget(
+    current: RunProjection,
+    exhaustedDimension: "model_turns" | "tool_calls" | "distinct_sources" | "source_bytes" | "wall_time",
+    remainingBudget: RemainingRunBudget,
+  ): RunProjection {
+    const occurredAt = this.#clock.now();
+    return this.#store.appendEvents(current.runId, current.lastEventSequence, [
+      {
+        eventId: this.#ids.nextEventId(),
+        runId: current.runId,
+        sequence: current.lastEventSequence + 1,
+        type: "run_budget_exhausted",
+        occurredAt,
+        payload: { exhaustedDimension, remainingBudget },
+      },
+    ]);
+  }
+
   public async readSource(command: ReadSourceCommand): Promise<RunProjection> {
+    return this.#readSource(command);
+  }
+
+  async #readSource(
+    command: ReadSourceCommand,
+    researchIntent?: ResearchToolIntent,
+  ): Promise<RunProjection> {
     const parsedCommand = readSourceCommandSchema.safeParse(command);
     if (!parsedCommand.success) {
       // caller 可能把 secret path 或自造 authority 塞进错误输入；错误边界不回显。
@@ -678,7 +1185,10 @@ export class ResearchAgentRuntime {
       // payload 或 identity；readSource 的公开错误边界不把它们转交给调用方。
       throw new SourceReadPersistenceError();
     }
-    if (current.state.type !== "researching") {
+    if (
+      current.state.type !== "researching" &&
+      current.state.type !== "research_complete"
+    ) {
       throw new IllegalSourceReadStateError();
     }
 
@@ -756,7 +1266,32 @@ export class ResearchAgentRuntime {
       sequence: current.lastEventSequence + 1,
       type: "source_read_observed",
       occurredAt: observedAt,
-      payload: { observation },
+      payload: {
+        observation,
+        ...(researchIntent === undefined
+          ? {}
+          : {
+              researchObservation: {
+                observationId: observation.observationId,
+                toolCallId: observation.toolCallId,
+                intentId: researchIntent.intentId,
+                toolName: "read_source",
+                status: observation.status,
+                ...(observation.status === "succeeded"
+                  ? {
+                      summary: `读取 ${observation.relativePath}:${observation.startLine}-${observation.endLine} 成功`,
+                      output: {
+                        sourceObservationId: observation.observationId,
+                      },
+                    }
+                  : {
+                      code: observation.code,
+                      summary: `read_source ${observation.status}: ${observation.code}`,
+                    }),
+                observedAt,
+              },
+            }),
+      },
     };
 
     try {
@@ -784,6 +1319,13 @@ export class ResearchAgentRuntime {
 
   public async recordEvidence(
     command: RecordEvidenceCommand,
+  ): Promise<RunProjection> {
+    return this.#recordEvidence(command);
+  }
+
+  async #recordEvidence(
+    command: RecordEvidenceCommand,
+    researchIntent?: ResearchToolIntent,
   ): Promise<RunProjection> {
     const parsedCommand = recordEvidenceCommandSchema.safeParse(command);
     if (!parsedCommand.success) {
@@ -840,7 +1382,21 @@ export class ResearchAgentRuntime {
       sequence: current.lastEventSequence + 1,
       type: "evidence_recorded",
       occurredAt,
-      payload: { evidence },
+      payload: {
+        evidence,
+        ...(researchIntent === undefined
+          ? {}
+          : {
+              researchObservation: this.#createResearchObservation(
+                researchIntent,
+                "succeeded",
+                undefined,
+                `已登记 Evidence ${evidence.evidenceId}`,
+                { evidenceId: evidence.evidenceId },
+                occurredAt,
+              ),
+            }),
+      },
     };
 
     try {
@@ -854,6 +1410,13 @@ export class ResearchAgentRuntime {
   }
 
   public async recordClaim(command: RecordClaimCommand): Promise<RunProjection> {
+    return this.#recordClaim(command);
+  }
+
+  async #recordClaim(
+    command: RecordClaimCommand,
+    researchIntent?: ResearchToolIntent,
+  ): Promise<RunProjection> {
     const parsedCommand = recordClaimCommandSchema.safeParse(command);
     if (!parsedCommand.success) {
       throw new InvalidClaimCommandError();
@@ -895,7 +1458,21 @@ export class ResearchAgentRuntime {
       sequence: current.lastEventSequence + 1,
       type: "claim_recorded",
       occurredAt,
-      payload: { claim },
+      payload: {
+        claim,
+        ...(researchIntent === undefined
+          ? {}
+          : {
+              researchObservation: this.#createResearchObservation(
+                researchIntent,
+                "succeeded",
+                undefined,
+                `已登记 Claim ${claim.claimId}`,
+                { claimId: claim.claimId },
+                occurredAt,
+              ),
+            }),
+      },
     };
 
     try {
@@ -922,7 +1499,10 @@ export class ResearchAgentRuntime {
     } catch {
       throw new LearningArtifactDraftError();
     }
-    if (current.state.type !== "researching") {
+    if (
+      current.state.type !== "researching" &&
+      current.state.type !== "research_complete"
+    ) {
       throw new IllegalLearningArtifactStateError();
     }
     const researching = current.state;
@@ -937,6 +1517,13 @@ export class ResearchAgentRuntime {
     if (current.runBudget.maxModelTurns < 2) {
       // 当前 one-shot slice 已经用 `proposePlan` 消耗一 turn；没有第二 turn 时
       // 不允许调用 Artifact proposal ModelPort，以免先产生未授权模型副作用。
+      throw new EvidenceGateBlockedError();
+    }
+    if (
+      current.runBudget.maxModelTurns - 1 - researching.modelTurns.length <= 0
+    ) {
+      // Artifact proposal 也是 Model Port generation。预算必须在调用前预留，不能
+      // 先制造模型副作用，再由 Gate 在返回后发现已经超限。
       throw new EvidenceGateBlockedError();
     }
 
@@ -954,11 +1541,17 @@ export class ResearchAgentRuntime {
       );
       proposedAt = this.#clock.now();
       assertEvidenceGateBudget({
-        modelTurnsUsed: 2,
+        modelTurnsUsed: 2 + researching.modelTurns.length,
+        toolCallsUsed: countLogicalToolCalls(
+          researching.sourceReadObservations,
+          researching.researchToolObservations,
+        ),
         sourceReadObservations: researching.sourceReadObservations,
         runBudget: current.runBudget,
-        runCreatedAt: current.createdAt,
-        evaluatedAt: proposedAt,
+        wallTimeStartedAt:
+          researching.researchStartedAt ?? current.createdAt,
+        wallTimeEndedAt:
+          researching.completion?.completedAt ?? proposedAt,
       });
       const gate = evaluateEvidenceGate(
         proposal,
@@ -1192,4 +1785,16 @@ export class ResearchAgentRuntime {
   public close(): void {
     this.#store.close();
   }
+}
+
+function firstExhaustedDimension(
+  remaining: RemainingRunBudget,
+  phase: "model" | "tool" = "model",
+): "model_turns" | "tool_calls" | "distinct_sources" | "source_bytes" | "wall_time" | undefined {
+  if (remaining.wallTimeMs === 0) return "wall_time";
+  if (phase === "model" && remaining.modelTurns === 0) return "model_turns";
+  if (remaining.toolCalls === 0) return "tool_calls";
+  if (remaining.distinctSources === 0) return "distinct_sources";
+  if (remaining.sourceBytes === 0) return "source_bytes";
+  return undefined;
 }

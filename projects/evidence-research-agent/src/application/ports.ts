@@ -2,6 +2,8 @@ import type {
   Claim,
   EvidenceRecord,
   LearningArtifactProposal,
+  ModelTurn,
+  ModelView,
   ResearchPlan,
   SourceScope,
 } from "../domain/types.js";
@@ -56,4 +58,6 @@ export interface ModelPort {
   proposeLearningArtifact(
     request: LearningArtifactProposalRequest,
   ): Promise<LearningArtifactProposal>;
+  /** 从 Harness 构建的 Model View 完成一个 Research Loop generation。 */
+  generateResearchTurn?(view: ModelView): Promise<Omit<ModelTurn, "turnId" | "completedAt">>;
 }

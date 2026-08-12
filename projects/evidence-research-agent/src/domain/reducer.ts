@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 
 import {
   assertEvidenceGateBudget,
+  countLogicalToolCalls,
   EvidenceGateError,
   evaluateEvidenceGate,
 } from "./evidence-gate.js";
@@ -36,6 +37,9 @@ import type {
   PublicationTarget,
   PublishedLearningArtifact,
   ResearchRunEvent,
+  ResearchToolIntent,
+  ResearchToolObservation,
+  ResearchingRunState,
   RunProjection,
   SourceReadObservation,
   RunTrace,
@@ -251,6 +255,83 @@ function applyRunEvent(
           sourceBytesRead: 0,
           evidenceRecords: [],
           claims: [],
+          modelTurns: [],
+          researchToolObservations: [],
+          evidenceGaps: [],
+          pendingToolIntents: [],
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "model_turn_completed": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError("只有 researching Run 可以提交 Model Turn");
+      }
+      if (current.state.pendingToolIntents.length !== 0) {
+        throw new IllegalRunEventError("pending Research Tool intent 尚未获得 observation");
+      }
+      const { turn } = event.payload;
+      if (
+        turn.turnId !== `turn-${event.eventId}` ||
+        turn.completedAt !== event.occurredAt ||
+        !isIsoUtc(turn.completedAt) ||
+        turn.toolIntents.length === 0 ||
+        new Set(turn.toolIntents.map((intent) => intent.intentId)).size !==
+          turn.toolIntents.length ||
+        turn.toolIntents.some(
+          (intent) =>
+            intent.intentId.trim() === "" ||
+            ![
+              "search_sources",
+              "read_source",
+              "record_evidence",
+              "propose_claim",
+              "complete_research",
+            ].includes(intent.name),
+        ) ||
+        current.state.modelTurns.length + 2 > current.runBudget.maxModelTurns
+        || !isIsoUtc(event.payload.generationStartedAt)
+        || Date.parse(event.payload.generationStartedAt) > Date.parse(event.occurredAt)
+      ) {
+        throw new IllegalRunEventError("Model Turn 公共字段无效");
+      }
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          modelTurns: [...current.state.modelTurns, turn],
+          evidenceGaps: turn.evidenceGaps,
+          pendingToolIntents: turn.toolIntents,
+          ...(event.payload.latestSteering === undefined
+            ? {}
+            : { latestSteering: event.payload.latestSteering }),
+          researchStartedAt:
+            current.state.researchStartedAt ?? event.payload.generationStartedAt,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "research_tool_observed": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError("只有 researching Run 可以记录 Research Tool observation");
+      }
+      const pending = validateResearchObservation(
+        current.state.pendingToolIntents,
+        current.state.researchToolObservations,
+        event.payload.observation,
+        event.occurredAt,
+      );
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          researchToolObservations: [
+            ...current.state.researchToolObservations,
+            event.payload.observation,
+          ],
+          pendingToolIntents: pending,
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -263,6 +344,18 @@ function applyRunEvent(
         );
       }
       const observation = event.payload.observation;
+      if (
+        event.payload.researchObservation !== undefined &&
+        (event.payload.researchObservation.observationId !==
+          observation.observationId ||
+          event.payload.researchObservation.toolCallId !== observation.toolCallId ||
+          event.payload.researchObservation.toolName !== "read_source" ||
+          event.payload.researchObservation.status !== observation.status ||
+          (observation.status !== "succeeded" &&
+            event.payload.researchObservation.code !== observation.code))
+      ) {
+        throw new IllegalRunEventError("read_source 领域 observation 与模型 observation 不一致");
+      }
       validateSourceReadObservation(
         current.sourceScope,
         current.state.sourceReadObservations,
@@ -298,6 +391,11 @@ function applyRunEvent(
             observation,
           ],
           sourceBytesRead,
+          ...consumeEmbeddedResearchObservation(
+            current.state,
+            event.payload.researchObservation,
+            event.occurredAt,
+          ),
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -323,6 +421,11 @@ function applyRunEvent(
             ...current.state.evidenceRecords,
             event.payload.evidence,
           ],
+          ...consumeEmbeddedResearchObservation(
+            current.state,
+            event.payload.researchObservation,
+            event.occurredAt,
+          ),
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -343,13 +446,86 @@ function applyRunEvent(
         state: {
           ...current.state,
           claims: [...current.state.claims, event.payload.claim],
+          ...consumeEmbeddedResearchObservation(
+            current.state,
+            event.payload.researchObservation,
+            event.occurredAt,
+          ),
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "research_completed": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError("只有 researching Run 可以显式完成研究");
+      }
+      const remaining = validateResearchObservation(
+        current.state.pendingToolIntents,
+        current.state.researchToolObservations,
+        event.payload.observation,
+        event.occurredAt,
+      );
+      if (
+        event.payload.observation.toolName !== "complete_research" ||
+        event.payload.observation.status !== "succeeded" ||
+        remaining.length !== 0 ||
+        event.payload.completion.completedAt !== event.occurredAt ||
+        !isIsoUtc(event.payload.completion.completedAt)
+      ) {
+        throw new IllegalRunEventError("Research completion 与 pending intent 不一致");
+      }
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "research_complete",
+          pendingToolIntents: [],
+          researchToolObservations: [
+            ...current.state.researchToolObservations,
+            event.payload.observation,
+          ],
+          completion: event.payload.completion,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "run_budget_exhausted": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError("只有 researching Run 可以因预算暂停");
+      }
+      const expectedRemaining = remainingBudgetFromProjection(
+        current,
+        event.occurredAt,
+      );
+      const expectedDimension = firstExhaustedBudgetDimension(
+        expectedRemaining,
+        current.state.pendingToolIntents.length === 0 ? "model" : "tool",
+      );
+      if (
+        expectedDimension !== event.payload.exhaustedDimension ||
+        !remainingBudgetsEqual(expectedRemaining, event.payload.remainingBudget)
+      ) {
+        throw new IllegalRunEventError("budget_exhausted 事件与 canonical usage 不一致");
+      }
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "budget_exhausted",
+          exhaustedDimension: event.payload.exhaustedDimension,
+          remainingBudget: event.payload.remainingBudget,
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
     }
     case "learning_artifact_draft_proposed": {
-      if (current.state.type !== "researching") {
+      if (
+        current.state.type !== "researching" &&
+        current.state.type !== "research_complete"
+      ) {
         throw new IllegalRunEventError(
           "只有 researching Run 可以提出 Learning Artifact draft",
         );
@@ -421,6 +597,76 @@ function applyRunEvent(
   }
 }
 
+function remainingBudgetFromProjection(
+  projection: RunProjection,
+  evaluatedAt: string,
+): import("./types.js").RemainingRunBudget {
+  if (projection.state.type !== "researching") {
+    throw new IllegalRunEventError("只有 researching Projection 可计算剩余预算");
+  }
+  const distinctSources = new Set(
+    projection.state.sourceReadObservations.flatMap((observation) =>
+      observation.status === "succeeded"
+        ? [observation.sourceSnapshot.snapshotId]
+        : [],
+    ),
+  ).size;
+  const elapsedMs =
+    projection.state.researchStartedAt === undefined
+      ? 0
+      : Date.parse(evaluatedAt) - Date.parse(projection.state.researchStartedAt);
+  if (!Number.isSafeInteger(elapsedMs) || elapsedMs < 0) {
+    throw new IllegalRunEventError("Research Loop wall time 无效");
+  }
+  return {
+    modelTurns: Math.max(
+      0,
+      projection.runBudget.maxModelTurns - 1 - projection.state.modelTurns.length,
+    ),
+    toolCalls: Math.max(
+      0,
+      projection.runBudget.maxToolCalls - countLogicalToolCalls(
+        projection.state.sourceReadObservations,
+        projection.state.researchToolObservations,
+      ),
+    ),
+    distinctSources: Math.max(
+      0,
+      projection.runBudget.maxDistinctSources - distinctSources,
+    ),
+    sourceBytes: Math.max(
+      0,
+      projection.runBudget.maxSourceBytes - projection.state.sourceBytesRead,
+    ),
+    wallTimeMs: Math.max(0, projection.runBudget.maxWallTimeMs - elapsedMs),
+  };
+}
+
+function firstExhaustedBudgetDimension(
+  remaining: import("./types.js").RemainingRunBudget,
+  phase: "model" | "tool",
+): import("./types.js").BudgetExhaustedRunState["exhaustedDimension"] | undefined {
+  if (remaining.wallTimeMs === 0) return "wall_time";
+  if (phase === "model" && remaining.modelTurns === 0) return "model_turns";
+  if (remaining.toolCalls === 0) return "tool_calls";
+  if (remaining.distinctSources === 0) return "distinct_sources";
+  if (remaining.sourceBytes === 0) return "source_bytes";
+  return undefined;
+}
+
+function remainingBudgetsEqual(
+  left: import("./types.js").RemainingRunBudget,
+  right: import("./types.js").RemainingRunBudget,
+): boolean {
+  return (
+    left.modelTurns === right.modelTurns &&
+    left.toolCalls === right.toolCalls &&
+    left.distinctSources === right.distinctSources &&
+    left.sourceBytes === right.sourceBytes &&
+    left.wallTimeMs === right.wallTimeMs
+  );
+}
+
 function traceLineage(
   event: ResearchRunEvent,
 ): Pick<
@@ -448,6 +694,21 @@ function traceLineage(
         : {}),
     };
   }
+  if (event.type === "research_tool_observed") {
+    return {
+      toolCallId: event.payload.observation.toolCallId,
+      observationId: event.payload.observation.observationId,
+      observationStatus:
+        event.payload.observation.status === "succeeded" ? "succeeded" : "failed",
+    };
+  }
+  if (event.type === "research_completed") {
+    return {
+      toolCallId: event.payload.observation.toolCallId,
+      observationId: event.payload.observation.observationId,
+      observationStatus: "succeeded",
+    };
+  }
   if (event.type === "evidence_recorded") {
     return {
       evidenceId: event.payload.evidence.evidenceId,
@@ -469,6 +730,58 @@ function traceLineage(
     return { learningArtifactSha256: event.payload.learningArtifact.sha256 };
   }
   return {};
+}
+
+function consumeEmbeddedResearchObservation(
+  state: ResearchingRunState,
+  observation: ResearchToolObservation | undefined,
+  occurredAt: string,
+): Pick<
+  typeof state,
+  "researchToolObservations" | "pendingToolIntents"
+> {
+  if (observation === undefined) {
+    return {
+      researchToolObservations: state.researchToolObservations,
+      pendingToolIntents: state.pendingToolIntents,
+    };
+  }
+  return {
+    researchToolObservations: [...state.researchToolObservations, observation],
+    pendingToolIntents: validateResearchObservation(
+      state.pendingToolIntents,
+      state.researchToolObservations,
+      observation,
+      occurredAt,
+    ),
+  };
+}
+
+function validateResearchObservation(
+  pendingIntents: readonly ResearchToolIntent[],
+  priorObservations: readonly ResearchToolObservation[],
+  observation: ResearchToolObservation,
+  occurredAt: string,
+): readonly ResearchToolIntent[] {
+  const intent = pendingIntents[0];
+  if (
+    intent === undefined ||
+    observation.intentId !== intent.intentId ||
+    observation.toolName !== intent.name ||
+    observation.observationId.trim() === "" ||
+    observation.toolCallId.trim() === "" ||
+    observation.summary.trim() === "" ||
+    observation.observedAt !== occurredAt ||
+    !isIsoUtc(observation.observedAt) ||
+    priorObservations.some(
+      (prior) =>
+        prior.observationId === observation.observationId ||
+        prior.toolCallId === observation.toolCallId,
+    )
+  ) {
+    throw new IllegalRunEventError("Research Tool observation 未精确消费 pending intent");
+  }
+  return pendingIntents.slice(1);
 }
 
 function validateSourceReadObservation(
@@ -641,7 +954,10 @@ function validateLearningArtifactDraft(
   payload: LearningArtifactDraftProposedPayload,
   occurredAt: string,
 ): void {
-  if (projection.state.type !== "researching") {
+  if (
+    projection.state.type !== "researching" &&
+    projection.state.type !== "research_complete"
+  ) {
     throw new IllegalRunEventError("Learning Artifact draft 必须来自 researching Run");
   }
   const researching = projection.state;
@@ -685,11 +1001,17 @@ function validateLearningArtifactDraft(
   let markdown: string;
   try {
     assertEvidenceGateBudget({
-      modelTurnsUsed: 2,
+      modelTurnsUsed: 2 + researching.modelTurns.length,
+      toolCallsUsed: countLogicalToolCalls(
+        researching.sourceReadObservations,
+        researching.researchToolObservations,
+      ),
       sourceReadObservations: researching.sourceReadObservations,
       runBudget: projection.runBudget,
-      runCreatedAt: projection.createdAt,
-      evaluatedAt: occurredAt,
+      wallTimeStartedAt:
+        researching.researchStartedAt ?? projection.createdAt,
+      wallTimeEndedAt:
+        researching.completion?.completedAt ?? occurredAt,
     });
     markdown = renderLearningArtifact(
       proposal,

@@ -2,12 +2,24 @@ import type {
   Claim,
   EvidenceRecord,
   LearningArtifactProposal,
+  ResearchToolObservation,
   RunBudget,
   SourceReadObservation,
 } from "./types.js";
 
 /** Evidence Gate 无法从已登记来源事实构造可发布 Markdown 时抛出的领域错误。 */
 export class EvidenceGateError extends Error {}
+
+/** 按稳定 `toolCallId` 去重显式读取与 Research Loop observation 的逻辑调用数。 */
+export function countLogicalToolCalls(
+  sourceReadObservations: readonly SourceReadObservation[],
+  researchToolObservations: readonly ResearchToolObservation[],
+): number {
+  return new Set([
+    ...sourceReadObservations.map((observation) => observation.toolCallId),
+    ...researchToolObservations.map((observation) => observation.toolCallId),
+  ]).size;
+}
 
 /** Gate 接受后可被 renderer 使用、且已经按模型选择顺序冻结的事实集合。 */
 export interface EvidenceGateResult {
@@ -21,14 +33,16 @@ export interface EvidenceGateResult {
 export interface EvidenceGateBudgetContext {
   /** 当前 one-shot slice 已由 Journal 可证明消耗的 ModelPort turn 数。 */
   readonly modelTurnsUsed: number;
+  /** Journal 可证明已完成的逻辑 Research Tool call 数。 */
+  readonly toolCallsUsed: number;
   /** Journal 中已经发生的安全来源读取 observation；每条都计入 tool-call 限额。 */
   readonly sourceReadObservations: readonly SourceReadObservation[];
   /** 创建 Run 时冻结并经计划审批绑定的多维预算。 */
   readonly runBudget: RunBudget;
-  /** `run_created` 的稳定 ISO 8601 UTC 时间，作为 wall-time 起点。 */
-  readonly runCreatedAt: string;
-  /** 本次 Gate 评估时间；draft replay 使用 event time，runtime 使用受控 Clock。 */
-  readonly evaluatedAt: string;
+  /** 计费活动开始时间；Research Loop 使用首个 Model Turn，显式旧路径使用 Run 创建时间。 */
+  readonly wallTimeStartedAt: string;
+  /** 计费活动结束时间；已完成 Research Loop 使用 completion 时间，活动路径使用 Gate 时间。 */
+  readonly wallTimeEndedAt: string;
 }
 
 /**
@@ -98,10 +112,10 @@ export function assertEvidenceGateBudget(
     ),
   ).size;
   const elapsedMs =
-    Date.parse(context.evaluatedAt) - Date.parse(context.runCreatedAt);
+    Date.parse(context.wallTimeEndedAt) - Date.parse(context.wallTimeStartedAt);
   if (
     context.modelTurnsUsed > context.runBudget.maxModelTurns ||
-    context.sourceReadObservations.length > context.runBudget.maxToolCalls ||
+    context.toolCallsUsed > context.runBudget.maxToolCalls ||
     distinctSources > context.runBudget.maxDistinctSources ||
     sourceBytesRead > context.runBudget.maxSourceBytes ||
     !Number.isSafeInteger(elapsedMs) ||

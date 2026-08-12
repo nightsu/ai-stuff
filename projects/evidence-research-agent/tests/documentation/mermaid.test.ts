@@ -18,7 +18,7 @@ it("parses every architecture Mermaid block", async () => {
   }
 });
 
-it("documents the Evidence-backed publication flow without introducing a research loop", async () => {
+it("documents the bounded Research Loop and its publication handoff", async () => {
   const markdown = await readArchitecture();
   const stateDiagram = extractMermaidDiagrams(markdown).find((diagram) =>
     /^stateDiagram-v2\b/m.test(diagram),
@@ -28,36 +28,44 @@ it("documents the Evidence-backed publication flow without introducing a researc
     throw new Error("architecture 缺少 stateDiagram-v2");
   }
 
-  expect(markdown).toContain("Runtime --> Policy");
-  expect(markdown).toContain(
-    'Policy -->|"approved explicit read"| Reader',
-  );
-  expect(markdown).toContain("Reader --> Snapshot");
-  expect(markdown).toContain("Snapshot --> Registry");
-  expect(markdown).toContain("Registry --> Observation");
-  expect(markdown).toContain(
-    'Policy -->|"denied or failed<br/>no snapshot"| Observation',
-  );
+  expect(markdown).toContain("Runtime --> Harness");
+  expect(markdown).toContain("Harness <--> Journal");
   expect(markdown).toContain("Journal --> Projection");
+  expect(markdown).toContain("Projection --> View");
+  expect(markdown).toContain("View --> Model");
+  expect(markdown).toContain("Model --> Loop");
+  expect(markdown).toContain("Loop --> Scheduler");
+  expect(markdown).toContain("Scheduler --> Search");
+  expect(markdown).toContain("Scheduler --> Read");
+  expect(markdown).toContain("Scheduler --> RecordEvidence");
+  expect(markdown).toContain("Scheduler --> ProposeClaim");
+  expect(markdown).toContain("Scheduler --> CompleteResearch");
+  expect(markdown).toContain('Search["search_sources"]');
+  expect(markdown).toContain('Read["read_source"]');
+  expect(markdown).toContain('RecordEvidence["record_evidence"]');
+  expect(markdown).toContain('ProposeClaim["propose_claim"]');
+  expect(markdown).toContain('CompleteResearch["complete_research"]');
   expect(markdown).toContain("Journal --> Trace");
-  expect(markdown).toContain("Observation --> Evidence");
-  expect(markdown).toContain("Evidence --> Claim");
-  expect(markdown).toContain("Claim --> Gate");
+  expect(markdown).toContain("CompleteResearch --> Journal");
+  expect(markdown).toContain("ResearchComplete --> Gate");
   expect(markdown).toContain("Gate --> Draft");
   expect(markdown).toContain("Draft --> Approval");
   expect(markdown).toContain("Approval --> Publisher");
   expect(markdown).toContain("Output Root");
   expect(stateDiagram).toMatch(
-    /^\s*researching\s*-->\s*researching\s*:\s*source_read_observed\s*$/m,
+    /^\s*researching\s*-->\s*researching\s*:\s*model_turn_completed\s*$/m,
   );
   expect(stateDiagram).toMatch(
-    /^\s*researching\s*-->\s*researching\s*:\s*evidence_recorded\s*$/m,
+    /^\s*researching\s*-->\s*researching\s*:\s*research_tool_observed\s*$/m,
   );
   expect(stateDiagram).toMatch(
-    /^\s*researching\s*-->\s*researching\s*:\s*claim_recorded\s*$/m,
+    /^\s*researching\s*-->\s*research_complete\s*:\s*research_completed\s*$/m,
   );
   expect(stateDiagram).toMatch(
-    /^\s*researching\s*-->\s*waiting_publication_approval\s*:\s*learning_artifact_draft_proposed\s*$/m,
+    /^\s*researching\s*-->\s*budget_exhausted\s*:\s*run_budget_exhausted\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*research_complete\s*-->\s*waiting_publication_approval\s*:\s*learning_artifact_draft_proposed\s*$/m,
   );
   expect(stateDiagram).toMatch(
     /^\s*waiting_publication_approval\s*-->\s*ready_to_publish\s*:\s*publication_approved\s*$/m,
@@ -65,13 +73,8 @@ it("documents the Evidence-backed publication flow without introducing a researc
   expect(stateDiagram).toMatch(
     /^\s*ready_to_publish\s*-->\s*completed\s*:\s*learning_artifact_published\s*$/m,
   );
-  expect(stateDiagram).not.toMatch(/\bsearch_sources\b/i);
-
-  const stateEdges = stateDiagram
-    .split("\n")
-    .filter((line) => /-->/.test(line))
-    .join("\n");
-  expect(stateEdges).not.toMatch(/\b(?:model|research[\s_-]*loop)\b/i);
+  expect(markdown).toContain("budget_exhausted");
+  expect(markdown).toContain("research_complete");
 });
 
 async function readArchitecture(): Promise<string> {

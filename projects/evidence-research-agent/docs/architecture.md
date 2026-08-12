@@ -1,62 +1,95 @@
-# Evidence Research Agent 架构（Issue #5）
+# Evidence Research Agent 架构（Issue #6）
 
-当前 slice 已经走通一条刻意收窄的 Learning Artifact 成功路径：一个 durable approved 的 Run 显式读取来源，先冻结完整 Source Snapshot，再把其中一次成功 observation 登记为 Evidence Record，记录一个分类为 `source_fact` 的 Claim，通过 Evidence Gate 生成私有 Markdown draft，等待用户批准**精确 draft hash、Output Root 与 canonical target identity**，最后以 normal no-clobber 写入完成 publication。
+当前 slice 已经把 #5 的 Evidence-backed publication 路径接到真正有界的多轮 Research Loop：一个 durable approved 的 Run 每轮从 canonical facts 重建 Model View，由 Scripted Model 返回完整、provider-neutral Model Turn，Harness 再按原始 intent 顺序调度五个模型可见 Research Tools。研究只有在 `complete_research` 成功后才成为 `research_complete`；任一硬预算耗尽则 durable 进入 `budget_exhausted`，不会被当作完成或进入 publication。
 
-这仍然不是自动研究 Agent：没有 `search_sources`、模型可见工具、自动工具调度、retry、live model 或多轮 Research Loop，也没有 publication crash reconciliation。
+外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。当前仍没有自动 retry、live model、并行 tool batch、预算扩展恢复或 publication crash reconciliation；这些分别属于后续 tickets。
 
 ## 组件、端口与单向能力流
 
 ```mermaid
 flowchart LR
-  Caller["TypeScript caller<br/>no publication CLI"] --> Runtime["ResearchAgentRuntime"]
+  Caller["TypeScript caller / CLI"] --> Runtime["ResearchAgentRuntime"]
+  Runtime --> Harness["Deterministic Harness"]
+
+  Harness <--> Journal["Run Journal"]
+  Journal --> Projection["Run Projection"]
+  Projection --> View["Model View Builder<br/>pinned facts + deterministic trimming"]
+  View --> Model["Model Port<br/>Scripted Model"]
+  Model --> Loop["Bounded Research Loop"]
+  Loop -->|"model_turn_completed"| Journal
+  Loop --> Scheduler["Research Tool Scheduler<br/>sequential in Issue #6"]
+
+  subgraph ResearchTools["Exactly five model-visible Research Tools"]
+    Search["search_sources"]
+    Read["read_source"]
+    RecordEvidence["record_evidence"]
+    ProposeClaim["propose_claim"]
+    CompleteResearch["complete_research"]
+  end
+
+  Scheduler --> Search
+  Scheduler --> Read
+  Scheduler --> RecordEvidence
+  Scheduler --> ProposeClaim
+  Scheduler --> CompleteResearch
 
   subgraph SourceBoundary["Private source boundary"]
     Policy["Shared Source policy<br/>canonical root + realpath preflight"]
-    Reader["Bounded UTF-8 capture"]
+    Searcher["Fixed-argument rg<br/>bounded discovery"]
+    Reader["Bounded UTF-8 capture<br/>explicit read only"]
   end
 
   subgraph RuntimeHome["Private Runtime Home"]
     Snapshot["ContentAddressedArtifactStore<br/>private Source Snapshot"]
     Registry["SqliteRunStore<br/>snapshot + artifact registry"]
-    Observation["Run Journal<br/>source_read_observed"]
-    Evidence["evidence_recorded"]
-    Claim["claim_recorded"]
+    Evidence["Evidence Records"]
+    Claim["Claims"]
     Draft["Private Markdown draft<br/>learning_artifact_draft_proposed"]
     Approval["User publication receipt<br/>publication_approved"]
-    Journal["Run Journal + Projection cache"]
   end
 
+  Search --> Policy
+  Policy --> Searcher
+  Searcher -->|"matches only; no snapshot"| Journal
+  Read --> Policy
+  Policy -->|"approved explicit read"| Reader
+  Reader --> Snapshot
+  Snapshot --> Registry
+  Registry -->|"source_read_observed + tool observation"| Journal
+  Policy -->|"denied / stale / failed observation"| Journal
+  RecordEvidence -->|"evidence_recorded + tool observation"| Journal
+  ProposeClaim -->|"claim_recorded + tool observation"| Journal
+  CompleteResearch --> Journal
+  Journal --> Evidence
+  Journal --> Claim
+
+  Projection --> Budget["Five-dimensional Run Budget"]
+  Budget -->|"hard limit"| Exhausted["budget_exhausted"]
+  Projection --> ResearchComplete["research_complete"]
   Gate["Evidence Gate + deterministic renderer"]
   Publisher["LearningArtifactPublisher<br/>same-directory no-clobber publish"]
   Trace["Run Trace projection"]
 
-  Runtime --> Policy
-  Policy -->|"approved explicit read"| Reader
-  Reader --> Snapshot
-  Snapshot --> Registry
-  Registry --> Observation
-  Policy -->|"denied or failed<br/>no snapshot"| Observation
-  Reader -->|"denied or failed<br/>no snapshot"| Observation
-  Observation --> Evidence
-  Evidence --> Claim
-  Claim --> Gate
+  ResearchComplete --> Gate
   Gate --> Draft
   Draft --> Approval
   Approval --> Publisher
   Publisher --> Journal
-  Observation --> Journal
-  Journal --> Projection["Run Projection cache"]
   Journal --> Trace
 ```
 
-`readSource` 与 Source Snapshot 的权限边界保持不变：Policy 没有 snapshot 写入能力，只有成功 explicit read 才能冻结完整原始字节；`denied`/`failed` 只落安全 observation。新增加的 Evidence Record 也没有读取 live file 的能力，它只能由 Runtime 根据一个早已持久化的成功 observation 逐字段派生：`observationId`、`toolCallId`、Snapshot identity、规范范围与 excerpt hash 都必须精确匹配。
+`advanceResearch` 是当前主 seam。每轮开始时，Runtime 只从 Run Journal、derived Projection 和 plan artifact 构造新的 Model View；它不会把 Journal 或完整 `messages[]` 直接传给模型。fixed rules、批准计划、approval binding、预算版本与余额、pending intents、evidence gaps 和最新 steering 是 pinned facts。超过 Model View 字节上限时，Builder 先删除最旧 observations，再从尾部删除 Evidence；pinned facts 仍放不下便抛出 `ModelViewTooLargeError`，不请求 LLM 摘要隐藏约束。
+
+Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_turn_completed`。该事件同时把有序 tool intents 变为 durable pending work；重启后的 `advanceResearch` 会先消费这些 pending intents，而不是再次 generation。Issue #6 的 scheduler 刻意顺序执行全部 intents；safe sibling search/read 的并发和原始顺序回填留给 Issue #11。
+
+`search_sources` 与 `read_source` 共享 Source Scope 权限边界。搜索通过固定参数 `rg` 下推 extension、exclusion、secret 与 file-size 过滤，启动前复核批准 root identity，每个命中再过 realpath preflight；命中只形成 observation，不创建 Snapshot。只有成功 explicit read 才冻结完整原始 UTF-8 字节；`invalid`、`denied`、`stale` 与 `failed` 都只落安全 observation。Evidence Record 也没有读取 live file 的能力，只能由 Runtime 从已持久化的成功 observation 逐字段派生。
 
 ## Evidence、Claim、Gate 与 draft 的职责分离
 
 1. **Source Snapshot** 解决“当时看到了哪一版完整字节”。完整文件而非仅摘录被冻结，因而以后可以核对读取范围所在的同一版本。
 2. **Evidence Record** 解决“哪一个已冻结来源事实可以被引用”。当前 `kind` 固定为 `source_fact`，一个成功 observation 最多登记一次 Evidence。
 3. **Claim** 解决“要在学习工件中表达什么”。当前最小 slice 也显式保存 `kind: source_fact`、文本与已有 `evidenceIds`；重复、未知、空引用、未分类文本或预渲染 citation 都会被 reducer 拒绝。
-4. **Evidence Gate** 在生成 draft 前检查模型选中的每个 Claim 都能通过结构化 `source_fact` Evidence 回溯，并从 Journal 重算已批准 Run Budget 的 model turns、tool calls、按 Source Snapshot identity 去重的 distinct sources、source bytes 与 wall time。没有有效 Evidence 或预算已耗尽时，Runtime 不创建 draft artifact，也不会触碰 publication target。
+4. **Evidence Gate** 在 `research_complete` 后检查模型选中的每个 Claim 都能通过结构化 `source_fact` Evidence 回溯，并从 Journal 重算实际 plan/research model turns、Research Tool calls、按 Source Snapshot identity 去重的 distinct sources、source bytes 与 Research Loop wall time。没有有效 Evidence、预算已耗尽或 Run 仍处于 `budget_exhausted` 时，Runtime 不创建 draft artifact，也不会触碰 publication target。
 5. **确定性 renderer** 是唯一产生 `【Evidence: <id>】` 的位置，并固定输出 `Claims`、`Evidence Index` 和紧凑 `Tool usage` 三个部分。`ModelPort.proposeLearningArtifact` 只能提交标题、摘要和既有 Claim ID 的展示顺序；它不能创建 Claim、Evidence 或 citation ID，且 title/summary/Claim 文本中的预渲染 `【Evidence:` token 会被拒绝。因此每一个可见 citation 都来自被 Gate 选中的结构化 Evidence。
 
 Markdown draft 写入私有通用 artifact namespace，并和引用它的 `learning_artifact_draft_proposed` 事件在同一个 SQLite 事务中注册。store 会拒绝“事件引用却没有匹配 artifact registry 行”的批次；Projection cache 与 Trace 仍从 canonical Journal 派生。
@@ -69,12 +102,26 @@ stateDiagram-v2
   created --> planning: planning_started
   planning --> waiting_plan_approval: plan_proposed
   waiting_plan_approval --> researching: plan_approved
+  researching --> researching: model_turn_completed
+  researching --> researching: research_tool_observed
   researching --> researching: source_read_observed
   researching --> researching: evidence_recorded
   researching --> researching: claim_recorded
-  researching --> waiting_publication_approval: learning_artifact_draft_proposed
+  researching --> research_complete: research_completed
+  researching --> budget_exhausted: run_budget_exhausted
+  research_complete --> waiting_publication_approval: learning_artifact_draft_proposed
   waiting_publication_approval --> ready_to_publish: publication_approved
   ready_to_publish --> completed: learning_artifact_published
+
+  note right of researching
+    complete Model Turn becomes canonical first
+    then pending intents execute in source order
+  end note
+
+  note right of budget_exhausted
+    resumable non-success suspension
+    budget extension belongs to Issue #9
+  end note
 
   note right of waiting_publication_approval
     binding = draftHash + Output Root identity
@@ -87,7 +134,9 @@ stateDiagram-v2
   end note
 ```
 
-`publication_approved` 不是“文件已经写好”的断言。用户命令只批准等待状态中显示的 `draftHash`、canonical Output Root、`targetCanonicalPath`、父目录 `device` 和 `inode` 的精确聚合 hash。Runtime 在接受 receipt 前重新捕获 root 与 target parent identity；若目录被替换、target 逃出 root 或 canonical target 改变，旧 binding 失效。receipt 进入 `ready_to_publish` 后，只有显式 `publishLearningArtifact` 才会调用外部 publisher；正常 publisher 返回后才追加 `learning_artifact_published` 并进入 `completed`。
+`research_complete` 不是最终 terminal `completed`：它只表示模型通过 `complete_research` 显式结束调查并保存 unresolved questions，可以进入确定性 Gate。`budget_exhausted` 则是 suspended non-success；它保留 Model Turns、pending intents、observations、Evidence 与 Claims，但拒绝 draft/publication。Issue #9 才会加入新预算版本、重新审批和精确恢复。
+
+`publication_approved` 也不是“文件已经写好”的断言。用户命令只批准等待状态中显示的 `draftHash`、canonical Output Root、`targetCanonicalPath`、父目录 `device` 和 `inode` 的精确聚合 hash。Runtime 在接受 receipt 前重新捕获 root 与 target parent identity；若目录被替换、target 逃出 root 或 canonical target 改变，旧 binding 失效。receipt 进入 `ready_to_publish` 后，只有显式 `publishLearningArtifact` 才会调用外部 publisher；正常 publisher 返回后才追加 `learning_artifact_published` 并进入 terminal `completed`。
 
 Trace 依次暴露不含源正文的 lineage：`read_source` 的 observation/tool call/Snapshot，**每个 Evidence 的相同 observation/tool call/Snapshot**，再到 Claim ID、draft artifact ID、publication receipt ID 与最终 Markdown SHA-256。这样可以从最终工件反向追到每条结构化证据实际来自哪次 Tool 调用，而不会把绝对来源路径、摘录正文、私有 Runtime Home 或 OS 错误放入 Trace。
 
@@ -101,7 +150,8 @@ Trace 依次暴露不含源正文的 lineage：`read_source` 的 observation/too
 
 ## 当前边界与后续 ticket
 
-- Issue #6 才加入真正的 `search_sources`、模型可见 Research Tools 和有界多轮 Research Loop。
 - Issue #7 才加入错误分类、attempt、retry/backoff 与恢复策略。
 - Issue #8 才用 Vercel AI SDK `streamText` 接入 OpenAI-compatible live Model Port；SDK 类型仍隔离在 `ModelPort` 后。
+- Issue #9 才加入用户暂停、取消、预算版本扩展以及从 `budget_exhausted` 的恢复。
+- Issue #11 才加入 safe search/read sibling batch 的有界并发与模型原始顺序回填。
 - Issue #14 才把 publication 外部 effect 的 crash reconciliation 做成 durable protocol。

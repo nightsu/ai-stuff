@@ -175,6 +175,13 @@ export async function canonicalizeSourceScope(
   };
 }
 
+/** 在 discovery/search 启动前复核批准 Source Root 的 path、device 与 inode。 */
+export async function sourceRootIdentityStillMatches(
+  root: SourceRootIdentity,
+): Promise<boolean> {
+  return rootIdentityStillMatches(root);
+}
+
 /** 在私有基础设施边界内执行 Source Scope 预检与精确字节读取。 */
 export class PrivateSourceAccess {
   /** 创建组件时复制冻结、且已经应用层验证过的 Source Scope。 */
