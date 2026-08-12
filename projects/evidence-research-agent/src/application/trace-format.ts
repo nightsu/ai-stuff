@@ -17,6 +17,9 @@ export function formatRunTrace(
     ...trace.events.map((event) => {
       const lineage = [
         event.toolCallId === undefined ? undefined : `tool=${event.toolCallId}`,
+        event.observationId === undefined
+          ? undefined
+          : `observation=${event.observationId}`,
         event.observationStatus === undefined
           ? undefined
           : `status=${event.observationStatus}`,

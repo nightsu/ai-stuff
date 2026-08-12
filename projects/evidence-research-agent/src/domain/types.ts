@@ -300,6 +300,8 @@ export interface EvidenceRecord {
 export interface Claim {
   /** 由 Runtime 从本次 Journal event identity 派生的稳定 Claim identity。 */
   readonly claimId: string;
+  /** 当前最小切片显式只允许原始来源事实，后续分类须各自拥有独立 Gate 规则。 */
+  readonly kind: "source_fact";
   /** 面向 Learning Artifact 的简短主张文本，不能包含渲染后的 citation 字符串。 */
   readonly text: string;
   /** 去重且按调用方明确顺序保存的 Evidence identities。 */
@@ -332,6 +334,12 @@ export interface LearningArtifactProposal {
 
 /** 一个经 canonical parent realpath 与 inode 绑定、可被用户批准的 Markdown 目标。 */
 export interface PublicationTarget {
+  /** 发布目标必须位于其内的 canonical Output Root 路径。 */
+  readonly outputRootCanonicalPath: string;
+  /** 准备时 Output Root 的设备号，防止 root 被同路径替换后继续发布。 */
+  readonly outputRootDevice: string;
+  /** 准备时 Output Root 的 inode，防止 root 被同路径替换后继续发布。 */
+  readonly outputRootInode: string;
   /** 由批准时 canonical parent directory 与 basename 组成的绝对目标路径。 */
   readonly targetCanonicalPath: string;
   /** 批准时目标父目录设备号的无损十进制字符串。 */
@@ -344,6 +352,12 @@ export interface PublicationTarget {
 export interface PublicationApprovalBinding {
   /** 私有持久化 Markdown draft 精确 UTF-8 内容的 SHA-256 摘要。 */
   readonly draftHash: string;
+  /** 绑定 target 所属的 canonical Output Root，排除 Runtime Home 或任意外部目录。 */
+  readonly outputRootCanonicalPath: string;
+  /** 绑定 Output Root 的审批时设备号。 */
+  readonly outputRootDevice: string;
+  /** 绑定 Output Root 的审批时 inode。 */
+  readonly outputRootInode: string;
   /** 经 canonical parent directory 解释后的确切绝对 Markdown 目标路径。 */
   readonly targetCanonicalPath: string;
   /** 目标父目录的审批时设备号，防止同名路径被替换后复用旧审批。 */
@@ -366,6 +380,12 @@ export interface PublicationApprovalReceipt {
   readonly approvedAt: string;
   /** Receipt 所授权 Markdown draft 的精确内容 SHA-256。 */
   readonly draftHash: string;
+  /** Receipt 所授权 target 所属的 canonical Output Root 路径。 */
+  readonly outputRootCanonicalPath: string;
+  /** Receipt 所授权 Output Root 的设备号。 */
+  readonly outputRootDevice: string;
+  /** Receipt 所授权 Output Root 的 inode。 */
+  readonly outputRootInode: string;
   /** Receipt 所授权的 canonical Markdown 目标路径。 */
   readonly targetCanonicalPath: string;
   /** Receipt 所授权目标父目录的设备号。 */
@@ -595,11 +615,13 @@ export interface RunTraceEvent {
   readonly occurredAt: string;
   /** reducer 应用该事件后得到的状态判别值。 */
   readonly stateAfter: ResearchRunState["type"];
-  /** 仅 `source_read_observed` 暴露的安全 Research Tool call lineage。 */
+  /** source read 与 Evidence event 共同暴露的安全 Research Tool call lineage。 */
   readonly toolCallId?: string;
+  /** source read 与 Evidence event 共同暴露的成功 observation identity。 */
+  readonly observationId?: string;
   /** 仅 `source_read_observed` 暴露的成功、拒绝或失败状态。 */
   readonly observationStatus?: SourceReadObservation["status"];
-  /** 仅成功来源读取暴露的私有 Source Snapshot identity。 */
+  /** 成功来源读取与 Evidence event 暴露的私有 Source Snapshot identity。 */
   readonly sourceSnapshotId?: string;
   /** 仅 `evidence_recorded` 暴露的结构化 Evidence identity。 */
   readonly evidenceId?: string;

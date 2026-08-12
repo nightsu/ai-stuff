@@ -48,6 +48,7 @@ describe("ResearchAgentRuntime evidence gate", () => {
       const evidence = onlyEvidenceRecord(evidenced);
       const claimed = await runtime.recordClaim({
         runId: fixture.runId,
+        kind: "source_fact",
         text: "来源明确说明 Journal 是 canonical history。",
         evidenceIds: [evidence.evidenceId],
       });
@@ -66,6 +67,7 @@ describe("ResearchAgentRuntime evidence gate", () => {
         type: "researching",
         claims: [
           {
+            kind: "source_fact",
             text: "来源明确说明 Journal 是 canonical history。",
             evidenceIds: [evidence.evidenceId],
           },
@@ -97,6 +99,7 @@ describe("ResearchAgentRuntime evidence gate", () => {
       await expect(
         runtime.recordClaim({
           runId: fixture.runId,
+          kind: "source_fact",
           text: "没有可验证引用的主张。",
           evidenceIds: ["evidence-not-durable"],
         }),
@@ -108,6 +111,48 @@ describe("ResearchAgentRuntime evidence gate", () => {
         type: "researching",
         evidenceRecords: [],
         claims: [],
+      });
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("requires an explicit source_fact classification and rejects pre-rendered citation text", async () => {
+    const fixture = await createApprovedReadRun();
+    const runtime = openRuntime(fixture.runtimeHome);
+
+    try {
+      const read = await runtime.readSource({
+        runId: fixture.runId,
+        request: {
+          rootIndex: 0,
+          relativePath: "source.md",
+          startLine: 2,
+          endLine: 3,
+        },
+      });
+      const evidenceProjection = await runtime.recordEvidence({
+        runId: fixture.runId,
+        observationId: onlySucceededObservation(read).observationId,
+      });
+      const evidence = onlyEvidenceRecord(evidenceProjection);
+      await expect(
+        runtime.recordClaim({
+          runId: fixture.runId,
+          kind: "source_fact",
+          text: "调用方不能预渲染 【Evidence: forged】。",
+          evidenceIds: [evidence.evidenceId],
+        }),
+      ).rejects.toThrow(/Claim/);
+      await expect(
+        runtime.recordClaim({
+          runId: fixture.runId,
+          kind: "source_fact",
+          text: "来源事实需要明确分类。",
+          evidenceIds: [evidence.evidenceId],
+        }),
+      ).resolves.toMatchObject({
+        state: { type: "researching", claims: [{ kind: "source_fact" }] },
       });
     } finally {
       runtime.close();

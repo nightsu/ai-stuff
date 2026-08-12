@@ -32,7 +32,7 @@ describe("LearningArtifactPublisher", () => {
   it("publishes exact Markdown once and treats an identical existing target as idempotent", async () => {
     const outputDirectory = await createTemporaryDirectory("publisher-output-");
     const targetPath = join(outputDirectory, "learning.md");
-    const publisher = new LearningArtifactPublisher();
+    const publisher = new LearningArtifactPublisher({ outputRoot: outputDirectory });
     const target = await publisher.prepareTarget(targetPath);
     const markdown = "# Learned\n\nEvidence-backed.\n";
 
@@ -49,7 +49,7 @@ describe("LearningArtifactPublisher", () => {
     const outsideDirectory = await createTemporaryDirectory("publisher-outside-");
     const targetPath = join(outputDirectory, "learning.md");
     const outsidePath = join(outsideDirectory, "outside.md");
-    const publisher = new LearningArtifactPublisher();
+    const publisher = new LearningArtifactPublisher({ outputRoot: outputDirectory });
     await writeFile(targetPath, "# Existing\n", "utf8");
     const existingTarget = await publisher.prepareTarget(targetPath);
 
@@ -72,7 +72,7 @@ describe("LearningArtifactPublisher", () => {
     const outputDirectory = join(root, "output");
     const movedDirectory = join(root, "output-before-replace");
     await mkdir(outputDirectory);
-    const publisher = new LearningArtifactPublisher();
+    const publisher = new LearningArtifactPublisher({ outputRoot: outputDirectory });
     const target = await publisher.prepareTarget(join(outputDirectory, "learning.md"));
 
     await rename(outputDirectory, movedDirectory);

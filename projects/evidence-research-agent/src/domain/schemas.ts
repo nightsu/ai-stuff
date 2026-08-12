@@ -6,6 +6,7 @@ import {
   artifactReferenceHasMatchingContentIdentity,
   sourceSnapshotHasMatchingContentIdentity,
 } from "./integrity.js";
+import { hasPreRenderedCitationToken } from "./citation-safety.js";
 import type {
   Claim,
   EvidenceRecord,
@@ -235,7 +236,15 @@ const evidenceRecordSchema = z
 const claimSchema = z
   .object({
     claimId: z.string().trim().min(1),
-    text: z.string().trim().min(1),
+    kind: z.literal("source_fact"),
+    text: z
+      .string()
+      .trim()
+      .min(1)
+      .refine(
+        (text) => !hasPreRenderedCitationToken(text),
+        "Claim 不能包含预渲染 citation",
+      ),
     evidenceIds: z.array(z.string().trim().min(1)).min(1),
     recordedAt: z.iso.datetime(),
   })
@@ -244,8 +253,22 @@ const claimSchema = z
 
 const learningArtifactProposalSchema = z
   .object({
-    title: z.string().trim().min(1),
-    summary: z.string().trim().min(1),
+    title: z
+      .string()
+      .trim()
+      .min(1)
+      .refine(
+        (title) => !hasPreRenderedCitationToken(title),
+        "标题不能包含预渲染 citation",
+      ),
+    summary: z
+      .string()
+      .trim()
+      .min(1)
+      .refine(
+        (summary) => !hasPreRenderedCitationToken(summary),
+        "摘要不能包含预渲染 citation",
+      ),
     claimIds: z.array(z.string().trim().min(1)).min(1),
   })
   .strict()
@@ -253,6 +276,12 @@ const learningArtifactProposalSchema = z
 
 const publicationTargetSchema = z
   .object({
+    outputRootCanonicalPath: z
+      .string()
+      .min(1)
+      .refine(isAbsolute, "Output Root 必须是绝对路径"),
+    outputRootDevice: z.string().regex(/^\d+$/),
+    outputRootInode: z.string().regex(/^\d+$/),
     targetCanonicalPath: z
       .string()
       .min(1)
@@ -266,6 +295,12 @@ const publicationTargetSchema = z
 const publicationApprovalBindingSchema = z
   .object({
     draftHash: sha256Schema,
+    outputRootCanonicalPath: z
+      .string()
+      .min(1)
+      .refine(isAbsolute, "Output Root 必须是绝对路径"),
+    outputRootDevice: z.string().regex(/^\d+$/),
+    outputRootInode: z.string().regex(/^\d+$/),
     targetCanonicalPath: z
       .string()
       .min(1)
@@ -284,6 +319,12 @@ const publicationApprovalReceiptSchema = z
     approvedBy: z.literal("user-command"),
     approvedAt: z.iso.datetime(),
     draftHash: sha256Schema,
+    outputRootCanonicalPath: z
+      .string()
+      .min(1)
+      .refine(isAbsolute, "Output Root 必须是绝对路径"),
+    outputRootDevice: z.string().regex(/^\d+$/),
+    outputRootInode: z.string().regex(/^\d+$/),
     targetCanonicalPath: z
       .string()
       .min(1)

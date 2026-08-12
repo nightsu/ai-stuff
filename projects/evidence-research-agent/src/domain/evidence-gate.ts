@@ -2,6 +2,8 @@ import type {
   Claim,
   EvidenceRecord,
   LearningArtifactProposal,
+  RunBudget,
+  SourceReadObservation,
 } from "./types.js";
 
 /** Evidence Gate 无法从已登记来源事实构造可发布 Markdown 时抛出的领域错误。 */
@@ -13,6 +15,20 @@ export interface EvidenceGateResult {
   readonly claims: readonly Claim[];
   /** 被所选 Claims 引用且按首次出现顺序去重的完整 Evidence Records。 */
   readonly evidenceRecords: readonly EvidenceRecord[];
+}
+
+/** Evidence Gate 在渲染 draft 时重算、不可由模型覆盖的 Run 预算事实。 */
+export interface EvidenceGateBudgetContext {
+  /** 当前 one-shot slice 已由 Journal 可证明消耗的 ModelPort turn 数。 */
+  readonly modelTurnsUsed: number;
+  /** Journal 中已经发生的安全来源读取 observation；每条都计入 tool-call 限额。 */
+  readonly sourceReadObservations: readonly SourceReadObservation[];
+  /** 创建 Run 时冻结并经计划审批绑定的多维预算。 */
+  readonly runBudget: RunBudget;
+  /** `run_created` 的稳定 ISO 8601 UTC 时间，作为 wall-time 起点。 */
+  readonly runCreatedAt: string;
+  /** 本次 Gate 评估时间；draft replay 使用 event time，runtime 使用受控 Clock。 */
+  readonly evaluatedAt: string;
 }
 
 /**
@@ -33,7 +49,10 @@ export function evaluateEvidenceGate(
 
   const selectedClaims = proposal.claimIds.map((claimId) => {
     const claim = claims.find((candidate) => candidate.claimId === claimId);
-    if (claim === undefined || claim.evidenceIds.length === 0) {
+    if (
+      claim?.kind !== "source_fact" ||
+      claim.evidenceIds.length === 0
+    ) {
       throw new EvidenceGateError("Learning Artifact Claim 缺少可验证 Evidence");
     }
     return claim;
@@ -57,4 +76,38 @@ export function evaluateEvidenceGate(
     claims: selectedClaims,
     evidenceRecords: selectedEvidenceRecords,
   };
+}
+
+/**
+ * Publication 不能绕过已经冻结的 Run Budget。source bytes 会在读取 reducer 中先
+ * 限制，这里仍从 Journal 重新求和；tool/source/wall-time 同样只信任 durable facts。
+ */
+export function assertEvidenceGateBudget(
+  context: EvidenceGateBudgetContext,
+): void {
+  const successfulObservations = context.sourceReadObservations.filter(
+    (observation) => observation.status === "succeeded",
+  );
+  const sourceBytesRead = successfulObservations.reduce(
+    (total, observation) => total + observation.byteLength,
+    0,
+  );
+  const distinctSources = new Set(
+    successfulObservations.map(
+      (observation) => observation.sourceSnapshot.snapshotId,
+    ),
+  ).size;
+  const elapsedMs =
+    Date.parse(context.evaluatedAt) - Date.parse(context.runCreatedAt);
+  if (
+    context.modelTurnsUsed > context.runBudget.maxModelTurns ||
+    context.sourceReadObservations.length > context.runBudget.maxToolCalls ||
+    distinctSources > context.runBudget.maxDistinctSources ||
+    sourceBytesRead > context.runBudget.maxSourceBytes ||
+    !Number.isSafeInteger(elapsedMs) ||
+    elapsedMs < 0 ||
+    elapsedMs > context.runBudget.maxWallTimeMs
+  ) {
+    throw new EvidenceGateError("Learning Artifact 超出已批准 Run Budget");
+  }
 }

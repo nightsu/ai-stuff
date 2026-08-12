@@ -8,7 +8,15 @@ import {
   unlink,
 } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 
 import type { PublicationTarget } from "../domain/types.js";
 
@@ -28,6 +36,14 @@ export class LearningArtifactPublishError extends Error {
   }
 }
 
+/** 创建 publisher 时冻结的、禁止把私有 Runtime Home 当成公开输出的边界。 */
+export interface LearningArtifactPublisherOptions {
+  /** 所有 Learning Artifact target 必须位于此 canonical Output Root 内。 */
+  readonly outputRoot?: string;
+  /** 私有 Runtime Home；若与 Output Root 重叠，任何 publication 都 fail closed。 */
+  readonly runtimeHome?: string;
+}
+
 /** 同目录原子 publication 前捕获的 canonical parent directory identity。 */
 interface PublicationDirectoryIdentity {
   /** 准备时得到、后续每次写入前后都重新验证的 canonical parent directory。 */
@@ -40,10 +56,31 @@ interface PublicationDirectoryIdentity {
 
 /** 向用户可见目标发布 Markdown 的窄基础设施边界。 */
 export class LearningArtifactPublisher {
+  /** 调用方声明的 Output Root；缺失时不允许提出可发布 target。 */
+  readonly #outputRoot: string | undefined;
+  /** 已由 Runtime 集中 canonicalize 的私有状态目录。 */
+  readonly #runtimeHome: string | undefined;
+
+  public constructor(options: LearningArtifactPublisherOptions = {}) {
+    this.#outputRoot = options.outputRoot;
+    this.#runtimeHome = options.runtimeHome;
+  }
+
   /** 把调用方绝对路径绑定为 canonical target path 与 parent device/inode。 */
   public async prepareTarget(targetPath: string): Promise<PublicationTarget> {
     try {
-      if (!isAbsolute(targetPath) || extname(targetPath).toLowerCase() !== ".md") {
+      if (
+        this.#outputRoot === undefined ||
+        !isAbsolute(targetPath) ||
+        extname(targetPath).toLowerCase() !== ".md"
+      ) {
+        throw new PublicationTargetPreparationError();
+      }
+      const outputRoot = await captureDirectoryIdentity(this.#outputRoot);
+      if (
+        this.#runtimeHome !== undefined &&
+        pathsOverlap(outputRoot.canonicalPath, this.#runtimeHome)
+      ) {
         throw new PublicationTargetPreparationError();
       }
       const resolvedPath = resolve(targetPath);
@@ -53,8 +90,14 @@ export class LearningArtifactPublisher {
       }
       const parent = await captureDirectoryIdentity(dirname(resolvedPath));
       const targetCanonicalPath = join(parent.canonicalPath, targetName);
+      if (!isStrictDescendant(outputRoot.canonicalPath, targetCanonicalPath)) {
+        throw new PublicationTargetPreparationError();
+      }
       await assertExistingTargetIsRegularOrMissing(targetCanonicalPath);
       return {
+        outputRootCanonicalPath: outputRoot.canonicalPath,
+        outputRootDevice: outputRoot.device.toString(10),
+        outputRootInode: outputRoot.inode.toString(10),
         targetCanonicalPath,
         parentDevice: parent.device.toString(10),
         parentInode: parent.inode.toString(10),
@@ -77,6 +120,7 @@ export class LearningArtifactPublisher {
     let temporaryPath: string | undefined;
     let handle: FileHandle | undefined;
     try {
+      await this.#assertConfiguredOutputRoot(target);
       const parent = await assertPublicationTargetParent(target);
       await assertExistingTargetMatchesOrIsMissing(target.targetCanonicalPath, expected);
       temporaryPath = join(
@@ -105,7 +149,7 @@ export class LearningArtifactPublisher {
       try {
         await link(temporaryPath, target.targetCanonicalPath);
       } catch (error) {
-        if (!isErrorCode(error, "EEXIST")) {
+      if (!isErrorCode(error, "EEXIST")) {
           throw new LearningArtifactPublishError();
         }
         // 其他 writer 在我们 preflight 后先占用了 final name 时，只有精确相同
@@ -127,6 +171,23 @@ export class LearningArtifactPublisher {
       if (temporaryPath !== undefined) {
         await unlink(temporaryPath).catch(() => undefined);
       }
+    }
+  }
+
+  /** 重新打开 Runtime 时也必须使用批准时同一 Output Root，而不是相信 Journal target 自己。 */
+  async #assertConfiguredOutputRoot(target: PublicationTarget): Promise<void> {
+    if (this.#outputRoot === undefined) {
+      throw new LearningArtifactPublishError();
+    }
+    const configured = await captureDirectoryIdentity(this.#outputRoot);
+    if (
+      (this.#runtimeHome !== undefined &&
+        pathsOverlap(configured.canonicalPath, this.#runtimeHome)) ||
+      configured.canonicalPath !== target.outputRootCanonicalPath ||
+      configured.device.toString(10) !== target.outputRootDevice ||
+      configured.inode.toString(10) !== target.outputRootInode
+    ) {
+      throw new LearningArtifactPublishError();
     }
   }
 }
@@ -176,6 +237,15 @@ async function captureDirectoryIdentity(
 async function assertPublicationTargetParent(
   target: PublicationTarget,
 ): Promise<PublicationDirectoryIdentity> {
+  const outputRoot = await captureDirectoryIdentity(target.outputRootCanonicalPath);
+  if (
+    outputRoot.canonicalPath !== target.outputRootCanonicalPath ||
+    outputRoot.device.toString(10) !== target.outputRootDevice ||
+    outputRoot.inode.toString(10) !== target.outputRootInode ||
+    !isStrictDescendant(outputRoot.canonicalPath, target.targetCanonicalPath)
+  ) {
+    throw new LearningArtifactPublishError();
+  }
   const parent = await captureDirectoryIdentity(dirname(target.targetCanonicalPath));
   if (
     parent.canonicalPath !== dirname(target.targetCanonicalPath) ||
@@ -185,6 +255,26 @@ async function assertPublicationTargetParent(
     throw new LearningArtifactPublishError();
   }
   return parent;
+}
+
+/** 仅接受 child path，禁止 root 本身、兄弟目录与 `..` 逃逸路径。 */
+function isStrictDescendant(rootPath: string, candidatePath: string): boolean {
+  const pathFromRoot = relative(rootPath, candidatePath);
+  return (
+    pathFromRoot !== "" &&
+    !pathFromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) &&
+    pathFromRoot !== ".." &&
+    !isAbsolute(pathFromRoot)
+  );
+}
+
+/** Runtime Home 与 Output Root 不能彼此包含，避免私有状态成为可发布目标。 */
+function pathsOverlap(first: string, second: string): boolean {
+  return (
+    first === second ||
+    isStrictDescendant(first, second) ||
+    isStrictDescendant(second, first)
+  );
 }
 
 async function assertExistingTargetIsRegularOrMissing(
@@ -229,9 +319,11 @@ async function assertExistingTargetMatchesOrIsMissing(
       !opened.isFile() ||
       opened.dev !== pathMetadata.dev ||
       opened.ino !== pathMetadata.ino ||
-      opened.size !== BigInt(expected.byteLength) ||
       (await realpath(targetCanonicalPath)) !== targetCanonicalPath
     ) {
+      throw new LearningArtifactPublishError();
+    }
+    if (opened.size !== BigInt(expected.byteLength)) {
       throw new LearningArtifactPublishError();
     }
     const existing = await handle.readFile();

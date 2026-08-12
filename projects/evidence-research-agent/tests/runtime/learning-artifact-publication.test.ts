@@ -10,7 +10,12 @@ import {
   ResearchAgentRuntime,
   ScriptedModel,
 } from "../../src/index.js";
-import type { IdGenerator, RunBudget, SourceScope } from "../../src/index.js";
+import type {
+  IdGenerator,
+  Clock,
+  RunBudget,
+  SourceScope,
+} from "../../src/index.js";
 import {
   IllegalRunEventError,
   reduceRunEvents,
@@ -54,6 +59,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
 
     const restarted = ResearchAgentRuntime.open({
       runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
       model: new ScriptedModel([]),
     });
     try {
@@ -78,6 +84,15 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
       );
       await expect(readFile(targetCanonicalPath, "utf8")).resolves.toContain(
         "【Evidence: evidence-event-006】",
+      );
+      await expect(readFile(targetCanonicalPath, "utf8")).resolves.toContain(
+        "## Evidence Index",
+      );
+      await expect(readFile(targetCanonicalPath, "utf8")).resolves.toContain(
+        "## Tool usage",
+      );
+      await expect(readFile(targetCanonicalPath, "utf8")).resolves.toContain(
+        "tool-call-001",
       );
       const trace = await restarted.traceRun({ runId: fixture.runId });
       expect(trace.events.slice(-5)).toEqual([
@@ -146,6 +161,302 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
     }
   });
 
+  it("blocks draft creation after the approved tool-call budget is exceeded", async () => {
+    const fixture = await createEvidenceReadyRun({
+      runBudget: { maxToolCalls: 1 },
+    });
+    await fixture.runtime.readSource({
+      runId: fixture.runId,
+      request: {
+        rootIndex: 0,
+        relativePath: "source.md",
+        startLine: 1,
+        endLine: 1,
+      },
+    });
+
+    try {
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "tool-budget.md"),
+        }),
+      ).rejects.toThrow(/Evidence/);
+      const projection = await fixture.runtime.inspectRun({ runId: fixture.runId });
+      expect(projection.state.type).toBe("researching");
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("blocks the second ModelPort call when the approved model-turn budget only permits plan generation", async () => {
+    const fixture = await createEvidenceReadyRun({
+      runBudget: { maxModelTurns: 1 },
+    });
+
+    try {
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "model-budget.md"),
+        }),
+      ).rejects.toThrow(/Evidence/);
+      const projection = await fixture.runtime.inspectRun({ runId: fixture.runId });
+      expect(projection.state.type).toBe("researching");
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("blocks draft creation after the approved distinct-source budget is exceeded", async () => {
+    const fixture = await createEvidenceReadyRun({
+      runBudget: { maxDistinctSources: 1 },
+    });
+    await fixture.runtime.readSource({
+      runId: fixture.runId,
+      request: {
+        rootIndex: 0,
+        relativePath: "other.md",
+        startLine: 1,
+        endLine: 1,
+      },
+    });
+
+    try {
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "source-budget.md"),
+        }),
+      ).rejects.toThrow(/Evidence/);
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("counts distinct Source Snapshots instead of different paths with identical bytes", async () => {
+    const fixture = await createEvidenceReadyRun({
+      runBudget: { maxDistinctSources: 1 },
+      otherSourceText:
+        "title\nRun Journal 是 canonical history。\nProjection 可从 Journal 重建。\n",
+    });
+    await fixture.runtime.readSource({
+      runId: fixture.runId,
+      request: {
+        rootIndex: 0,
+        relativePath: "other.md",
+        startLine: 1,
+        endLine: 1,
+      },
+    });
+
+    try {
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "same-snapshot.md"),
+        }),
+      ).resolves.toMatchObject({
+        state: { type: "waiting_publication_approval" },
+      });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("rejects direct draft replay after the approved wall-time budget expires", async () => {
+    const fixture = await createEvidenceReadyRun();
+    await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath: join(fixture.outputDirectory, "expired.md"),
+    });
+    fixture.runtime.close();
+
+    const store = new SqliteRunStore(fixture.runtimeHome);
+    const events = structuredClone(store.readEvents(fixture.runId));
+    store.close();
+    const draftEvent = events.at(-1);
+    const createdEvent = events[0];
+    const planEvent = events.find((event) => event.type === "plan_proposed");
+    const approvedEvent = events.find((event) => event.type === "plan_approved");
+    if (
+      draftEvent?.type !== "learning_artifact_draft_proposed" ||
+      createdEvent?.type !== "run_created" ||
+      planEvent?.type !== "plan_proposed" ||
+      approvedEvent?.type !== "plan_approved"
+    ) {
+      throw new Error("测试夹具要求完整的已批准 draft Journal");
+    }
+    const expiredBudget = {
+      ...createdEvent.payload.runBudget,
+      maxWallTimeMs: 1,
+    };
+    const expiredBinding = createPlanApprovalBinding({
+      question: createdEvent.payload.question,
+      planHash: planEvent.payload.planArtifact.sha256,
+      sourceScope: createdEvent.payload.sourceScope,
+      runBudget: expiredBudget,
+    });
+    events[0] = {
+      ...createdEvent,
+      payload: { ...createdEvent.payload, runBudget: expiredBudget },
+    };
+    const planIndex = events.indexOf(planEvent);
+    events[planIndex] = {
+      ...planEvent,
+      payload: { ...planEvent.payload, approvalBinding: expiredBinding },
+    };
+    const approvalIndex = events.indexOf(approvedEvent);
+    events[approvalIndex] = {
+      ...approvedEvent,
+      payload: {
+        approvalReceipt: {
+          ...approvedEvent.payload.approvalReceipt,
+          ...expiredBinding,
+        },
+      },
+    };
+    events[events.length - 1] = {
+      ...draftEvent,
+      occurredAt: "2030-01-01T00:00:00.000Z",
+    };
+
+    expect(() => reduceRunEvents(events)).toThrow(IllegalRunEventError);
+    expect(() => reduceRunEvents(events)).toThrow(/Evidence Gate/);
+  });
+
+  it("allows an already approved draft to publish after the research wall-time window closes", async () => {
+    let now = "2026-08-12T00:00:00.000Z";
+    const clock: Clock = { now: () => now };
+    const fixture = await createEvidenceReadyRun({ clock });
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath: join(fixture.outputDirectory, "approved-after-window.md"),
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    now = "2030-01-01T00:00:00.000Z";
+
+    try {
+      const ready = await fixture.runtime.approvePublication({
+        runId: fixture.runId,
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      });
+      await expect(
+        fixture.runtime.publishLearningArtifact({ runId: ready.runId }),
+      ).resolves.toMatchObject({ state: { type: "completed" } });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("rejects a model proposal that tries to render its own Evidence citation token", async () => {
+    const fixture = await createEvidenceReadyRun();
+    fixture.runtime.close();
+    const maliciousRuntime = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: {
+        proposePlan: async () => {
+          throw new Error("测试不应再次请求计划");
+        },
+        proposeLearningArtifact: async () =>
+          ({
+            title: "Journal 的可恢复性",
+            summary: "模型不能加入 【Evidence: evidence-forged】。",
+            claimIds: ["claim-event-007"],
+          }) as never,
+      },
+    });
+
+    try {
+      await expect(
+        maliciousRuntime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "forged-citation.md"),
+        }),
+      ).rejects.toThrow(/Learning Artifact/);
+      const projection = await maliciousRuntime.inspectRun({ runId: fixture.runId });
+      expect(projection.state.type).toBe("researching");
+      expect(projection.lastEventSequence).toBe(7);
+    } finally {
+      maliciousRuntime.close();
+    }
+  });
+
+  it("rejects a publication target outside the configured Output Root", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const outsideDirectory = await createTemporaryDirectory("artifact-outside-");
+
+    try {
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(outsideDirectory, "outside.md"),
+        }),
+      ).rejects.toThrow(/Learning Artifact/);
+      const projection = await fixture.runtime.inspectRun({ runId: fixture.runId });
+      expect(projection.state.type).toBe("researching");
+      expect(projection.lastEventSequence).toBe(7);
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("projects each Evidence Record with the exact source observation and tool-call lineage", async () => {
+    const fixture = await createEvidenceReadyRun();
+
+    try {
+      const reread = await fixture.runtime.readSource({
+        runId: fixture.runId,
+        request: {
+          rootIndex: 0,
+          relativePath: "source.md",
+          startLine: 1,
+          endLine: 1,
+        },
+      });
+      if (reread.state.type !== "researching") {
+        throw new Error("测试夹具要求第二次读取后仍处于 researching");
+      }
+      const secondObservation = reread.state.sourceReadObservations.at(-1);
+      if (secondObservation?.status !== "succeeded") {
+        throw new Error("测试夹具要求第二个成功 observation");
+      }
+      const evidenced = await fixture.runtime.recordEvidence({
+        runId: fixture.runId,
+        observationId: secondObservation.observationId,
+      });
+      if (evidenced.state.type !== "researching") {
+        throw new Error("测试夹具要求第二个 Evidence 后仍处于 researching");
+      }
+      const secondEvidence = evidenced.state.evidenceRecords.at(-1);
+      if (secondEvidence === undefined) {
+        throw new Error("测试夹具要求第二个 Evidence Record");
+      }
+
+      const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+      const evidenceTrace = trace.events.filter(
+        (event) => event.type === "evidence_recorded",
+      );
+      expect(evidenceTrace).toEqual([
+        expect.objectContaining({
+          evidenceId: "evidence-event-006",
+          observationId: "observation-001",
+          toolCallId: "tool-call-001",
+        }),
+        expect.objectContaining({
+          evidenceId: secondEvidence.evidenceId,
+          observationId: secondObservation.observationId,
+          toolCallId: secondObservation.toolCallId,
+        }),
+      ]);
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
   it("invalidates a publication approval when its approved parent directory identity changes", async () => {
     const fixture = await createEvidenceReadyRun();
     const waiting = await fixture.runtime.proposeLearningArtifact({
@@ -176,6 +487,38 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         force: true,
         recursive: true,
       });
+    }
+  });
+
+  it("refuses a persisted target when a restarted Runtime is configured with a different Output Root", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath: join(fixture.outputDirectory, "different-root.md"),
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+    const otherOutputRoot = await createTemporaryDirectory("artifact-other-output-");
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: otherOutputRoot,
+      model: new ScriptedModel([]),
+    });
+
+    try {
+      await expect(
+        restarted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Learning Artifact/);
+      const persisted = await restarted.inspectRun({ runId: fixture.runId });
+      expect(persisted.state.type).toBe("ready_to_publish");
+    } finally {
+      restarted.close();
     }
   });
 
@@ -302,6 +645,16 @@ async function createEvidenceReadyRun(options: {
   readonly recordEvidenceAndClaim?: boolean;
   /** Scripted Model 尝试选择的 Claim identities；测试可借此模拟伪造引用。 */
   readonly proposalClaimIds?: readonly string[];
+  /** Scripted Model 提交的标题；可验证 renderer 不接纳预渲染 citation。 */
+  readonly proposalTitle?: string;
+  /** Scripted Model 提交的摘要；可验证 renderer 不接纳预渲染 citation。 */
+  readonly proposalSummary?: string;
+  /** 覆盖默认预算的一部分，以证明 Gate 使用整个已批准 Run Budget。 */
+  readonly runBudget?: Partial<RunBudget>;
+  /** 可替换第二条来源的完整字节，以验证 distinct source 以 Snapshot identity 去重。 */
+  readonly otherSourceText?: string;
+  /** 测试可注入的 UTC Clock；用于将 research 执行窗口与人工 approval 分离。 */
+  readonly clock?: Clock;
 } = {}): Promise<{
   /** 当前测试仍持有、可继续提出 draft 的 Runtime。 */
   readonly runtime: ResearchAgentRuntime;
@@ -320,9 +673,16 @@ async function createEvidenceReadyRun(options: {
     "title\nRun Journal 是 canonical history。\nProjection 可从 Journal 重建。\n",
     "utf8",
   );
+  await writeFile(
+    join(sourceRoot, "other.md"),
+    options.otherSourceText ?? "另一份来源。\n",
+    "utf8",
+  );
   const ids = createIds();
   const runtime = ResearchAgentRuntime.open({
     runtimeHome,
+    outputRoot: outputDirectory,
+    ...(options.clock === undefined ? {} : { clock: options.clock }),
     ids,
     model: new ScriptedModel(
       [
@@ -334,8 +694,10 @@ async function createEvidenceReadyRun(options: {
       ],
       [
         {
-          title: "Journal 的可恢复性",
-          summary: "这个 Learning Artifact 只渲染已登记 Claim 的结构化 Evidence 引用。",
+          title: options.proposalTitle ?? "Journal 的可恢复性",
+          summary:
+            options.proposalSummary ??
+            "这个 Learning Artifact 只渲染已登记 Claim 的结构化 Evidence 引用。",
           claimIds: options.proposalClaimIds ?? ["claim-event-007"],
         },
       ],
@@ -350,7 +712,7 @@ async function createEvidenceReadyRun(options: {
       maxFileBytes: 4_096,
       maxTotalBytes: 4_096,
     },
-    runBudget: runBudget(),
+    runBudget: runBudget(options.runBudget),
   });
   if (waiting.state.type !== "waiting_plan_approval") {
     throw new Error("测试夹具要求等待计划审批");
@@ -389,6 +751,7 @@ async function createEvidenceReadyRun(options: {
     }
     await runtime.recordClaim({
       runId: waiting.runId,
+      kind: "source_fact",
       text: "Run Journal 是 canonical history。",
       evidenceIds: [evidence.evidenceId],
     });
@@ -396,7 +759,7 @@ async function createEvidenceReadyRun(options: {
   return { runtime, runId: waiting.runId, runtimeHome, outputDirectory };
 }
 
-function runBudget(): RunBudget {
+function runBudget(overrides: Partial<RunBudget> = {}): RunBudget {
   return {
     version: "budget-v1",
     maxModelTurns: 4,
@@ -404,17 +767,21 @@ function runBudget(): RunBudget {
     maxDistinctSources: 2,
     maxSourceBytes: 4_096,
     maxWallTimeMs: 60_000,
+    ...overrides,
   };
 }
 
 function createIds(): IdGenerator {
   let event = 0;
+  let toolCall = 0;
+  let observation = 0;
   return {
     nextRunId: () => "run-artifact-001",
     nextEventId: () => `event-${String(++event).padStart(3, "0")}`,
     nextApprovalId: () => "approval-plan-001",
-    nextToolCallId: () => "tool-call-001",
-    nextObservationId: () => "observation-001",
+    nextToolCallId: () => `tool-call-${String(++toolCall).padStart(3, "0")}`,
+    nextObservationId: () =>
+      `observation-${String(++observation).padStart(3, "0")}`,
   };
 }
 

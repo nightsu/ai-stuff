@@ -1,6 +1,14 @@
 import { isAbsolute } from "node:path";
 
-import { EvidenceGateError, evaluateEvidenceGate } from "./evidence-gate.js";
+import {
+  assertEvidenceGateBudget,
+  EvidenceGateError,
+  evaluateEvidenceGate,
+} from "./evidence-gate.js";
+import {
+  hasPreRenderedCitationToken,
+  PreRenderedCitationTokenError,
+} from "./citation-safety.js";
 import {
   artifactReferenceHasMatchingContentIdentity,
   createPlanApprovalBinding,
@@ -28,7 +36,6 @@ import type {
   PublicationTarget,
   PublishedLearningArtifact,
   ResearchRunEvent,
-  ResearchingRunState,
   RunProjection,
   SourceReadObservation,
   RunTrace,
@@ -347,11 +354,7 @@ function applyRunEvent(
           "只有 researching Run 可以提出 Learning Artifact draft",
         );
       }
-      validateLearningArtifactDraft(
-        current.state,
-        event.payload,
-        event.occurredAt,
-      );
+      validateLearningArtifactDraft(current, event.payload, event.occurredAt);
       return {
         ...current,
         state: {
@@ -423,6 +426,7 @@ function traceLineage(
 ): Pick<
   RunTraceEvent,
   | "toolCallId"
+  | "observationId"
   | "observationStatus"
   | "sourceSnapshotId"
   | "evidenceId"
@@ -434,6 +438,7 @@ function traceLineage(
   if (event.type === "source_read_observed") {
     return {
       toolCallId: event.payload.observation.toolCallId,
+      observationId: event.payload.observation.observationId,
       observationStatus: event.payload.observation.status,
       ...(event.payload.observation.status === "succeeded"
         ? {
@@ -444,7 +449,12 @@ function traceLineage(
     };
   }
   if (event.type === "evidence_recorded") {
-    return { evidenceId: event.payload.evidence.evidenceId };
+    return {
+      evidenceId: event.payload.evidence.evidenceId,
+      observationId: event.payload.evidence.observationId,
+      toolCallId: event.payload.evidence.toolCallId,
+      sourceSnapshotId: event.payload.evidence.sourceSnapshotId,
+    };
   }
   if (event.type === "claim_recorded") {
     return { claimId: event.payload.claim.claimId };
@@ -601,9 +611,17 @@ function validateClaim(
   occurredAt: string,
 ): void {
   if (
-    !hasExactKeys(claim, ["claimId", "text", "evidenceIds", "recordedAt"]) ||
+    !hasExactKeys(claim, [
+      "claimId",
+      "kind",
+      "text",
+      "evidenceIds",
+      "recordedAt",
+    ]) ||
     claim.claimId.trim() === "" ||
+    claim.kind !== "source_fact" ||
     claim.text.trim() === "" ||
+    hasPreRenderedCitationToken(claim.text) ||
     claim.recordedAt !== occurredAt ||
     !isIsoUtc(claim.recordedAt) ||
     claim.evidenceIds.length === 0 ||
@@ -619,10 +637,14 @@ function validateClaim(
 }
 
 function validateLearningArtifactDraft(
-  researching: ResearchingRunState,
+  projection: RunProjection,
   payload: LearningArtifactDraftProposedPayload,
   occurredAt: string,
 ): void {
+  if (projection.state.type !== "researching") {
+    throw new IllegalRunEventError("Learning Artifact draft 必须来自 researching Run");
+  }
+  const researching = projection.state;
   const { draftArtifact, proposal, publicationTarget, publicationBinding } =
     payload;
   if (
@@ -640,12 +662,17 @@ function validateLearningArtifactDraft(
     !hasExactKeys(proposal, ["title", "summary", "claimIds"]) ||
     proposal.title.trim() === "" ||
     proposal.summary.trim() === "" ||
+    hasPreRenderedCitationToken(proposal.title) ||
+    hasPreRenderedCitationToken(proposal.summary) ||
     proposal.claimIds.length === 0 ||
     new Set(proposal.claimIds).size !== proposal.claimIds.length ||
     !proposal.claimIds.every((claimId) => claimId.trim() !== "") ||
     !hasExactPublicationTargetShape(publicationTarget) ||
     !hasExactKeys(publicationBinding, [
       "draftHash",
+      "outputRootCanonicalPath",
+      "outputRootDevice",
+      "outputRootInode",
       "targetCanonicalPath",
       "parentDevice",
       "parentInode",
@@ -657,6 +684,13 @@ function validateLearningArtifactDraft(
 
   let markdown: string;
   try {
+    assertEvidenceGateBudget({
+      modelTurnsUsed: 2,
+      sourceReadObservations: researching.sourceReadObservations,
+      runBudget: projection.runBudget,
+      runCreatedAt: projection.createdAt,
+      evaluatedAt: occurredAt,
+    });
     markdown = renderLearningArtifact(
       proposal,
       evaluateEvidenceGate(
@@ -666,7 +700,10 @@ function validateLearningArtifactDraft(
       ),
     );
   } catch (error) {
-    if (error instanceof EvidenceGateError) {
+    if (
+      error instanceof EvidenceGateError ||
+      error instanceof PreRenderedCitationTokenError
+    ) {
       throw new IllegalRunEventError("Learning Artifact draft 未通过 Evidence Gate");
     }
     throw error;
@@ -708,6 +745,9 @@ function validatePublicationApprovalReceipt(
       "approvedBy",
       "approvedAt",
       "draftHash",
+      "outputRootCanonicalPath",
+      "outputRootDevice",
+      "outputRootInode",
       "targetCanonicalPath",
       "parentDevice",
       "parentInode",
@@ -748,7 +788,17 @@ function validatePublishedLearningArtifact(
 
 function hasExactPublicationTargetShape(target: PublicationTarget): boolean {
   return (
-    hasExactKeys(target, ["targetCanonicalPath", "parentDevice", "parentInode"]) &&
+    hasExactKeys(target, [
+      "outputRootCanonicalPath",
+      "outputRootDevice",
+      "outputRootInode",
+      "targetCanonicalPath",
+      "parentDevice",
+      "parentInode",
+    ]) &&
+    isAbsolute(target.outputRootCanonicalPath) &&
+    /^\d+$/.test(target.outputRootDevice) &&
+    /^\d+$/.test(target.outputRootInode) &&
     isAbsolute(target.targetCanonicalPath) &&
     /^\d+$/.test(target.parentDevice) &&
     /^\d+$/.test(target.parentInode)

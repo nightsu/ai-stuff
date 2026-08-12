@@ -1,4 +1,5 @@
 import { hashCanonicalJson } from "./integrity.js";
+import { assertNoPreRenderedCitationToken } from "./citation-safety.js";
 import type {
   LearningArtifactProposal,
   PublicationApprovalBinding,
@@ -18,6 +19,9 @@ export function createPublicationApprovalBinding(input: {
   }
   const components = {
     draftHash: input.draftHash,
+    outputRootCanonicalPath: input.publicationTarget.outputRootCanonicalPath,
+    outputRootDevice: input.publicationTarget.outputRootDevice,
+    outputRootInode: input.publicationTarget.outputRootInode,
     targetCanonicalPath: input.publicationTarget.targetCanonicalPath,
     parentDevice: input.publicationTarget.parentDevice,
     parentInode: input.publicationTarget.parentInode,
@@ -35,6 +39,9 @@ export function publicationBindingsEqual(
 ): boolean {
   return (
     actual.draftHash === expected.draftHash &&
+    actual.outputRootCanonicalPath === expected.outputRootCanonicalPath &&
+    actual.outputRootDevice === expected.outputRootDevice &&
+    actual.outputRootInode === expected.outputRootInode &&
     actual.targetCanonicalPath === expected.targetCanonicalPath &&
     actual.parentDevice === expected.parentDevice &&
     actual.parentInode === expected.parentInode &&
@@ -50,6 +57,13 @@ export function renderLearningArtifact(
   proposal: LearningArtifactProposal,
   gate: EvidenceGateResult,
 ): string {
+  // title/summary/Claim 都是非结构化文案；只允许下面的 renderer 使用 Gate 事实
+  // 拼出 citation，不能让模型或调用方夹带一个看似可信却无 Evidence 的可见 token。
+  assertNoPreRenderedCitationToken([
+    proposal.title,
+    proposal.summary,
+    ...gate.claims.map((claim) => claim.text),
+  ]);
   const claimLines = gate.claims.map((claim) => {
     const citations = claim.evidenceIds
       .map((evidenceId) => `【Evidence: ${evidenceId}】`)
@@ -59,6 +73,9 @@ export function renderLearningArtifact(
   const evidenceLines = gate.evidenceRecords.map(
     (evidence) =>
       `- ${evidence.evidenceId}: ${evidence.sourceSnapshotId} lines ${evidence.startLine}-${evidence.endLine}`,
+  );
+  const toolLines = gate.evidenceRecords.map(
+    (evidence) => `- read_source: ${evidence.toolCallId}`,
   );
 
   return [
@@ -70,9 +87,13 @@ export function renderLearningArtifact(
     "",
     ...claimLines,
     "",
-    "## Evidence identity",
+    "## Evidence Index",
     "",
     ...evidenceLines,
+    "",
+    "## Tool usage",
+    "",
+    ...toolLines,
     "",
   ].join("\n");
 }

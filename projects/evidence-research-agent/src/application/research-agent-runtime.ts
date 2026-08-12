@@ -7,11 +7,16 @@ import {
   hashReadSourceRequest,
   hashUtf8Text,
 } from "../domain/integrity.js";
-import { EvidenceGateError, evaluateEvidenceGate } from "../domain/evidence-gate.js";
+import {
+  assertEvidenceGateBudget,
+  EvidenceGateError,
+  evaluateEvidenceGate,
+} from "../domain/evidence-gate.js";
 import {
   createPublicationApprovalBinding,
   renderLearningArtifact,
 } from "../domain/learning-artifact.js";
+import { hasPreRenderedCitationToken } from "../domain/citation-safety.js";
 import { buildRunTrace } from "../domain/reducer.js";
 import {
   parseResearchPlan,
@@ -51,7 +56,6 @@ import {
 import { preparePrivateRuntimeHome } from "../infrastructure/private-runtime-home.js";
 import {
   LearningArtifactPublisher,
-  LearningArtifactPublishError,
   PublicationTargetPreparationError,
 } from "../infrastructure/learning-artifact-publisher.js";
 import type { Clock, IdGenerator, ModelPort } from "./ports.js";
@@ -60,6 +64,8 @@ import type { Clock, IdGenerator, ModelPort } from "./ports.js";
 export interface OpenRuntimeOptions {
   /** 私有且应被 git ignore 的 Runtime Home 路径。 */
   readonly runtimeHome: string;
+  /** 可发布 Markdown 的唯一边界；省略时 Runtime 仍可研究，但不能提出 publication draft。 */
+  readonly outputRoot?: string;
   /** 计划生成使用的 Model Port；inspect 与 trace 不会调用它。 */
   readonly model: ModelPort;
   /** 可选时间边界；生产默认使用系统 UTC 时间。 */
@@ -124,6 +130,8 @@ export interface RecordEvidenceCommand {
 export interface RecordClaimCommand {
   /** 当前必须仍处于 researching 的 Research Run identity。 */
   readonly runId: string;
+  /** 当前 slice 明确只接纳直接由来源 Evidence 支持的 source fact。 */
+  readonly kind: "source_fact";
   /** 不包含预渲染 citation 的简短、非空 Claim 文本。 */
   readonly text: string;
   /** 至少一个既有 Evidence identity，顺序是未来渲染的显式引用顺序。 */
@@ -134,7 +142,7 @@ export interface RecordClaimCommand {
 export interface ProposeLearningArtifactCommand {
   /** 当前必须处于 researching 的 Research Run identity。 */
   readonly runId: string;
-  /** 必须为绝对 Markdown 路径；Runtime 会捕获其 canonical parent identity。 */
+  /** 必须为 Output Root 内的绝对 Markdown 路径；Runtime 会捕获 root 与 parent identity。 */
   readonly targetPath: string;
 }
 
@@ -410,7 +418,15 @@ const recordEvidenceCommandSchema = z
 const recordClaimCommandSchema = z
   .object({
     runId: z.string().trim().min(1),
-    text: z.string().trim().min(1),
+    kind: z.literal("source_fact"),
+    text: z
+      .string()
+      .trim()
+      .min(1)
+      .refine(
+        (text) => !hasPreRenderedCitationToken(text),
+        "Claim 不能包含预渲染 citation",
+      ),
     evidenceIds: z.array(z.string().trim().min(1)).min(1),
   })
   .strict();
@@ -477,7 +493,12 @@ export class ResearchAgentRuntime {
     this.#model = options.model;
     this.#artifacts = new ContentAddressedArtifactStore(runtimeHome);
     this.#store = new SqliteRunStore(runtimeHome);
-    this.#publisher = new LearningArtifactPublisher();
+    this.#publisher = new LearningArtifactPublisher({
+      runtimeHome,
+      ...(options.outputRoot === undefined
+        ? {}
+        : { outputRoot: options.outputRoot }),
+    });
   }
 
   public static open(options: OpenRuntimeOptions): ResearchAgentRuntime {
@@ -837,7 +858,7 @@ export class ResearchAgentRuntime {
     if (!parsedCommand.success) {
       throw new InvalidClaimCommandError();
     }
-    const { runId, text, evidenceIds } = parsedCommand.data;
+    const { runId, kind, text, evidenceIds } = parsedCommand.data;
     let current: RunProjection;
     try {
       current = this.#store.readProjection(runId);
@@ -863,6 +884,7 @@ export class ResearchAgentRuntime {
     const eventId = this.#ids.nextEventId();
     const claim: Claim = {
       claimId: `claim-${eventId}`,
+      kind,
       text,
       evidenceIds,
       recordedAt: occurredAt,
@@ -912,9 +934,15 @@ export class ResearchAgentRuntime {
       // draft artifact；这使“没有 Evidence 就不能 publish”成为可观察不变量。
       throw new EvidenceGateBlockedError();
     }
+    if (current.runBudget.maxModelTurns < 2) {
+      // 当前 one-shot slice 已经用 `proposePlan` 消耗一 turn；没有第二 turn 时
+      // 不允许调用 Artifact proposal ModelPort，以免先产生未授权模型副作用。
+      throw new EvidenceGateBlockedError();
+    }
 
     let proposal: LearningArtifactProposal;
     let markdown: string;
+    let proposedAt: string;
     try {
       proposal = parseLearningArtifactProposal(
         await this.#model.proposeLearningArtifact({
@@ -924,6 +952,14 @@ export class ResearchAgentRuntime {
           evidenceRecords: researching.evidenceRecords,
         }),
       );
+      proposedAt = this.#clock.now();
+      assertEvidenceGateBudget({
+        modelTurnsUsed: 2,
+        sourceReadObservations: researching.sourceReadObservations,
+        runBudget: current.runBudget,
+        runCreatedAt: current.createdAt,
+        evaluatedAt: proposedAt,
+      });
       const gate = evaluateEvidenceGate(
         proposal,
         researching.claims,
@@ -948,7 +984,6 @@ export class ResearchAgentRuntime {
       }
       throw error;
     }
-    const proposedAt = this.#clock.now();
     let draftArtifact: PersistedArtifact;
     try {
       draftArtifact = await this.#artifacts.putMarkdown(markdown, proposedAt);
@@ -1028,6 +1063,12 @@ export class ResearchAgentRuntime {
     if (
       currentTarget.targetCanonicalPath !==
         current.state.publicationTarget.targetCanonicalPath ||
+      currentTarget.outputRootCanonicalPath !==
+        current.state.publicationTarget.outputRootCanonicalPath ||
+      currentTarget.outputRootDevice !==
+        current.state.publicationTarget.outputRootDevice ||
+      currentTarget.outputRootInode !==
+        current.state.publicationTarget.outputRootInode ||
       currentTarget.parentDevice !== current.state.publicationTarget.parentDevice ||
       currentTarget.parentInode !== current.state.publicationTarget.parentInode
     ) {
@@ -1108,14 +1149,9 @@ export class ResearchAgentRuntime {
         throw new LearningArtifactPublicationError();
       }
       await this.#publisher.publish(ready.publicationTarget, markdown);
-    } catch (error) {
-      if (
-        error instanceof EvidenceGateError ||
-        error instanceof LearningArtifactPublishError ||
-        error instanceof LearningArtifactPublicationError
-      ) {
-        throw new LearningArtifactPublicationError();
-      }
+    } catch {
+      // renderer、Gate 与 publisher 的内部诊断都可能暴露私有内容或路径；public
+      // seam 统一映射为稳定错误，且不改变已获批准的 waiting Projection。
       throw new LearningArtifactPublicationError();
     }
 
