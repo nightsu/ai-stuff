@@ -41,6 +41,7 @@ flowchart LR
 
   subgraph RuntimeHome["Private Runtime Home"]
     Snapshot["ContentAddressedArtifactStore<br/>private Source Snapshot"]
+    SearchArtifact["Bounded search result Artifact<br/>full matches"]
     Registry["SqliteRunStore<br/>snapshot + artifact registry"]
     Evidence["Evidence Records"]
     Claim["Claims"]
@@ -50,7 +51,9 @@ flowchart LR
 
   Search --> Policy
   Policy --> Searcher
-  Searcher -->|"matches only; no snapshot"| Journal
+  Searcher -->|"bounded matches"| SearchArtifact
+  SearchArtifact --> Registry
+  Registry -->|"artifact reference + match count"| Journal
   Read --> Policy
   Policy -->|"approved explicit read"| Reader
   Reader --> Snapshot
@@ -82,7 +85,7 @@ flowchart LR
 
 Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_turn_completed`。该事件同时把有序 tool intents 变为 durable pending work；重启后的 `advanceResearch` 会先消费这些 pending intents，而不是再次 generation。Issue #6 的 scheduler 刻意顺序执行全部 intents；safe sibling search/read 的并发和原始顺序回填留给 Issue #11。
 
-`search_sources` 与 `read_source` 共享 Source Scope 权限边界。搜索通过固定参数 `rg` 下推 extension、exclusion、secret 与 file-size 过滤，启动前复核批准 root identity，每个命中再过 realpath preflight；命中只形成 observation，不创建 Snapshot。只有成功 explicit read 才冻结完整原始 UTF-8 字节；`invalid`、`denied`、`stale` 与 `failed` 都只落安全 observation。Evidence Record 也没有读取 live file 的能力，只能由 Runtime 从已持久化的成功 observation 逐字段派生。
+`search_sources` 与 `read_source` 共享 Source Scope 权限边界。搜索通过可注入 `SourceSearchPort` 调用默认的固定参数 `rg` adapter，下推 extension、exclusion、secret 与 file-size 过滤，启动前复核批准 root identity，每个命中再过 realpath preflight。完整命中列表写入私有 JSON Artifact；Journal observation 只保存 artifact 引用和 `matchCount`，下一轮 Model View 再按需校验并展开最近结果。搜索仍不创建 Source Snapshot。只有成功 explicit read 才冻结完整原始 UTF-8 字节；`invalid`、`denied`、`stale` 与 `failed` 都只落安全 observation。Evidence Record 也没有读取 live file 的能力，只能由 Runtime 从已持久化的成功 observation 逐字段派生。
 
 ## Evidence、Claim、Gate 与 draft 的职责分离
 
@@ -92,7 +95,7 @@ Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_tu
 4. **Evidence Gate** 在 `research_complete` 后检查模型选中的每个 Claim 都能通过结构化 `source_fact` Evidence 回溯，并从 Journal 重算实际 plan/research model turns、Research Tool calls、按 Source Snapshot identity 去重的 distinct sources、source bytes 与 Research Loop wall time。没有有效 Evidence、预算已耗尽或 Run 仍处于 `budget_exhausted` 时，Runtime 不创建 draft artifact，也不会触碰 publication target。
 5. **确定性 renderer** 是唯一产生 `【Evidence: <id>】` 的位置，并固定输出 `Claims`、`Evidence Index` 和紧凑 `Tool usage` 三个部分。`ModelPort.proposeLearningArtifact` 只能提交标题、摘要和既有 Claim ID 的展示顺序；它不能创建 Claim、Evidence 或 citation ID，且 title/summary/Claim 文本中的预渲染 `【Evidence:` token 会被拒绝。因此每一个可见 citation 都来自被 Gate 选中的结构化 Evidence。
 
-Markdown draft 写入私有通用 artifact namespace，并和引用它的 `learning_artifact_draft_proposed` 事件在同一个 SQLite 事务中注册。store 会拒绝“事件引用却没有匹配 artifact registry 行”的批次；Projection cache 与 Trace 仍从 canonical Journal 派生。
+Search result 与 Markdown draft 都写入私有通用 artifact namespace，并分别和引用它们的 `research_tool_observed` / `learning_artifact_draft_proposed` 事件在同一个 SQLite 事务中注册。store 会拒绝“事件引用却没有匹配 artifact registry 行”的批次；Projection cache 与 Trace 仍从 canonical Journal 派生，且不复制 search 行正文。
 
 ## 运行状态机与用户 publication gate
 

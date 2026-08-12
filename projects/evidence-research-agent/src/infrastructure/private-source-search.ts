@@ -1,8 +1,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import { sourcePathPolicyDenial } from "../domain/source-policy.js";
+import {
+  SOURCE_DISCOVERY_SECRET_GLOBS,
+  sourcePathPolicyDenial,
+} from "../domain/source-policy.js";
 import type { SourceScope, SourceSearchMatch } from "../domain/types.js";
+import type { SourceSearchPort } from "../application/ports.js";
 import {
   PrivateSourceAccess,
   sourceRootIdentityStillMatches,
@@ -50,7 +54,7 @@ export async function searchApprovedSources(
             `*${extension}`,
           ]),
           ...scope.exclusions.flatMap((pattern) => ["--glob", `!${pattern}`]),
-          ...SECRET_SEARCH_GLOBS.flatMap((pattern) => ["--glob", `!${pattern}`]),
+          ...SOURCE_DISCOVERY_SECRET_GLOBS.flatMap((pattern) => ["--glob", `!${pattern}`]),
           "--",
           request.query,
           ".",
@@ -100,26 +104,15 @@ export async function searchApprovedSources(
   return matches;
 }
 
-const SECRET_SEARCH_GLOBS = [
-  "**/.env*",
-  "**/*.pem",
-  "**/*.key",
-  "**/.npmrc",
-  "**/.pypirc",
-  "**/.netrc",
-  "**/.dockercfg",
-  "**/.git-credentials",
-  "**/.yarnrc.yml",
-  "**/.docker/config.json",
-  "**/.config/gh/hosts.yml",
-  "**/*credential*.json",
-  "**/*credential*.yaml",
-  "**/*credential*.yml",
-  "**/*token*.json",
-  "**/*secret*.json",
-  "**/service-account*.json",
-  "**/service_account*.json",
-] as const;
+/** 生产默认的固定参数 `rg` Source Search Port。 */
+export class RgSourceSearch implements SourceSearchPort {
+  public search(
+    scope: SourceScope,
+    request: SearchSourcesRequest,
+  ): Promise<readonly SourceSearchMatch[]> {
+    return searchApprovedSources(scope, request);
+  }
+}
 
 function isRgNoMatches(error: unknown): boolean {
   return (

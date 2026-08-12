@@ -2,10 +2,15 @@ import { isAbsolute } from "node:path";
 
 import {
   assertEvidenceGateBudget,
-  countLogicalToolCalls,
   EvidenceGateError,
   evaluateEvidenceGate,
 } from "./evidence-gate.js";
+import {
+  calculateRemainingRunBudget,
+  countLogicalToolCalls,
+  firstExhaustedRunBudgetDimension,
+  RunBudgetCalculationError,
+} from "./run-budget.js";
 import {
   hasPreRenderedCitationToken,
   PreRenderedCitationTokenError,
@@ -323,6 +328,25 @@ function applyRunEvent(
         event.payload.observation,
         event.occurredAt,
       );
+      const output = event.payload.observation.output;
+      assertResearchToolCallWithinBudget(current, event.payload.observation);
+      if (event.payload.observation.status === "succeeded") {
+        if (
+          event.payload.observation.toolName !== "search_sources" ||
+          output === undefined ||
+          !("searchResultArtifact" in output) ||
+          !artifactReferenceHasMatchingContentIdentity(output.searchResultArtifact) ||
+          output.searchResultArtifact.mediaType !== "application/json" ||
+          !Number.isSafeInteger(output.matchCount) ||
+          output.matchCount < 0
+        ) {
+          // read/evidence/claim/completion 的成功事实各有专属领域事件；generic
+          // observation 只能承载 search success 或安全的非成功反馈。
+          throw new IllegalRunEventError("generic Research Tool success 无效");
+        }
+      } else if (output !== undefined) {
+        throw new IllegalRunEventError("非成功 Research Tool observation 不能携带 output");
+      }
       return {
         ...current,
         state: {
@@ -344,6 +368,10 @@ function applyRunEvent(
         );
       }
       const observation = event.payload.observation;
+      assertResearchToolCallWithinBudget(
+        current,
+        event.payload.researchObservation ?? observation,
+      );
       if (
         event.payload.researchObservation !== undefined &&
         (event.payload.researchObservation.observationId !==
@@ -351,8 +379,14 @@ function applyRunEvent(
           event.payload.researchObservation.toolCallId !== observation.toolCallId ||
           event.payload.researchObservation.toolName !== "read_source" ||
           event.payload.researchObservation.status !== observation.status ||
-          (observation.status !== "succeeded" &&
-            event.payload.researchObservation.code !== observation.code))
+          (observation.status === "succeeded"
+            ? !hasExactOutput(
+                event.payload.researchObservation.output,
+                "sourceObservationId",
+                observation.observationId,
+              )
+            : event.payload.researchObservation.code !== observation.code ||
+              event.payload.researchObservation.output !== undefined))
       ) {
         throw new IllegalRunEventError("read_source 领域 observation 与模型 observation 不一致");
       }
@@ -380,6 +414,16 @@ function applyRunEvent(
       );
       if (sourceBytesRead > approvedByteLimit) {
         throw new IllegalRunEventError("来源读取 observation 超出批准累计字节限制");
+      }
+      const distinctSources = new Set(
+        [...current.state.sourceReadObservations, observation].flatMap((candidate) =>
+          candidate.status === "succeeded"
+            ? [candidate.sourceSnapshot.snapshotId]
+            : [],
+        ),
+      ).size;
+      if (distinctSources > current.runBudget.maxDistinctSources) {
+        throw new IllegalRunEventError("来源读取 observation 超出批准 distinct source 限制");
       }
 
       return {
@@ -413,6 +457,14 @@ function applyRunEvent(
         event.payload.evidence,
         event.occurredAt,
       );
+      validateEmbeddedSuccessObservation(
+        current,
+        event.payload.researchObservation,
+        "record_evidence",
+        "evidenceId",
+        event.payload.evidence.evidenceId,
+        event.occurredAt,
+      );
       return {
         ...current,
         state: {
@@ -441,6 +493,14 @@ function applyRunEvent(
         event.payload.claim,
         event.occurredAt,
       );
+      validateEmbeddedSuccessObservation(
+        current,
+        event.payload.researchObservation,
+        "propose_claim",
+        "claimId",
+        event.payload.claim.claimId,
+        event.occurredAt,
+      );
       return {
         ...current,
         state: {
@@ -466,9 +526,15 @@ function applyRunEvent(
         event.payload.observation,
         event.occurredAt,
       );
+      assertResearchToolCallWithinBudget(current, event.payload.observation);
       if (
         event.payload.observation.toolName !== "complete_research" ||
         event.payload.observation.status !== "succeeded" ||
+        event.payload.observation.code !== undefined ||
+        !hasExactUnresolvedQuestionsOutput(
+          event.payload.observation.output,
+          event.payload.completion.unresolvedQuestions,
+        ) ||
         remaining.length !== 0 ||
         event.payload.completion.completedAt !== event.occurredAt ||
         !isIsoUtc(event.payload.completion.completedAt)
@@ -499,7 +565,7 @@ function applyRunEvent(
         current,
         event.occurredAt,
       );
-      const expectedDimension = firstExhaustedBudgetDimension(
+      const expectedDimension = firstExhaustedRunBudgetDimension(
         expectedRemaining,
         current.state.pendingToolIntents.length === 0 ? "model" : "tool",
       );
@@ -528,6 +594,14 @@ function applyRunEvent(
       ) {
         throw new IllegalRunEventError(
           "只有 researching Run 可以提出 Learning Artifact draft",
+        );
+      }
+      if (
+        current.state.modelTurns.length > 0 &&
+        current.state.type !== "research_complete"
+      ) {
+        throw new IllegalRunEventError(
+          "进入 Research Loop 后必须先显式完成研究",
         );
       }
       validateLearningArtifactDraft(current, event.payload, event.occurredAt);
@@ -604,54 +678,18 @@ function remainingBudgetFromProjection(
   if (projection.state.type !== "researching") {
     throw new IllegalRunEventError("只有 researching Projection 可计算剩余预算");
   }
-  const distinctSources = new Set(
-    projection.state.sourceReadObservations.flatMap((observation) =>
-      observation.status === "succeeded"
-        ? [observation.sourceSnapshot.snapshotId]
-        : [],
-    ),
-  ).size;
-  const elapsedMs =
-    projection.state.researchStartedAt === undefined
-      ? 0
-      : Date.parse(evaluatedAt) - Date.parse(projection.state.researchStartedAt);
-  if (!Number.isSafeInteger(elapsedMs) || elapsedMs < 0) {
-    throw new IllegalRunEventError("Research Loop wall time 无效");
+  try {
+    return calculateRemainingRunBudget({
+      runBudget: projection.runBudget,
+      state: projection.state,
+      evaluatedAt,
+    });
+  } catch (error) {
+    if (error instanceof RunBudgetCalculationError) {
+      throw new IllegalRunEventError(error.message);
+    }
+    throw error;
   }
-  return {
-    modelTurns: Math.max(
-      0,
-      projection.runBudget.maxModelTurns - 1 - projection.state.modelTurns.length,
-    ),
-    toolCalls: Math.max(
-      0,
-      projection.runBudget.maxToolCalls - countLogicalToolCalls(
-        projection.state.sourceReadObservations,
-        projection.state.researchToolObservations,
-      ),
-    ),
-    distinctSources: Math.max(
-      0,
-      projection.runBudget.maxDistinctSources - distinctSources,
-    ),
-    sourceBytes: Math.max(
-      0,
-      projection.runBudget.maxSourceBytes - projection.state.sourceBytesRead,
-    ),
-    wallTimeMs: Math.max(0, projection.runBudget.maxWallTimeMs - elapsedMs),
-  };
-}
-
-function firstExhaustedBudgetDimension(
-  remaining: import("./types.js").RemainingRunBudget,
-  phase: "model" | "tool",
-): import("./types.js").BudgetExhaustedRunState["exhaustedDimension"] | undefined {
-  if (remaining.wallTimeMs === 0) return "wall_time";
-  if (phase === "model" && remaining.modelTurns === 0) return "model_turns";
-  if (remaining.toolCalls === 0) return "tool_calls";
-  if (remaining.distinctSources === 0) return "distinct_sources";
-  if (remaining.sourceBytes === 0) return "source_bytes";
-  return undefined;
 }
 
 function remainingBudgetsEqual(
@@ -757,6 +795,84 @@ function consumeEmbeddedResearchObservation(
   };
 }
 
+function validateEmbeddedSuccessObservation(
+  projection: RunProjection,
+  observation: ResearchToolObservation | undefined,
+  toolName: "record_evidence" | "propose_claim",
+  outputKey: "evidenceId" | "claimId",
+  outputIdentity: string,
+  occurredAt: string,
+): void {
+  if (observation === undefined) return;
+  if (projection.state.type !== "researching") {
+    throw new IllegalRunEventError("只有 researching Run 可以消费 Research Tool intent");
+  }
+  assertResearchToolCallWithinBudget(projection, observation);
+  if (
+    observation.toolName !== toolName ||
+    observation.status !== "succeeded" ||
+    observation.code !== undefined ||
+    !hasExactOutput(observation.output, outputKey, outputIdentity)
+  ) {
+    throw new IllegalRunEventError(`${toolName} 成功 observation 与领域事实不一致`);
+  }
+  validateResearchObservation(
+    projection.state.pendingToolIntents,
+    projection.state.researchToolObservations,
+    observation,
+    occurredAt,
+  );
+}
+
+function assertResearchToolCallWithinBudget(
+  projection: RunProjection,
+  observation: Pick<ResearchToolObservation, "toolCallId">,
+): void {
+  if (projection.state.type !== "researching") {
+    throw new IllegalRunEventError("只有 researching Run 可以消费 Research Tool budget");
+  }
+  const usedToolCallIds = new Set([
+    ...projection.state.sourceReadObservations.map((item) => item.toolCallId),
+    ...projection.state.researchToolObservations.map((item) => item.toolCallId),
+  ]);
+  usedToolCallIds.add(observation.toolCallId);
+  if (usedToolCallIds.size > projection.runBudget.maxToolCalls) {
+    throw new IllegalRunEventError("Research Tool observation 超出批准 tool call 限制");
+  }
+}
+
+function hasExactOutput(
+  output: ResearchToolObservation["output"],
+  key: "sourceObservationId" | "evidenceId" | "claimId",
+  identity: string,
+): boolean {
+  if (output === undefined || !hasExactKeys(output, [key])) return false;
+  switch (key) {
+    case "sourceObservationId":
+      return "sourceObservationId" in output &&
+        output.sourceObservationId === identity;
+    case "evidenceId":
+      return "evidenceId" in output && output.evidenceId === identity;
+    case "claimId":
+      return "claimId" in output && output.claimId === identity;
+  }
+}
+
+function hasExactUnresolvedQuestionsOutput(
+  output: ResearchToolObservation["output"],
+  unresolvedQuestions: readonly string[],
+): boolean {
+  return (
+    output !== undefined &&
+    hasExactKeys(output, ["unresolvedQuestions"]) &&
+    "unresolvedQuestions" in output &&
+    output.unresolvedQuestions.length === unresolvedQuestions.length &&
+    output.unresolvedQuestions.every(
+      (question, index) => question === unresolvedQuestions[index],
+    )
+  );
+}
+
 function validateResearchObservation(
   pendingIntents: readonly ResearchToolIntent[],
   priorObservations: readonly ResearchToolObservation[],
@@ -777,7 +893,10 @@ function validateResearchObservation(
       (prior) =>
         prior.observationId === observation.observationId ||
         prior.toolCallId === observation.toolCallId,
-    )
+    ) ||
+    (observation.status === "succeeded"
+      ? observation.code !== undefined
+      : observation.code === undefined || observation.output !== undefined)
   ) {
     throw new IllegalRunEventError("Research Tool observation 未精确消费 pending intent");
   }
@@ -1011,7 +1130,9 @@ function validateLearningArtifactDraft(
       wallTimeStartedAt:
         researching.researchStartedAt ?? projection.createdAt,
       wallTimeEndedAt:
-        researching.completion?.completedAt ?? occurredAt,
+        researching.type === "research_complete"
+          ? researching.completion.completedAt
+          : occurredAt,
     });
     markdown = renderLearningArtifact(
       proposal,

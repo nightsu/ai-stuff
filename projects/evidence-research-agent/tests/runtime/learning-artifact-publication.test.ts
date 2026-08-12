@@ -161,29 +161,26 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
     }
   });
 
-  it("blocks draft creation after the approved tool-call budget is exceeded", async () => {
+  it("rejects a source read before it can exceed the approved tool-call budget", async () => {
     const fixture = await createEvidenceReadyRun({
       runBudget: { maxToolCalls: 1 },
-    });
-    await fixture.runtime.readSource({
-      runId: fixture.runId,
-      request: {
-        rootIndex: 0,
-        relativePath: "source.md",
-        startLine: 1,
-        endLine: 1,
-      },
     });
 
     try {
       await expect(
-        fixture.runtime.proposeLearningArtifact({
+        fixture.runtime.readSource({
           runId: fixture.runId,
-          targetPath: join(fixture.outputDirectory, "tool-budget.md"),
+          request: {
+            rootIndex: 0,
+            relativePath: "source.md",
+            startLine: 1,
+            endLine: 1,
+          },
         }),
-      ).rejects.toThrow(/Evidence/);
+      ).rejects.toThrow(/无法安全持久化/);
       const projection = await fixture.runtime.inspectRun({ runId: fixture.runId });
       expect(projection.state.type).toBe("researching");
+      expect(projection.lastEventSequence).toBe(7);
     } finally {
       fixture.runtime.close();
     }
@@ -208,27 +205,25 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
     }
   });
 
-  it("blocks draft creation after the approved distinct-source budget is exceeded", async () => {
+  it("rejects a source read before it can exceed the approved distinct-source budget", async () => {
     const fixture = await createEvidenceReadyRun({
       runBudget: { maxDistinctSources: 1 },
-    });
-    await fixture.runtime.readSource({
-      runId: fixture.runId,
-      request: {
-        rootIndex: 0,
-        relativePath: "other.md",
-        startLine: 1,
-        endLine: 1,
-      },
     });
 
     try {
       await expect(
-        fixture.runtime.proposeLearningArtifact({
+        fixture.runtime.readSource({
           runId: fixture.runId,
-          targetPath: join(fixture.outputDirectory, "source-budget.md"),
+          request: {
+            rootIndex: 0,
+            relativePath: "other.md",
+            startLine: 1,
+            endLine: 1,
+          },
         }),
-      ).rejects.toThrow(/Evidence/);
+      ).rejects.toThrow(/无法安全持久化/);
+      const projection = await fixture.runtime.inspectRun({ runId: fixture.runId });
+      expect(projection.lastEventSequence).toBe(7);
     } finally {
       fixture.runtime.close();
     }

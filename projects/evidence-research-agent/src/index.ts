@@ -54,6 +54,7 @@ export type {
   LearningArtifactProposalRequest,
   ModelPort,
   PlanRequest,
+  SourceSearchPort,
 } from "./application/ports.js";
 export type {
   AdvanceResearchCommand,

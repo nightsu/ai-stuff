@@ -405,14 +405,8 @@ const modelTurnSchema = z
 
 const researchToolOutputSchema = z.union([
   z.object({
-    matches: z.array(
-      z.object({
-        rootIndex: z.number().int().nonnegative(),
-        relativePath: z.string().min(1),
-        lineNumber: z.number().int().positive(),
-        lineText: z.string(),
-      }).strict(),
-    ),
+    searchResultArtifact: artifactReferenceSchema,
+    matchCount: z.number().int().nonnegative(),
   }).strict(),
   z.object({ sourceObservationId: z.string().trim().min(1) }).strict(),
   z.object({ evidenceId: z.string().trim().min(1) }).strict(),
@@ -456,11 +450,12 @@ const evidenceBackedStateFields = {
   pendingToolIntents: z.array(researchToolIntentSchema),
   latestSteering: z.string().trim().min(1).optional(),
   researchStartedAt: z.iso.datetime().optional(),
-  completion: z.object({
-    unresolvedQuestions: z.array(z.string().trim().min(1)),
-    completedAt: z.iso.datetime(),
-  }).strict().optional(),
 };
+
+const researchCompletionSchema = z.object({
+  unresolvedQuestions: z.array(z.string().trim().min(1)),
+  completedAt: z.iso.datetime(),
+}).strict();
 
 const runStateSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("created") }),
@@ -481,7 +476,7 @@ const runStateSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("research_complete"),
     ...evidenceBackedStateFields,
-    completion: evidenceBackedStateFields.completion.unwrap(),
+    completion: researchCompletionSchema,
   }),
   z.object({
     type: z.literal("budget_exhausted"),
@@ -503,6 +498,7 @@ const runStateSchema = z.discriminatedUnion("type", [
     publicationTarget: publicationTargetSchema,
     publicationBinding: publicationApprovalBindingSchema,
     proposedAt: z.iso.datetime(),
+    completion: researchCompletionSchema.optional(),
   }),
   z.object({
     type: z.literal("ready_to_publish"),
@@ -512,6 +508,7 @@ const runStateSchema = z.discriminatedUnion("type", [
     publicationTarget: publicationTargetSchema,
     publicationBinding: publicationApprovalBindingSchema,
     publicationReceipt: publicationApprovalReceiptSchema,
+    completion: researchCompletionSchema.optional(),
   }),
   z.object({
     type: z.literal("completed"),
@@ -522,6 +519,7 @@ const runStateSchema = z.discriminatedUnion("type", [
     publicationBinding: publicationApprovalBindingSchema,
     publicationReceipt: publicationApprovalReceiptSchema,
     learningArtifact: publishedLearningArtifactSchema,
+    completion: researchCompletionSchema.optional(),
   }),
 ]);
 

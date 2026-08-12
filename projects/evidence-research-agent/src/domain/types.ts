@@ -191,12 +191,17 @@ export interface SourceSearchMatch {
   readonly lineText: string;
 }
 
+/** Journal 为成功 search observation 保存的轻量 Artifact 引用。 */
+export interface PersistedSourceSearchOutput {
+  /** 私有 Artifact Store 中保存完整有界命中列表的稳定引用。 */
+  readonly searchResultArtifact: ArtifactReference;
+  /** artifact 内命中数量，供 Projection 与 Trace 无需读取正文即可解释结果。 */
+  readonly matchCount: number;
+}
+
 /** Research Tool 成功时可暴露给下一轮模型的最小结构化结果。 */
 export type ResearchToolOutput =
-  | {
-      /** `search_sources` 按批准 root 与原始输出顺序返回的有界命中。 */
-      readonly matches: readonly SourceSearchMatch[];
-    }
+  | PersistedSourceSearchOutput
   | {
       /** `read_source` 已 durable 写入的 Source Read Observation identity。 */
       readonly sourceObservationId: string;
@@ -213,6 +218,14 @@ export type ResearchToolOutput =
       /** `complete_research` 明确保留的未解决问题。 */
       readonly unresolvedQuestions: readonly string[];
     };
+
+/** Model View 为最近搜索 observation 按需加载的有界结构化结果。 */
+export type ModelViewResearchToolOutput =
+  | {
+      /** `search_sources` 按批准 root 与原始输出顺序返回的有界命中。 */
+      readonly matches: readonly SourceSearchMatch[];
+    }
+  | Exclude<ResearchToolOutput, PersistedSourceSearchOutput>;
 
 /** Harness 对一个模型 intent 的安全、可回放 observation。 */
 export interface ResearchToolObservation {
@@ -234,6 +247,13 @@ export interface ResearchToolObservation {
   readonly output?: ResearchToolOutput | undefined;
   /** observation 进入 Run Journal 的 ISO 8601 UTC 时间。 */
   readonly observedAt: string;
+}
+
+/** Model View 中的 observation；search artifact 仅在最近窗口内按需展开。 */
+export interface ModelViewResearchToolObservation
+  extends Omit<ResearchToolObservation, "output"> {
+  /** 最近搜索结果可展开为 matches，其他工具保持原有最小 typed output。 */
+  readonly output?: ModelViewResearchToolOutput | undefined;
 }
 
 /** 每轮 generation 前由 canonical facts 确定性重建的模型可见预算余额。 */
@@ -273,7 +293,7 @@ export interface ModelView {
   /** 与当前 Claims/gaps 相关、且带精确摘录的有界 Evidence 视图。 */
   readonly relevantEvidence: readonly ModelViewEvidence[];
   /** 最近若干工具 observation；旧结果通过稳定 identities 保留而非完整 Journal。 */
-  readonly recentObservations: readonly ResearchToolObservation[];
+  readonly recentObservations: readonly ModelViewResearchToolObservation[];
   /** 最近一次非空用户 steering；裁剪时不得删除。 */
   readonly latestSteering?: string | undefined;
 }
@@ -358,8 +378,6 @@ export interface EvidenceBackedRunStateData {
   readonly latestSteering?: string | undefined;
   /** 第一个 Research Loop Model Turn 的 ISO 8601 UTC 时间；审批等待不计入 wall time。 */
   readonly researchStartedAt?: string | undefined;
-  /** 显式研究完成后在 Gate、审批与 publication 状态继续保留的不确定性。 */
-  readonly completion?: ResearchCompletion | undefined;
 }
 
 /** 精确计划已获用户批准、可以继续显式收集 Evidence 与 Claim 的 Run 状态。 */
@@ -650,6 +668,8 @@ export interface WaitingPublicationApprovalRunState
   readonly publicationBinding: PublicationApprovalBinding;
   /** draft 被正式写入 Run Journal 的 ISO 8601 UTC 时间。 */
   readonly proposedAt: string;
+  /** 若 draft 来自 Research Loop，保留显式完成时的不确定性；旧显式路径则省略。 */
+  readonly completion?: ResearchCompletion | undefined;
 }
 
 /** 用户已批准 exact publication binding、等待显式正常写入命令的 Run 状态。 */
@@ -666,6 +686,8 @@ export interface ReadyToPublishRunState extends EvidenceBackedRunStateData {
   readonly publicationBinding: PublicationApprovalBinding;
   /** 已由用户命令持久化的精确 publication authorization。 */
   readonly publicationReceipt: PublicationApprovalReceipt;
+  /** 若 draft 来自 Research Loop，保留显式完成时的不确定性；旧显式路径则省略。 */
+  readonly completion?: ResearchCompletion | undefined;
 }
 
 /** 正常 publisher 返回且 `learning_artifact_published` 已 durably append 后的终态。 */
@@ -684,6 +706,8 @@ export interface CompletedRunState extends EvidenceBackedRunStateData {
   readonly publicationReceipt: PublicationApprovalReceipt;
   /** 外部 publisher 成功后写入 Journal 的已发布内容 identity。 */
   readonly learningArtifact: PublishedLearningArtifact;
+  /** 若 draft 来自 Research Loop，保留显式完成时的不确定性；旧显式路径则省略。 */
+  readonly completion?: ResearchCompletion | undefined;
 }
 
 /** `learning_artifact_draft_proposed` 事件携带的 gated draft 与 publication binding。 */

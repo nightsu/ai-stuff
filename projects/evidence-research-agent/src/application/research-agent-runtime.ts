@@ -9,10 +9,15 @@ import {
 } from "../domain/integrity.js";
 import {
   assertEvidenceGateBudget,
-  countLogicalToolCalls,
   EvidenceGateError,
   evaluateEvidenceGate,
 } from "../domain/evidence-gate.js";
+import {
+  calculateRemainingRunBudget,
+  countLogicalToolCalls,
+  firstExhaustedRunBudgetDimension,
+  RunBudgetCalculationError,
+} from "../domain/run-budget.js";
 import {
   createPublicationApprovalBinding,
   renderLearningArtifact,
@@ -39,10 +44,12 @@ import type {
   ReadSourceRequest,
   RunProjection,
   RunTrace,
+  SourceSearchMatch,
   SourceReadObservation,
   SourceScope,
   ModelTurn,
   ModelView,
+  ModelViewResearchToolObservation,
   ResearchPlan,
   ResearchToolIntent,
   ResearchToolObservation,
@@ -66,8 +73,8 @@ import {
   LearningArtifactPublisher,
   PublicationTargetPreparationError,
 } from "../infrastructure/learning-artifact-publisher.js";
-import { searchApprovedSources } from "../infrastructure/private-source-search.js";
-import type { Clock, IdGenerator, ModelPort } from "./ports.js";
+import { RgSourceSearch } from "../infrastructure/private-source-search.js";
+import type { Clock, IdGenerator, ModelPort, SourceSearchPort } from "./ports.js";
 
 /** 打开一个 headless runtime 所需的基础设施与可控边界。 */
 export interface OpenRuntimeOptions {
@@ -81,6 +88,8 @@ export interface OpenRuntimeOptions {
   readonly clock?: Clock;
   /** 可选 identity 边界；生产默认使用 UUID。 */
   readonly ids?: IdGenerator;
+  /** 可选 Source Search Port；测试可替换 host `rg` 与 discovery 故障。 */
+  readonly sourceSearch?: SourceSearchPort;
   /** 单个 Model View 允许的确定性 JSON UTF-8 字节数；不足以容纳 pinned facts 时暂停。 */
   readonly maxModelViewBytes?: number;
 }
@@ -573,6 +582,8 @@ export class ResearchAgentRuntime {
   readonly #store: SqliteRunStore;
   /** 只接收 exact target binding 与 Markdown bytes 的外部 publication 边界。 */
   readonly #publisher: LearningArtifactPublisher;
+  /** 执行模型可见 `search_sources` 且可由测试注入的 discovery 边界。 */
+  readonly #sourceSearch: SourceSearchPort;
   /** 不依赖 tokenizer/provider 的确定性 JSON byte 上限。 */
   readonly #maxModelViewBytes: number;
 
@@ -592,6 +603,7 @@ export class ResearchAgentRuntime {
         ? {}
         : { outputRoot: options.outputRoot }),
     });
+    this.#sourceSearch = options.sourceSearch ?? new RgSourceSearch();
   }
 
   public static open(options: OpenRuntimeOptions): ResearchAgentRuntime {
@@ -778,12 +790,12 @@ export class ResearchAgentRuntime {
       }
       const now = this.#clock.now();
       const remainingBudget = this.#remainingBudget(current, now);
-      const exhausted = firstExhaustedDimension(
+      const exhausted = firstExhaustedRunBudgetDimension(
         remainingBudget,
         current.state.pendingToolIntents.length === 0 ? "model" : "tool",
       );
       if (exhausted !== undefined) {
-        return this.#suspendForBudget(current, exhausted, remainingBudget);
+        return this.#suspendForBudget(current, exhausted);
       }
       if (current.state.pendingToolIntents.length !== 0) {
         await this.#executePendingResearchIntent(current);
@@ -793,7 +805,7 @@ export class ResearchAgentRuntime {
       const approvedPlan = parseResearchPlan(
         await this.#artifacts.readJson(current.state.planArtifact),
       );
-      const view = this.#fitModelView(this.#buildModelView(
+      const view = this.#fitModelView(await this.#buildModelView(
         current,
         approvedPlan,
         remainingBudget,
@@ -834,12 +846,12 @@ export class ResearchAgentRuntime {
     }
   }
 
-  #buildModelView(
+  async #buildModelView(
     current: RunProjection,
     approvedPlan: ResearchPlan,
     remainingBudget: RemainingRunBudget,
     latestSteering: string | undefined,
-  ): ModelView {
+  ): Promise<ModelView> {
     if (
       current.state.type !== "researching" &&
       current.state.type !== "research_complete"
@@ -862,6 +874,33 @@ export class ResearchAgentRuntime {
         excerpt: observation.excerpt,
       };
     });
+    const recentObservations = await Promise.all(
+      researching.researchToolObservations.slice(-8).map(async (
+        observation,
+      ): Promise<ModelViewResearchToolObservation> => {
+        const output = observation.output;
+        if (output === undefined) {
+          return { ...observation, output: undefined };
+        }
+        if (!("searchResultArtifact" in output)) {
+          return { ...observation, output };
+        }
+        let matches: SourceSearchMatch[];
+        try {
+          matches = parseSourceSearchMatches(
+            await this.#artifacts.readJson(output.searchResultArtifact),
+          );
+        } catch {
+          // Journal 只能证明 search artifact identity；若私有 CAS 丢失或损坏，
+          // Harness 不得用空结果继续 generation 并把恢复故障伪装成“没有命中”。
+          throw new ResearchLoopError();
+        }
+        if (matches.length !== output.matchCount) {
+          throw new ResearchLoopError();
+        }
+        return { ...observation, output: { matches } };
+      }),
+    );
     return {
       runId: current.runId,
       question: current.question,
@@ -877,7 +916,7 @@ export class ResearchAgentRuntime {
       evidenceGaps: current.state.evidenceGaps,
       pendingIntents: current.state.pendingToolIntents,
       relevantEvidence,
-      recentObservations: current.state.researchToolObservations.slice(-8),
+      recentObservations,
       ...(latestSteering === undefined ? {} : { latestSteering }),
     };
   }
@@ -948,14 +987,40 @@ export class ResearchAgentRuntime {
       return;
     }
     try {
-      const matches = await searchApprovedSources(current.sourceScope, parsed.data);
-      this.#appendGenericToolObservation(
-        current,
+      const matches = await this.#sourceSearch.search(
+        current.sourceScope,
+        parsed.data,
+      );
+      const observedAt = this.#clock.now();
+      const artifact = await this.#artifacts.putJson(
+        matches,
+        "application/json",
+        observedAt,
+      );
+      const observation = this.#createResearchObservation(
         intent,
         "succeeded",
         undefined,
-        `找到 ${matches.length} 个批准来源命中：${matches.map((match) => match.relativePath).join(", ") || "none"}`,
-        { matches },
+        `找到 ${matches.length} 个批准来源命中`,
+        {
+          searchResultArtifact: stripArtifactCreatedAt(artifact),
+          matchCount: matches.length,
+        },
+        observedAt,
+      );
+      const event: ResearchRunEvent = {
+        eventId: this.#ids.nextEventId(),
+        runId: current.runId,
+        sequence: current.lastEventSequence + 1,
+        type: "research_tool_observed",
+        occurredAt: observedAt,
+        payload: { observation },
+      };
+      this.#store.appendEvents(
+        current.runId,
+        current.lastEventSequence,
+        [event],
+        [artifact],
       );
     } catch {
       this.#appendGenericToolObservation(current, intent, "failed", "search_failed");
@@ -970,7 +1035,7 @@ export class ResearchAgentRuntime {
     }
     const remaining = this.#remainingBudget(current, this.#clock.now());
     if (remaining.sourceBytes === 0) {
-      this.#suspendForBudget(current, "source_bytes", remaining);
+      this.#suspendForBudget(current, "source_bytes");
       return;
     }
     await this.#readSource(
@@ -1107,47 +1172,28 @@ export class ResearchAgentRuntime {
     ) {
       throw new ResearchLoopError();
     }
-    const distinctSources = new Set(
-      current.state.sourceReadObservations.flatMap((observation) =>
-        observation.status === "succeeded"
-          ? [observation.sourceSnapshot.snapshotId]
-          : [],
-      ),
-    ).size;
-    const elapsedMs =
-      current.state.researchStartedAt === undefined
-        ? 0
-        : Math.max(0, Date.parse(evaluatedAt) - Date.parse(current.state.researchStartedAt));
-    return {
-      modelTurns: Math.max(
-        0,
-        current.runBudget.maxModelTurns - 1 - current.state.modelTurns.length,
-      ),
-      toolCalls: Math.max(
-        0,
-        current.runBudget.maxToolCalls - countLogicalToolCalls(
-          current.state.sourceReadObservations,
-          current.state.researchToolObservations,
-        ),
-      ),
-      distinctSources: Math.max(
-        0,
-        current.runBudget.maxDistinctSources - distinctSources,
-      ),
-      sourceBytes: Math.max(
-        0,
-        current.runBudget.maxSourceBytes - current.state.sourceBytesRead,
-      ),
-      wallTimeMs: Math.max(0, current.runBudget.maxWallTimeMs - elapsedMs),
-    };
+    try {
+      return calculateRemainingRunBudget({
+        runBudget: current.runBudget,
+        state: current.state,
+        evaluatedAt,
+      });
+    } catch (error) {
+      if (error instanceof RunBudgetCalculationError) {
+        throw new ResearchLoopError();
+      }
+      throw error;
+    }
   }
 
   #suspendForBudget(
     current: RunProjection,
     exhaustedDimension: "model_turns" | "tool_calls" | "distinct_sources" | "source_bytes" | "wall_time",
-    remainingBudget: RemainingRunBudget,
   ): RunProjection {
     const occurredAt = this.#clock.now();
+    // payload 必须用 event 自己的 occurredAt 重算；若复用更早一拍的 Model View
+    // 余额，真实递增时钟会让 reducer replay 得到不同 wall-time 并拒绝事件。
+    const remainingBudget = this.#remainingBudget(current, occurredAt);
     return this.#store.appendEvents(current.runId, current.lastEventSequence, [
       {
         eventId: this.#ids.nextEventId(),
@@ -1507,6 +1553,14 @@ export class ResearchAgentRuntime {
     }
     const researching = current.state;
     if (
+      researching.modelTurns.length > 0 &&
+      researching.type !== "research_complete"
+    ) {
+      // #5 的零 Model Turn 显式教学路径仍可独立使用；一旦进入 Research Loop，
+      // deterministic outer workflow 必须看到 complete_research 的 durable fact。
+      throw new IllegalLearningArtifactStateError();
+    }
+    if (
       researching.claims.length === 0 ||
       researching.evidenceRecords.length === 0
     ) {
@@ -1551,7 +1605,9 @@ export class ResearchAgentRuntime {
         wallTimeStartedAt:
           researching.researchStartedAt ?? current.createdAt,
         wallTimeEndedAt:
-          researching.completion?.completedAt ?? proposedAt,
+          researching.type === "research_complete"
+            ? researching.completion.completedAt
+            : proposedAt,
       });
       const gate = evaluateEvidenceGate(
         proposal,
@@ -1787,14 +1843,11 @@ export class ResearchAgentRuntime {
   }
 }
 
-function firstExhaustedDimension(
-  remaining: RemainingRunBudget,
-  phase: "model" | "tool" = "model",
-): "model_turns" | "tool_calls" | "distinct_sources" | "source_bytes" | "wall_time" | undefined {
-  if (remaining.wallTimeMs === 0) return "wall_time";
-  if (phase === "model" && remaining.modelTurns === 0) return "model_turns";
-  if (remaining.toolCalls === 0) return "tool_calls";
-  if (remaining.distinctSources === 0) return "distinct_sources";
-  if (remaining.sourceBytes === 0) return "source_bytes";
-  return undefined;
+function parseSourceSearchMatches(value: unknown): SourceSearchMatch[] {
+  return z.array(z.object({
+    rootIndex: z.number().int().nonnegative(),
+    relativePath: z.string().min(1),
+    lineNumber: z.number().int().positive(),
+    lineText: z.string(),
+  }).strict()).parse(value);
 }

@@ -571,6 +571,13 @@ function collectArtifactReferences(
     if (event.type === "learning_artifact_draft_proposed") {
       references.push(event.payload.draftArtifact);
     }
+    if (
+      event.type === "research_tool_observed" &&
+      event.payload.observation.output !== undefined &&
+      "searchResultArtifact" in event.payload.observation.output
+    ) {
+      references.push(event.payload.observation.output.searchResultArtifact);
+    }
   }
   return references;
 }

@@ -15,6 +15,30 @@ import type {
 /** Harness 固定拥有的单次 `read_source` 最大 1-based inclusive 行窗。 */
 export const MAX_SOURCE_LINE_WINDOW = 200;
 
+/** `rg` discovery 在读取文件前应用的 secret path 防御性排除；策略归属本模块。 */
+export const SOURCE_DISCOVERY_SECRET_GLOBS = [
+  "**/.env*",
+  "**/*.pem",
+  "**/*.key",
+  "**/.npmrc",
+  "**/.pypirc",
+  "**/.netrc",
+  "**/.dockercfg",
+  "**/.git-credentials",
+  "**/.yarnrc.yml",
+  "**/.docker/config.json",
+  "**/.config/gh/hosts.yml",
+  "**/application_default_credentials.json",
+  "**/credential*.{json,yaml,yml,toml,ini,conf,cfg}",
+  "**/credentials*.{json,yaml,yml,toml,ini,conf,cfg}",
+  "**/token*.{json,yaml,yml,toml,ini,conf,cfg}",
+  "**/tokens*.{json,yaml,yml,toml,ini,conf,cfg}",
+  "**/secret*.{json,yaml,yml,toml,ini,conf,cfg}",
+  "**/secrets*.{json,yaml,yml,toml,ini,conf,cfg}",
+  "**/service-account*.{json,yaml,yml,toml,ini,conf,cfg}",
+  "**/service_account*.{json,yaml,yml,toml,ini,conf,cfg}",
+] as const;
+
 const CREDENTIAL_CONFIG_NAME =
   /^(?:credentials?|tokens?|secrets?)\.(?:json|ya?ml|toml|ini|conf|cfg)$/;
 const SERVICE_ACCOUNT_CONFIG_NAME =

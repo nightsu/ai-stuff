@@ -2,24 +2,12 @@ import type {
   Claim,
   EvidenceRecord,
   LearningArtifactProposal,
-  ResearchToolObservation,
   RunBudget,
   SourceReadObservation,
 } from "./types.js";
 
 /** Evidence Gate 无法从已登记来源事实构造可发布 Markdown 时抛出的领域错误。 */
 export class EvidenceGateError extends Error {}
-
-/** 按稳定 `toolCallId` 去重显式读取与 Research Loop observation 的逻辑调用数。 */
-export function countLogicalToolCalls(
-  sourceReadObservations: readonly SourceReadObservation[],
-  researchToolObservations: readonly ResearchToolObservation[],
-): number {
-  return new Set([
-    ...sourceReadObservations.map((observation) => observation.toolCallId),
-    ...researchToolObservations.map((observation) => observation.toolCallId),
-  ]).size;
-}
 
 /** Gate 接受后可被 renderer 使用、且已经按模型选择顺序冻结的事实集合。 */
 export interface EvidenceGateResult {

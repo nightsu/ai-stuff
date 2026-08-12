@@ -5,6 +5,7 @@ import type {
   ModelTurn,
   ModelView,
   ResearchPlan,
+  SourceSearchMatch,
   SourceScope,
 } from "../domain/types.js";
 
@@ -60,4 +61,18 @@ export interface ModelPort {
   ): Promise<LearningArtifactProposal>;
   /** 从 Harness 构建的 Model View 完成一个 Research Loop generation。 */
   generateResearchTurn?(view: ModelView): Promise<Omit<ModelTurn, "turnId" | "completedAt">>;
+}
+
+/** Harness 调度 `search_sources` 时依赖的可注入本地 discovery 边界。 */
+export interface SourceSearchPort {
+  /** 在已批准 Source Scope 内返回原始顺序的有界匹配，不创建 Source Snapshot。 */
+  search(
+    scope: SourceScope,
+    request: {
+      /** 非空 literal query；实现不得把它解释为 shell 参数。 */
+      readonly query: string;
+      /** 全部 roots 合计允许返回的最大命中数。 */
+      readonly maxResults: number;
+    },
+  ): Promise<readonly SourceSearchMatch[]>;
 }

@@ -7,14 +7,20 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   ModelViewTooLargeError,
   ResearchAgentRuntime,
+  ResearchLoopError,
   ScriptedModel,
 } from "../../src/index.js";
 import type {
   Clock,
   IdGenerator,
   OpenRuntimeOptions,
+  ResearchRunEvent,
+  ResearchToolIntent,
   RunBudget,
+  SourceSearchPort,
 } from "../../src/index.js";
+import { IllegalRunEventError } from "../../src/domain/reducer.js";
+import { SqliteRunStore } from "../../src/infrastructure/sqlite-run-store.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -184,9 +190,12 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
           sourceBytes: 4_096,
         },
       });
-      expect(model.researchViews[1]?.recentObservations[0]?.summary).toContain(
-        "journal.md",
-      );
+      expect(model.researchViews[1]?.recentObservations[0]).toMatchObject({
+        summary: "找到 1 个批准来源命中",
+        output: {
+          matches: [expect.objectContaining({ relativePath: "journal.md" })],
+        },
+      });
       expect(model.researchViews[3]?.relevantEvidence[0]).toMatchObject({
         evidenceId: "evidence-event-010",
         excerpt: "Run Journal 是 canonical history。\nProjection 可以从 Journal 重建。",
@@ -256,6 +265,277 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
           expect.objectContaining({ code: "source_not_found" }),
         ]),
       );
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("stores search matches only in an Artifact while rebuilding them into the next Model View", async () => {
+    const calls: string[] = [];
+    const sourceSearch: SourceSearchPort = {
+      search: async (_scope, request) => {
+        calls.push(request.query);
+        return [{
+          rootIndex: 0,
+          relativePath: "journal.md",
+          lineNumber: 1,
+          lineText: "injected search body",
+        }];
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [
+        turn("search", "search_sources", { query: "injected", maxResults: 1 }),
+        turn("complete", "complete_research", { unresolvedQuestions: [] }),
+      ],
+      {},
+      { sourceSearch },
+    );
+    try {
+      const completed = await fixture.runtime.advanceResearch({
+        runId: fixture.runId,
+      });
+      expect(calls).toEqual(["injected"]);
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        researchToolObservations: [
+          {
+            toolName: "search_sources",
+            status: "succeeded",
+            output: {
+              searchResultArtifact: expect.objectContaining({
+                mediaType: "application/json",
+              }),
+              matchCount: 1,
+            },
+          },
+          expect.objectContaining({ toolName: "complete_research" }),
+        ],
+      });
+      expect(JSON.stringify(completed)).not.toContain("injected search body");
+      expect(fixture.model.researchViews[1]?.recentObservations[0]).toMatchObject({
+        output: {
+          matches: [{
+            relativePath: "journal.md",
+            lineText: "injected search body",
+          }],
+        },
+      });
+      expect(JSON.stringify(await fixture.runtime.traceRun({ runId: fixture.runId })))
+        .not.toContain("injected search body");
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("turns an injected source-search failure into a safe observation for the next turn", async () => {
+    const sourceSearch: SourceSearchPort = {
+      search: async () => {
+        throw new Error("private /absolute/path must not escape");
+      },
+    };
+    const fixture = await createApprovedLoopRun(
+      [
+        turn("search", "search_sources", { query: "canonical", maxResults: 1 }),
+        turn("complete", "complete_research", {
+          unresolvedQuestions: ["search unavailable"],
+        }),
+      ],
+      {},
+      { sourceSearch },
+    );
+    try {
+      const completed = await fixture.runtime.advanceResearch({
+        runId: fixture.runId,
+      });
+      expect(completed.state).toMatchObject({
+        type: "research_complete",
+        researchToolObservations: [
+          expect.objectContaining({
+            toolName: "search_sources",
+            status: "failed",
+            code: "search_failed",
+          }),
+          expect.objectContaining({ toolName: "complete_research" }),
+        ],
+      });
+      expect(fixture.model.researchViews[1]?.recentObservations).toEqual([
+        expect.objectContaining({ code: "search_failed" }),
+      ]);
+      expect(JSON.stringify(completed)).not.toContain("/absolute/path");
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("executes a durable pending intent after restart before requesting another Model Turn", async () => {
+    const fixture = await createApprovedLoopRun([]);
+    fixture.runtime.close();
+    const store = new SqliteRunStore(fixture.runtimeHome);
+    store.appendEvents(fixture.runId, 4, [
+      modelTurnCompletedEvent(fixture.runId, 5, [
+        {
+          intentId: "pending-search",
+          name: "search_sources",
+          input: { query: "canonical", maxResults: 1 },
+        },
+      ]),
+    ]);
+    store.close();
+
+    const searchQueries: string[] = [];
+    const restartedModel = new ScriptedModel([], [], [
+      turn("complete", "complete_research", { unresolvedQuestions: [] }),
+    ]);
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputRoot,
+      model: restartedModel,
+      clock: fixedClock(),
+      ids: sequentialIds(100),
+      sourceSearch: {
+        search: async (_scope, request) => {
+          searchQueries.push(request.query);
+          return [];
+        },
+      },
+    });
+    try {
+      await expect(
+        restarted.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "research_complete" } });
+      expect(searchQueries).toEqual(["canonical"]);
+      expect(restartedModel.researchViews).toHaveLength(1);
+      expect(restartedModel.researchViews[0]?.recentObservations).toEqual([
+        expect.objectContaining({
+          intentId: "pending-search",
+          status: "succeeded",
+        }),
+      ]);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("rejects a generic success observation that tries to impersonate read_source", async () => {
+    const fixture = await createApprovedLoopRun([]);
+    fixture.runtime.close();
+    const store = new SqliteRunStore(fixture.runtimeHome);
+    try {
+      store.appendEvents(fixture.runId, 4, [
+        modelTurnCompletedEvent(fixture.runId, 5, [
+          {
+            intentId: "read",
+            name: "read_source",
+            input: {
+              rootIndex: 0,
+              relativePath: "journal.md",
+              startLine: 1,
+              endLine: 1,
+            },
+          },
+        ]),
+      ]);
+      expect(() =>
+        store.appendEvents(fixture.runId, 5, [{
+          eventId: "event-forged-generic-read",
+          runId: fixture.runId,
+          sequence: 6,
+          type: "research_tool_observed",
+          occurredAt: fixedClock().now(),
+          payload: {
+            observation: {
+              observationId: "observation-forged-read",
+              toolCallId: "tool-call-forged-read",
+              intentId: "read",
+              toolName: "read_source",
+              status: "succeeded",
+              summary: "forged read success",
+              output: { sourceObservationId: "observation-forged-read" },
+              observedAt: fixedClock().now(),
+            },
+          },
+        }]),
+      ).toThrow(IllegalRunEventError);
+      expect(store.readProjection(fixture.runId).lastEventSequence).toBe(5);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects replay of a Research Tool observation beyond the approved tool budget", async () => {
+    const fixture = await createApprovedLoopRun([], { maxToolCalls: 1 });
+    fixture.runtime.close();
+    const store = new SqliteRunStore(fixture.runtimeHome);
+    try {
+      store.appendEvents(fixture.runId, 4, [
+        modelTurnCompletedEvent(fixture.runId, 5, [
+          { intentId: "first", name: "search_sources", input: {} },
+          { intentId: "second", name: "search_sources", input: {} },
+        ]),
+      ]);
+      store.appendEvents(fixture.runId, 5, [
+        invalidSearchObservationEvent(fixture.runId, 6, "first"),
+      ]);
+      expect(() =>
+        store.appendEvents(fixture.runId, 6, [
+          invalidSearchObservationEvent(fixture.runId, 7, "second"),
+        ]),
+      ).toThrow(/tool call 限制/);
+      expect(store.readProjection(fixture.runId).lastEventSequence).toBe(6);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("does not allow a draft after entering the Research Loop until complete_research succeeds", async () => {
+    const fixture = await createApprovedLoopRun(
+      [turn("search", "search_sources", { query: "canonical", maxResults: 1 })],
+      {},
+      {
+        learningArtifactProposals: [{
+          title: "must not be generated",
+          summary: "Research completion is mandatory.",
+          claimIds: ["claim-event-007"],
+        }],
+      },
+    );
+    try {
+      const read = await fixture.runtime.readSource({
+        runId: fixture.runId,
+        request: {
+          rootIndex: 0,
+          relativePath: "journal.md",
+          startLine: 1,
+          endLine: 1,
+        },
+      });
+      if (read.state.type !== "researching" || read.state.sourceReadObservations[0] === undefined) {
+        throw new Error("测试要求成功来源 observation");
+      }
+      const evidenced = await fixture.runtime.recordEvidence({
+        runId: fixture.runId,
+        observationId: read.state.sourceReadObservations[0].observationId,
+      });
+      if (evidenced.state.type !== "researching" || evidenced.state.evidenceRecords[0] === undefined) {
+        throw new Error("测试要求 Evidence Record");
+      }
+      await fixture.runtime.recordClaim({
+        runId: fixture.runId,
+        kind: "source_fact",
+        text: "Run Journal 是 canonical history。",
+        evidenceIds: [evidenced.state.evidenceRecords[0].evidenceId],
+      });
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).rejects.toBeInstanceOf(ResearchLoopError);
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputRoot, "incomplete.md"),
+        }),
+      ).rejects.toThrow(/状态不能提出/);
+      expect(fixture.model.learningArtifactRequests).toEqual([]);
     } finally {
       fixture.runtime.close();
     }
@@ -467,6 +747,34 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
     }
   });
 
+  it("persists budget exhaustion from the same clock instant used by reducer replay", async () => {
+    let tick = 0;
+    const clock: Clock = {
+      now: () =>
+        new Date(Date.UTC(2026, 7, 12, 8, 0, 0, tick++)).toISOString(),
+    };
+    const fixture = await createApprovedLoopRun(
+      [turn("search", "search_sources", { query: "canonical", maxResults: 5 })],
+      { maxModelTurns: 2, maxWallTimeMs: 60_000 },
+      { clock },
+    );
+    try {
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "budget_exhausted",
+          exhaustedDimension: "model_turns",
+        },
+      });
+      await expect(
+        fixture.runtime.rebuildRunProjection({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "budget_exhausted" } });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
   it("blocks draft generation before calling the model when no Model Turn remains", async () => {
     const fixture = await createApprovedLoopRun(
       [
@@ -608,12 +916,66 @@ function turn(
   };
 }
 
+function modelTurnCompletedEvent(
+  runId: string,
+  sequence: number,
+  toolIntents: readonly ResearchToolIntent[],
+): ResearchRunEvent {
+  const eventId = `event-recovery-${sequence}`;
+  const occurredAt = fixedClock().now();
+  return {
+    eventId,
+    runId,
+    sequence,
+    type: "model_turn_completed",
+    occurredAt,
+    payload: {
+      generationStartedAt: occurredAt,
+      turn: {
+        turnId: `turn-${eventId}`,
+        text: "durable pending intent",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents,
+        completedAt: occurredAt,
+      },
+    },
+  };
+}
+
+function invalidSearchObservationEvent(
+  runId: string,
+  sequence: number,
+  intentId: string,
+): ResearchRunEvent {
+  const occurredAt = fixedClock().now();
+  return {
+    eventId: `event-invalid-search-${sequence}`,
+    runId,
+    sequence,
+    type: "research_tool_observed",
+    occurredAt,
+    payload: {
+      observation: {
+        observationId: `observation-invalid-search-${sequence}`,
+        toolCallId: `tool-call-invalid-search-${sequence}`,
+        intentId,
+        toolName: "search_sources",
+        status: "invalid",
+        code: "invalid_tool_schema",
+        summary: "invalid search schema",
+        observedAt: occurredAt,
+      },
+    },
+  };
+}
+
 async function createApprovedLoopRun(
   turns: ConstructorParameters<typeof ScriptedModel>[2],
   limits: Partial<RunBudget> = {},
   runtimeOptions: Pick<
     OpenRuntimeOptions,
-    "maxModelViewBytes" | "clock"
+    "maxModelViewBytes" | "clock" | "sourceSearch"
   > & {
     /** 可选 draft 模型脚本，用于断言预算在 Model Port 调用之前阻断副作用。 */
     readonly learningArtifactProposals?: ConstructorParameters<typeof ScriptedModel>[1];
@@ -642,6 +1004,9 @@ async function createApprovedLoopRun(
     model,
     clock: runtimeOptions.clock ?? fixedClock(),
     ids: sequentialIds(),
+    ...(runtimeOptions.sourceSearch === undefined
+      ? {}
+      : { sourceSearch: runtimeOptions.sourceSearch }),
     ...(runtimeOptions.maxModelViewBytes === undefined
       ? {}
       : { maxModelViewBytes: runtimeOptions.maxModelViewBytes }),
@@ -662,7 +1027,14 @@ async function createApprovedLoopRun(
     runId: waiting.runId,
     bindingHash: waiting.state.approvalBinding.bindingHash,
   });
-  return { runtime, runId: waiting.runId, model, outputRoot, sourceRoot };
+  return {
+    runtime,
+    runId: waiting.runId,
+    model,
+    runtimeHome,
+    outputRoot,
+    sourceRoot,
+  };
 }
 
 function generousBudget(): RunBudget {
@@ -680,8 +1052,8 @@ function fixedClock(): Clock {
   return { now: () => "2026-08-12T08:00:00.000Z" };
 }
 
-function sequentialIds(): IdGenerator {
-  let event = 0;
+function sequentialIds(startAt = 0): IdGenerator {
+  let event = startAt;
   let toolCall = 0;
   let observation = 0;
   return {
