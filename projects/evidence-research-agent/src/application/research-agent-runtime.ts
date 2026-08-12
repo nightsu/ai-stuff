@@ -154,6 +154,8 @@ export interface CreateRunCommand {
   readonly sourceScope: unknown;
   /** 本次 Run 冻结记录且不可由模型修改的版本化 Run Budget。 */
   readonly runBudget: unknown;
+  /** 取消尚未形成完整 Research Plan 的 provider stream。 */
+  readonly abortSignal?: AbortSignal | undefined;
 }
 
 /** 通过 identity 读取当前 Run Projection 的应用命令。 */
@@ -226,6 +228,8 @@ export interface ProposeLearningArtifactCommand {
   readonly runId: string;
   /** 必须为 Output Root 内的绝对 Markdown 路径；Runtime 会捕获 root 与 parent identity。 */
   readonly targetPath: string;
+  /** 取消尚未形成完整 Learning Artifact proposal 的 provider stream。 */
+  readonly abortSignal?: AbortSignal | undefined;
 }
 
 /** 用用户可见 publication binding 批准 exact draft 和 target 的应用命令。 */
@@ -486,6 +490,9 @@ const createRunCommandSchema = z.object({
   question: z.string().trim().min(1),
   sourceScope: z.unknown(),
   runBudget: z.unknown(),
+  abortSignal: z.custom<AbortSignal>(
+    (value) => value === undefined || isAbortSignal(value),
+  ).optional(),
 });
 
 const runIdentityCommandSchema = z.object({
@@ -533,6 +540,9 @@ const proposeLearningArtifactCommandSchema = z
   .object({
     runId: z.string().trim().min(1),
     targetPath: z.string().trim().min(1),
+    abortSignal: z.custom<AbortSignal>(
+      (value) => value === undefined || isAbortSignal(value),
+    ).optional(),
   })
   .strict();
 
@@ -784,7 +794,7 @@ export class ResearchAgentRuntime {
         runId,
         question: parsed.question,
         sourceScope,
-      }),
+      }, { abortSignal: parsed.abortSignal }),
     );
     const proposedAt = this.#clock.now();
     const artifact = await this.#artifacts.putJson(
@@ -1059,7 +1069,18 @@ export class ResearchAgentRuntime {
           await this.#model.generateResearchTurn(view, { abortSignal }),
         );
       } catch (error) {
-        if (error instanceof ModelGenerationAbortedError) throw error;
+        if (error instanceof ModelGenerationAbortedError) {
+          // Retry Attempt 已在外部 I/O 前成为 durable fact；明确取消必须同样以
+          // completed outcome 闭合，但 #9 才决定是否把整个 Run 终止或暂停。
+          this.#commitAbortedAttempt(
+            started.projection,
+            this.#completeFailedAttempt(
+              started.attempt,
+              this.#normalizeModelFailure(error),
+            ),
+          );
+          throw error;
+        }
         this.#commitFailedAttempt(
           started.projection,
           this.#completeFailedAttempt(
@@ -1828,6 +1849,31 @@ export class ResearchAgentRuntime {
     );
   }
 
+  #commitAbortedAttempt(
+    current: RunProjection,
+    attempt: CompletedRetryAttempt,
+  ): RunProjection {
+    if (
+      attempt.outcome !== "permanent_failure" ||
+      attempt.failure?.category !== "model_permanent" ||
+      attempt.failure.code !== "model_generation_aborted"
+    ) {
+      throw new ResearchLoopError();
+    }
+    return this.#store.appendEvents(
+      current.runId,
+      current.lastEventSequence,
+      [{
+        eventId: this.#ids.nextEventId(),
+        runId: current.runId,
+        sequence: current.lastEventSequence + 1,
+        type: "retry_attempt_failed",
+        occurredAt: attempt.completedAt,
+        payload: { attempt },
+      }],
+    );
+  }
+
   #normalizeModelFailure(error: unknown): NormalizedFailure {
     if (error instanceof InfrastructureFailureError) {
       return this.#normalizeInfrastructureFailure(error);
@@ -2348,7 +2394,7 @@ export class ResearchAgentRuntime {
     if (!parsedCommand.success) {
       throw new InvalidLearningArtifactCommandError();
     }
-    const { runId, targetPath } = parsedCommand.data;
+    const { runId, targetPath, abortSignal } = parsedCommand.data;
     let current: RunProjection;
     try {
       current = this.#store.readProjection(runId);
@@ -2404,7 +2450,7 @@ export class ResearchAgentRuntime {
           question: current.question,
           claims: researching.claims,
           evidenceRecords: researching.evidenceRecords,
-        }),
+        }, { abortSignal }),
       );
       proposedAt = this.#clock.now();
       assertEvidenceGateBudget({
@@ -2429,6 +2475,7 @@ export class ResearchAgentRuntime {
       );
       markdown = renderLearningArtifact(proposal, gate);
     } catch (error) {
+      if (error instanceof ModelGenerationAbortedError) throw error;
       if (error instanceof EvidenceGateError) {
         throw new EvidenceGateBlockedError();
       }

@@ -139,6 +139,8 @@ export interface OpenAiCompatibleModelDependencies {
   readonly streamText: (
     options: AiSdkStreamTextOptions,
   ) => AiSdkStreamTextResult;
+  /** 解析 HTTP-date `Retry-After` 时使用的可注入 Unix epoch 毫秒时钟。 */
+  readonly nowMs?: (() => number) | undefined;
 }
 
 /** provider 配置缺失或无效时抛出的 payload-safe 错误。 */
@@ -378,7 +380,11 @@ export class OpenAiCompatibleModelPort implements ModelPort {
         }
       }
     } catch (error) {
-      throw normalizeProviderError(error, options.abortSignal);
+      throw normalizeProviderError(
+        error,
+        options.abortSignal,
+        this.#dependencies.nowMs ?? Date.now,
+      );
     }
     // 只有观察到 SDK 的 terminal finish event 后才返回；此前所有 delta 只存在
     // 于本地临时变量，网络中断、取消或解析失败都不可能伪装成 canonical turn。
@@ -455,6 +461,7 @@ const productionDependencies: OpenAiCompatibleModelDependencies = {
     });
     return { stream: result.stream as AsyncIterable<AiSdkStreamPart> };
   },
+  nowMs: Date.now,
 };
 
 function parseConfig(config: OpenAiCompatibleModelConfig): OpenAiCompatibleModelConfig {
@@ -524,6 +531,7 @@ function normalizeUsage(usage: AiSdkUsage | undefined): ModelUsage {
 function normalizeProviderError(
   error: unknown,
   abortSignal: AbortSignal | undefined,
+  nowMs: () => number,
 ): Error {
   if (
     error instanceof ModelGenerationAbortedError ||
@@ -535,7 +543,7 @@ function normalizeProviderError(
   }
   const providerError = RetryError.isInstance(error) ? error.lastError : error;
   if (APICallError.isInstance(providerError)) {
-    const retryAfterMs = parseRetryAfterMs(providerError.responseHeaders);
+    const retryAfterMs = parseRetryAfterMs(providerError.responseHeaders, nowMs);
     if (providerError.statusCode === 429) {
       return new InfrastructureFailureError("rate_limited", { retryAfterMs });
     }
@@ -558,6 +566,7 @@ function normalizeProviderError(
 
 function parseRetryAfterMs(
   headers: Record<string, string> | undefined,
+  nowMs: () => number,
 ): number | undefined {
   const value = headers?.["retry-after"] ?? headers?.["Retry-After"];
   if (value === undefined) return undefined;
@@ -565,7 +574,7 @@ function parseRetryAfterMs(
   if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return undefined;
-  return Math.max(0, timestamp - Date.now());
+  return Math.max(0, timestamp - nowMs());
 }
 
 function isAbortError(error: unknown): boolean {

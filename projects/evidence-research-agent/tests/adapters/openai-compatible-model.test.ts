@@ -156,6 +156,34 @@ describe("OpenAI-compatible Model Port contract", () => {
     },
   );
 
+  it("normalizes an HTTP-date Retry-After with an injected deterministic clock", async () => {
+    const nowMs = Date.parse("2026-08-12T10:00:00.000Z");
+    const model = new OpenAiCompatibleModelPort(
+      liveConfig("contract-secret"),
+      {
+        streamText: () => {
+          throw new APICallError({
+            message: "rate limited",
+            url: "https://provider.invalid/v1",
+            requestBodyValues: {},
+            statusCode: 429,
+            responseHeaders: {
+              "retry-after": "Wed, 12 Aug 2026 10:00:05 GMT",
+            },
+            responseBody: "{}",
+            isRetryable: true,
+          });
+        },
+        nowMs: () => nowMs,
+      },
+    );
+
+    await expect(model.generateResearchTurn(modelView())).rejects.toMatchObject({
+      code: "rate_limited",
+      retryAfterMs: 5_000,
+    });
+  });
+
   it("cancels a partial stream without returning a completed result", async () => {
     const controller = new AbortController();
     const model = contractModel((options) => ({
