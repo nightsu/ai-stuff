@@ -161,7 +161,7 @@ export class OpenAiCompatibleModelResponseError extends Error {
 
 const DEFAULT_ADAPTER_VERSION = "openai-compatible-adapter-v1";
 const DEFAULT_PROMPT_VERSION = "evidence-research-prompts-v1";
-const DEFAULT_TOOL_SCHEMA_VERSION = "research-tools-v1";
+const DEFAULT_TOOL_SCHEMA_VERSION = "research-tools-v2";
 const evidenceGapsSchema = z.array(z.string().trim().min(1)).default([]);
 const researchToolSchemas = {
   search_sources: z.object({
@@ -181,11 +181,15 @@ const researchToolSchemas = {
     evidenceGaps: evidenceGapsSchema,
   }).strict(),
   propose_claim: z.object({
-    kind: z.literal("source_fact"),
+    kind: z.enum(["source_fact", "inference", "design_recommendation"]),
     text: z.string().trim().min(1),
-    evidenceIds: z.array(z.string().trim().min(1)).min(1),
+    evidenceIds: z.array(z.string().trim().min(1)),
     evidenceGaps: evidenceGapsSchema,
-  }).strict(),
+  }).strict().refine(
+    (input) =>
+      input.kind === "design_recommendation" || input.evidenceIds.length > 0,
+    "source fact 与 inference 必须引用 Evidence",
+  ),
   complete_research: z.object({
     unresolvedQuestions: z.array(z.string().trim().min(1)),
     evidenceGaps: evidenceGapsSchema,

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +11,7 @@ import {
   ResearchAgentRuntime,
   ResearchLoopError,
   ScriptedModel,
+  formatRunTrace,
 } from "../../src/index.js";
 import type {
   Clock,
@@ -37,6 +38,214 @@ afterEach(async () => {
 });
 
 describe("ResearchAgentRuntime bounded Research Loop", () => {
+  it("returns a failed Evidence Gate to the Research Loop with a durable actionable repair observation", async () => {
+    let now = "2026-08-12T08:00:00.000Z";
+    const fixture = await createApprovedLoopRun(
+      [
+        turn("read", "read_source", {
+          rootIndex: 0,
+          relativePath: "journal.md",
+          startLine: 1,
+          endLine: 1,
+        }),
+        turn("evidence", "record_evidence", {
+          observationId: "observation-001",
+        }),
+        turn("claim", "propose_claim", {
+          kind: "source_fact",
+          text: "Run Journal 是 canonical history。",
+          evidenceIds: ["evidence-event-008"],
+        }),
+        turn("complete", "complete_research", { unresolvedQuestions: [] }),
+        turn("repair-complete", "complete_research", {
+          unresolvedQuestions: [],
+        }),
+      ],
+      {},
+      {
+        clock: { now: () => now },
+        learningArtifactProposals: [{
+          title: "伪造选择",
+          summary: "Gate 必须要求选择 durable Claim。",
+          claimIds: ["claim-not-durable"],
+        }],
+      },
+    );
+
+    try {
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "research_complete" } });
+      now = "2026-08-12T10:00:00.000Z";
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputRoot, "repair.md"),
+        }),
+      ).rejects.toThrow(/Evidence/);
+
+      const repairing = await fixture.runtime.inspectRun({ runId: fixture.runId });
+      expect(repairing.state).toMatchObject({
+        type: "researching",
+        suspendedDurationMs: 7_200_000,
+        evidenceGateRepairs: [{
+          code: "unknown_claim_id",
+          recommendedAction: "重新选择当前 Run 已登记的 Claim identity",
+        }],
+      });
+      const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+      expect(trace.events.at(-1)).toMatchObject({
+        type: "evidence_gate_repair_requested",
+        evidenceGateRepairCode: "unknown_claim_id",
+      });
+      expect(formatRunTrace(trace, "human")).toContain(
+        "evidence-gate-repair=unknown_claim_id",
+      );
+
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "research_complete" } });
+      expect(fixture.model.researchViews.at(-1)?.evidenceGateRepairs).toEqual([
+        expect.objectContaining({
+          code: "unknown_claim_id",
+          recommendedAction: "重新选择当前 Run 已登记的 Claim identity",
+        }),
+      ]);
+      expect(fixture.model.researchViews.at(-1)?.remainingBudget.modelTurns)
+        .toBe(2);
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("returns an invalid approved Source Root identity to the Research Loop before draft generation", async () => {
+    const fixture = await createApprovedLoopRun(
+      [
+        turn("read", "read_source", {
+          rootIndex: 0,
+          relativePath: "journal.md",
+          startLine: 1,
+          endLine: 1,
+        }),
+        turn("evidence", "record_evidence", {
+          observationId: "observation-001",
+        }),
+        turn("claim", "propose_claim", {
+          kind: "source_fact",
+          text: "Run Journal 是 canonical history。",
+          evidenceIds: ["evidence-event-008"],
+        }),
+        turn("complete", "complete_research", { unresolvedQuestions: [] }),
+      ],
+      {},
+      {
+        learningArtifactProposals: [{
+          title: "失效审批",
+          summary: "Source Scope identity 必须保持精确。",
+          claimIds: ["claim-event-010"],
+        }],
+      },
+    );
+    const approvedRoot = `${fixture.sourceRoot}-approved`;
+
+    try {
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "research_complete" } });
+      await rename(fixture.sourceRoot, approvedRoot);
+      await mkdir(fixture.sourceRoot);
+      await writeFile(
+        join(fixture.sourceRoot, "journal.md"),
+        "替代目录不能继承原审批。\n",
+        "utf8",
+      );
+
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputRoot, "approval-invalid.md"),
+        }),
+      ).rejects.toThrow(/Evidence/);
+      expect(fixture.model.learningArtifactRequests).toHaveLength(0);
+      await expect(
+        fixture.runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "researching",
+          evidenceGateRepairs: [{
+            code: "approval_invalid",
+            artifactProposalTurnConsumed: false,
+            recommendedAction:
+              "创建新的 Research Run，并批准新的 Source Scope 与计划版本",
+          }],
+        },
+      });
+    } finally {
+      fixture.runtime.close();
+      await rm(approvedRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("durably charges a completed Artifact proposal generation whose schema is invalid", async () => {
+    const fixture = await createApprovedLoopRun([
+      turn("read", "read_source", {
+        rootIndex: 0,
+        relativePath: "journal.md",
+        startLine: 1,
+        endLine: 1,
+      }),
+      turn("evidence", "record_evidence", {
+        observationId: "observation-001",
+      }),
+      turn("claim", "propose_claim", {
+        kind: "source_fact",
+        text: "Run Journal 是 canonical history。",
+        evidenceIds: ["evidence-event-008"],
+      }),
+      turn("complete", "complete_research", { unresolvedQuestions: [] }),
+    ]);
+    await fixture.runtime.advanceResearch({ runId: fixture.runId });
+    fixture.runtime.close();
+    let proposalCalls = 0;
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputRoot,
+      ids: sequentialIds(100),
+      model: {
+        proposePlan: async () => {
+          throw new Error("测试不应重新生成计划");
+        },
+        proposeLearningArtifact: async () => {
+          proposalCalls += 1;
+          return { title: "缺少 summary 与 claimIds" } as never;
+        },
+      },
+    });
+
+    try {
+      await expect(
+        restarted.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputRoot, "invalid-proposal.md"),
+        }),
+      ).rejects.toThrow(/Evidence/);
+      expect(proposalCalls).toBe(1);
+      await expect(
+        restarted.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "researching",
+          evidenceGateRepairs: [{
+            code: "proposal_invalid",
+            artifactProposalTurnConsumed: true,
+          }],
+        },
+      });
+    } finally {
+      restarted.close();
+    }
+  });
+
   it("runs sibling safe searches concurrently while restoring model intent order", async () => {
     const firstStarted = deferred<void>();
     const releaseFirst = deferred<void>();

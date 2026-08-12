@@ -15,6 +15,7 @@ import type {
   ArtifactReference,
   PersistedArtifact,
   PersistedSourceSnapshot,
+  SourceSnapshotReference,
 } from "../domain/types.js";
 
 export class ArtifactIntegrityError extends Error {
@@ -185,6 +186,45 @@ export class ContentAddressedArtifactStore {
         throw error;
       }
       throw new ArtifactIntegrityError();
+    }
+  }
+
+  /**
+   * 从 Journal/registry 已验证引用读取完整 Source Snapshot bytes。调用方只能按
+   * content identity 取回对象，不能提供任意 Runtime Home 相对路径。
+   */
+  public async readSourceSnapshot(
+    reference: SourceSnapshotReference,
+  ): Promise<Buffer> {
+    if (
+      reference.snapshotId !== `source-sha256:${reference.sha256}` ||
+      reference.mediaType !== "text/plain; charset=utf-8" ||
+      reference.relativePath !==
+        `source-snapshots/sha256/${reference.sha256.slice(0, 2)}/${reference.sha256}`
+    ) {
+      throw new ArtifactIntegrityError();
+    }
+    const absolutePath = join(this.#runtimeHome, reference.relativePath);
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(
+        absolutePath,
+        constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+      );
+      const metadata = await handle.stat({ bigint: true });
+      if (!metadata.isFile() || metadata.size !== BigInt(reference.byteLength)) {
+        throw new ArtifactIntegrityError();
+      }
+      const bytes = await handle.readFile();
+      if (hashBytes(bytes) !== reference.sha256) {
+        throw new ArtifactIntegrityError();
+      }
+      return bytes;
+    } catch (error) {
+      if (error instanceof ArtifactIntegrityError) throw error;
+      throw new ArtifactIntegrityError();
+    } finally {
+      await handle?.close().catch(() => undefined);
     }
   }
 }

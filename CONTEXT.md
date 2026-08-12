@@ -116,6 +116,10 @@ _Avoid_: Citation text, source file, Claim
 The deterministic publication gate that validates source scope, hashes, exact ranges, tool-call lineage, Claim classification, references, authorization, and budget compliance. A failed Evidence Gate cannot be overridden by an evaluator model.
 _Avoid_: Evaluator Review, LLM judge, user approval
 
+**Evidence Gate Repair**:
+A durable, typed feedback fact appended to the Run Journal when a completed Research Run cannot pass the Evidence Gate. It carries a stable code and deterministic repair action, returns the Run to the Research Loop when that loop exists, and records whether a completed Artifact proposal Model generation consumed budget. It is Gate feedback, not a Research Tool Observation, tool call, or terminal runtime failure.
+_Avoid_: Research Tool Observation, evaluator feedback, retry attempt, runtime error
+
 **Claim**:
 An atomic statement intended for a Learning Artifact and classified as a source fact, inference, or design recommendation. A Claim must satisfy the evidence rules for its classification before publication.
 _Avoid_: Evidence, paragraph, model assertion

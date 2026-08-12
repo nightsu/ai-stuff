@@ -10,7 +10,9 @@ import {
   hashCanonicalJson,
 } from "../domain/integrity.js";
 import {
+  assertEvidenceGateLineage,
   assertEvidenceGateBudget,
+  createEvidenceGateRepair,
   EvidenceGateError,
   evaluateEvidenceGate,
 } from "../domain/evidence-gate.js";
@@ -242,15 +244,15 @@ export interface RecordEvidenceCommand {
   readonly observationId: string;
 }
 
-/** 提交一个只能引用既有 Evidence Record 的最小 Claim 的应用命令。 */
+/** 提交一个显式分类、且只能引用既有 Evidence Record 的原子 Claim。 */
 export interface RecordClaimCommand {
   /** 当前必须仍处于 researching 的 Research Run identity。 */
   readonly runId: string;
-  /** 当前 slice 明确只接纳直接由来源 Evidence 支持的 source fact。 */
-  readonly kind: "source_fact";
+  /** source fact、inference 与 design recommendation 各自触发独立 Gate 规则。 */
+  readonly kind: Claim["kind"];
   /** 不包含预渲染 citation 的简短、非空 Claim 文本。 */
   readonly text: string;
-  /** 至少一个既有 Evidence identity，顺序是未来渲染的显式引用顺序。 */
+  /** source fact/inference 至少一个；recommendation 可为空；非空值都必须已存在。 */
   readonly evidenceIds: readonly string[];
 }
 
@@ -599,7 +601,7 @@ const recordEvidenceCommandSchema = z
 const recordClaimCommandSchema = z
   .object({
     runId: z.string().trim().min(1),
-    kind: z.literal("source_fact"),
+    kind: z.enum(["source_fact", "inference", "design_recommendation"]),
     text: z
       .string()
       .trim()
@@ -608,9 +610,15 @@ const recordClaimCommandSchema = z
         (text) => !hasPreRenderedCitationToken(text),
         "Claim 不能包含预渲染 citation",
       ),
-    evidenceIds: z.array(z.string().trim().min(1)).min(1),
+    evidenceIds: z.array(z.string().trim().min(1)),
   })
-  .strict();
+  .strict()
+  .refine(
+    (command) =>
+      command.kind === "design_recommendation" ||
+      command.evidenceIds.length > 0,
+    "source fact 与 inference 必须引用 Evidence",
+  );
 
 const proposeLearningArtifactCommandSchema = z
   .object({
@@ -695,11 +703,16 @@ const recordEvidenceInputSchema = z
 
 const proposeClaimInputSchema = z
   .object({
-    kind: z.literal("source_fact"),
+    kind: z.enum(["source_fact", "inference", "design_recommendation"]),
     text: z.string().trim().min(1),
-    evidenceIds: z.array(z.string().trim().min(1)).min(1),
+    evidenceIds: z.array(z.string().trim().min(1)),
   })
-  .strict();
+  .strict()
+  .refine(
+    (input) =>
+      input.kind === "design_recommendation" || input.evidenceIds.length > 0,
+    "source fact 与 inference 必须引用 Evidence",
+  );
 
 const completeResearchInputSchema = z
   .object({ unresolvedQuestions: z.array(z.string().trim().min(1)) })
@@ -1466,6 +1479,7 @@ export class ResearchAgentRuntime {
       fixedRules: [
         "只能使用五个 Research Tools，不能请求 shell、publication 或预算变更。",
         "Evidence 和 Claim identities 只能来自 Harness observations。",
+        "source_fact 与 inference 必须引用 Evidence；design_recommendation 可不引用，但必须保持显式分类。",
         "完成研究必须显式调用 complete_research 并保留未解决问题。",
       ],
       approvedPlan,
@@ -1473,6 +1487,7 @@ export class ResearchAgentRuntime {
       budgetVersion: current.runBudget.version,
       remainingBudget,
       evidenceGaps: current.state.evidenceGaps,
+      evidenceGateRepairs: current.state.evidenceGateRepairs,
       pendingIntents: current.state.pendingToolIntents,
       relevantEvidence,
       recentObservations,
@@ -3523,24 +3538,39 @@ export class ResearchAgentRuntime {
       // deterministic outer workflow 必须看到 complete_research 的 durable fact。
       throw new IllegalLearningArtifactStateError();
     }
-    if (
-      researching.claims.length === 0 ||
-      researching.evidenceRecords.length === 0
-    ) {
+    if (!(await Promise.all(
+      current.sourceScope.roots.map((root) => sourceRootIdentityStillMatches(root)),
+    )).every(Boolean)) {
+      // Plan Approval 精确绑定 canonical path + device/inode。目录被替换后，即使
+      // immutable Snapshot 仍可验证，当前 Run 也不能把旧审批扩张到新 Source Root；
+      // 该权限边界只能由用户在新的 Research Run 中重新批准，模型不会被调用。
+      // legacy 显式路径没有下一轮模型，因此只 fail closed；Research Loop 路径
+      // 额外持久化 repair observation，让模型明确知道旧 Run 不可继续授权。
+      this.#appendEvidenceGateRepair(current, "approval_invalid", false);
+      throw new EvidenceGateBlockedError();
+    }
+    if (researching.claims.length === 0) {
       // 先执行 cheap durable gate，保证没有来源事实时既不调用模型，也不创建私有
       // draft artifact；这使“没有 Evidence 就不能 publish”成为可观察不变量。
+      this.#appendEvidenceGateRepair(
+        current,
+        "invalid_claim_selection",
+        false,
+      );
       throw new EvidenceGateBlockedError();
     }
     if (current.runBudget.maxModelTurns < 2) {
       // 当前 one-shot slice 已经用 `proposePlan` 消耗一 turn；没有第二 turn 时
       // 不允许调用 Artifact proposal ModelPort，以免先产生未授权模型副作用。
+      this.#appendEvidenceGateRepair(current, "budget_violation", false);
       throw new EvidenceGateBlockedError();
     }
     if (
-      current.runBudget.maxModelTurns - 1 - researching.modelTurns.length <= 0
+      this.#remainingBudget(current, this.#clock.now()).modelTurns === 0
     ) {
       // Artifact proposal 也是 Model Port generation。预算必须在调用前预留，不能
       // 先制造模型副作用，再由 Gate 在返回后发现已经超限。
+      this.#appendEvidenceGateRepair(current, "budget_violation", false);
       throw new EvidenceGateBlockedError();
     }
 
@@ -3558,7 +3588,12 @@ export class ResearchAgentRuntime {
       );
       proposedAt = this.#clock.now();
       assertEvidenceGateBudget({
-        modelTurnsUsed: 2 + researching.modelTurns.length,
+        modelTurnsUsed:
+          2 +
+          researching.modelTurns.length +
+          researching.evidenceGateRepairs.filter(
+            (repair) => repair.artifactProposalTurnConsumed,
+          ).length,
         toolCallsUsed: countLogicalToolCalls(
           researching.sourceReadObservations,
           researching.researchToolObservations,
@@ -3577,10 +3612,24 @@ export class ResearchAgentRuntime {
         researching.claims,
         researching.evidenceRecords,
       );
+      await assertEvidenceGateLineage(gate, {
+        sourceScope: current.sourceScope,
+        sourceReadObservations: researching.sourceReadObservations,
+        readSourceSnapshot: (reference) =>
+          this.#artifacts.readSourceSnapshot(reference),
+      });
       markdown = renderLearningArtifact(proposal, gate);
     } catch (error) {
       if (error instanceof ModelGenerationAbortedError) throw error;
       if (error instanceof EvidenceGateError) {
+        this.#appendEvidenceGateRepair(current, error.code, true);
+        throw new EvidenceGateBlockedError();
+      }
+      if (error instanceof z.ZodError) {
+        // Model Port 已返回 completed result 后，proposal schema 失败也是真实的模型
+        // 消耗。必须先把这次 turn 作为 repair 事实计账，再让 Research Loop 修复；
+        // 否则调用方可无限重采样无效提案而绕过 canonical Run Budget。
+        this.#appendEvidenceGateRepair(current, "proposal_invalid", true);
         throw new EvidenceGateBlockedError();
       }
       // Model adapter、Zod 与 renderer 的诊断可能回显 scripts 或 provider payload；
@@ -3635,6 +3684,42 @@ export class ResearchAgentRuntime {
         throw new LearningArtifactDraftConflictError();
       }
       throw new LearningArtifactDraftError();
+    }
+  }
+
+  /**
+   * 只有 completed Research Loop 才能回到 repair：legacy 显式路径没有下一轮模型，
+   * 因而保持原状态并只返回 blocked error，避免凭空制造一个无法消费的反馈循环。
+   */
+  #appendEvidenceGateRepair(
+    current: RunProjection,
+    code: import("../domain/types.js").EvidenceGateRepairCode,
+    artifactProposalTurnConsumed: boolean,
+  ): void {
+    if (current.state.type !== "research_complete") return;
+    const occurredAt = this.#clock.now();
+    const eventId = this.#ids.nextEventId();
+    const event: ResearchRunEvent = {
+      eventId,
+      runId: current.runId,
+      sequence: current.lastEventSequence + 1,
+      type: "evidence_gate_repair_requested",
+      occurredAt,
+      payload: {
+        repair: createEvidenceGateRepair({
+          eventId,
+          code,
+          artifactProposalTurnConsumed,
+          requestedAt: occurredAt,
+        }),
+      },
+    };
+    try {
+      this.#appendEvents(current.runId, current.lastEventSequence, [event]);
+    } catch {
+      // Gate 已经失败，repair append 冲突不能被误报为不同领域结果；调用方通过
+      // inspect 读取赢得并发的 canonical 状态，再决定是否重试 proposal。
+      throw new LearningArtifactDraftConflictError();
     }
   }
 
@@ -3771,14 +3856,21 @@ export class ResearchAgentRuntime {
     const ready = current.state;
     let markdown: string;
     try {
-      markdown = renderLearningArtifact(
+      const gate = evaluateEvidenceGate(
         ready.proposal,
-        evaluateEvidenceGate(
-          ready.proposal,
-          ready.claims,
-          ready.evidenceRecords,
-        ),
+        ready.claims,
+        ready.evidenceRecords,
       );
+      // Publication approval 只授权 exact draft，不会冻结私有 CAS 的可读性。
+      // 因此真正写出前必须重新从 immutable Snapshot bytes 验证完整 lineage，
+      // 避免 draft/approval 之后的删除或篡改绕过 deterministic Evidence Gate。
+      await assertEvidenceGateLineage(gate, {
+        sourceScope: current.sourceScope,
+        sourceReadObservations: ready.sourceReadObservations,
+        readSourceSnapshot: (reference) =>
+          this.#artifacts.readSourceSnapshot(reference),
+      });
+      markdown = renderLearningArtifact(ready.proposal, gate);
       if (
         hashUtf8Text(markdown) !== ready.draftArtifact.sha256 ||
         Buffer.byteLength(markdown, "utf8") !== ready.draftArtifact.byteLength

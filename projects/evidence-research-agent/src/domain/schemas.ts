@@ -9,6 +9,7 @@ import {
 import { hasPreRenderedCitationToken } from "./citation-safety.js";
 import type {
   Claim,
+  EvidenceGateRepair,
   EvidenceRecord,
   ExperimentIdentity,
   LearningArtifactProposal,
@@ -253,7 +254,7 @@ const evidenceRecordSchema = z
 const claimSchema = z
   .object({
     claimId: z.string().trim().min(1),
-    kind: z.literal("source_fact"),
+    kind: z.enum(["source_fact", "inference", "design_recommendation"]),
     text: z
       .string()
       .trim()
@@ -262,10 +263,15 @@ const claimSchema = z
         (text) => !hasPreRenderedCitationToken(text),
         "Claim 不能包含预渲染 citation",
       ),
-    evidenceIds: z.array(z.string().trim().min(1)).min(1),
+    evidenceIds: z.array(z.string().trim().min(1)),
     recordedAt: z.iso.datetime(),
   })
   .strict()
+  .refine(
+    (claim) =>
+      claim.kind === "design_recommendation" || claim.evidenceIds.length > 0,
+    "source fact 与 inference 必须引用 Evidence",
+  )
   .transform((claim): Claim => claim);
 
 const learningArtifactProposalSchema = z
@@ -554,6 +560,28 @@ const remainingRunBudgetSchema = z.object({
   wallTimeMs: z.number().int().nonnegative(),
 }).strict();
 
+const evidenceGateRepairSchema = z.object({
+  repairId: z.string().trim().min(1),
+  code: z.enum([
+    "invalid_claim_selection",
+    "unknown_claim_id",
+    "claim_evidence_required",
+    "unknown_evidence_id",
+    "invalid_evidence_kind",
+    "lineage_mismatch",
+    "snapshot_integrity_failure",
+    "snapshot_range_invalid",
+    "excerpt_mismatch",
+    "approval_invalid",
+    "proposal_invalid",
+    "budget_violation",
+  ]),
+  summary: z.string().trim().min(1),
+  recommendedAction: z.string().trim().min(1),
+  artifactProposalTurnConsumed: z.boolean(),
+  requestedAt: z.iso.datetime(),
+}).strict().transform((repair): EvidenceGateRepair => repair);
+
 const evidenceBackedStateFields = {
   planArtifact: artifactReferenceSchema,
   approvalReceipt: planApprovalReceiptSchema,
@@ -564,6 +592,7 @@ const evidenceBackedStateFields = {
   modelTurns: z.array(modelTurnSchema),
   researchToolObservations: z.array(researchToolObservationSchema),
   evidenceGaps: z.array(z.string().trim().min(1)),
+  evidenceGateRepairs: z.array(evidenceGateRepairSchema).default([]),
   pendingToolIntents: z.array(researchToolIntentSchema),
   latestSteering: z.string().trim().min(1).optional(),
   researchStartedAt: z.iso.datetime().optional(),
@@ -595,6 +624,7 @@ const legacyExplicitPublicationFields = {
   modelTurns: z.tuple([]),
   researchToolObservations: z.tuple([]),
   evidenceGaps: z.tuple([]),
+  evidenceGateRepairs: z.array(evidenceGateRepairSchema).default([]),
   pendingToolIntents: z.tuple([]),
   suspendedDurationMs: z.number().int().nonnegative().default(0),
   retryAttempts: z.array(retryAttemptSchema),
@@ -609,6 +639,7 @@ const researchLoopPublicationFields = {
     researchToolObservationSchema,
   ),
   evidenceGaps: z.array(z.string().trim().min(1)),
+  evidenceGateRepairs: z.array(evidenceGateRepairSchema).default([]),
   pendingToolIntents: z.tuple([]),
   latestSteering: z.string().trim().min(1).optional(),
   researchStartedAt: z.iso.datetime(),
@@ -937,6 +968,13 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
         completedAt: z.iso.datetime(),
       }).strict(),
       observation: researchToolObservationSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("evidence_gate_repair_requested"),
+    payload: z.object({
+      repair: evidenceGateRepairSchema,
     }).strict(),
   }).strict(),
   z.object({

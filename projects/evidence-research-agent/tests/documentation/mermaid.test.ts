@@ -54,6 +54,9 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   expect(markdown).toContain("Journal --> Trace");
   expect(markdown).toContain("CompleteResearch --> Journal");
   expect(markdown).toContain("ResearchComplete --> Gate");
+  expect(markdown).toContain('Snapshot -->|"verified bytes / range / excerpt"| Gate');
+  expect(markdown).toContain('Gate -->|"evidence_gate_repair_requested"| Journal');
+  expect(markdown).toContain("Repair --> View");
   expect(markdown).toContain("Gate --> Draft");
   expect(markdown).toContain("Draft --> Approval");
   expect(markdown).toContain("Approval --> Publisher");
@@ -71,6 +74,9 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   );
   expect(stateDiagram).toMatch(
     /^\s*researching\s*-->\s*budget_exhausted\s*:\s*run_budget_exhausted\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*research_complete\s*-->\s*researching\s*:\s*evidence_gate_repair_requested\s*$/m,
   );
   expect(stateDiagram).toMatch(
     /^\s*research_complete\s*-->\s*waiting_publication_approval\s*:\s*learning_artifact_draft_proposed\s*$/m,

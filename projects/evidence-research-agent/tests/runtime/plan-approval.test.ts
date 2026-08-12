@@ -482,6 +482,7 @@ describe("plan_approved schema and reducer boundary", () => {
       modelTurns: [],
       researchToolObservations: [],
       evidenceGaps: [],
+      evidenceGateRepairs: [],
       pendingToolIntents: [],
       suspendedDurationMs: 0,
       retryAttempts: [],

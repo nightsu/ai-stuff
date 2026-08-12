@@ -437,6 +437,8 @@ export interface ModelView {
   readonly remainingBudget: RemainingRunBudget;
   /** 上一完整 Model Turn 声明、仍需模型处理的 evidence gaps。 */
   readonly evidenceGaps: readonly string[];
+  /** 最近的 durable Evidence Gate 问题与 Harness 建议的确定性修复动作。 */
+  readonly evidenceGateRepairs: readonly EvidenceGateRepair[];
   /** 尚未获得 observation 的 durable tool intents；恢复时必须优先处理。 */
   readonly pendingIntents: readonly ResearchToolIntent[];
   /** 与当前 Claims/gaps 相关、且带精确摘录的有界 Evidence 视图。 */
@@ -521,6 +523,8 @@ export interface EvidenceBackedRunStateData {
   readonly researchToolObservations: readonly ResearchToolObservation[];
   /** 最近一个 Model Turn 声明的未决 evidence gaps。 */
   readonly evidenceGaps: readonly string[];
+  /** 按 Journal 顺序保留、等待 Research Loop 修复的 Evidence Gate 反馈。 */
+  readonly evidenceGateRepairs: readonly EvidenceGateRepair[];
   /** 已 durable 提交但尚未得到 observation 的有序 tool intents。 */
   readonly pendingToolIntents: readonly ResearchToolIntent[];
   /** 最近一次进入 Model View 的非空用户 steering。 */
@@ -910,15 +914,18 @@ export interface EvidenceRecord {
   readonly recordedAt: string;
 }
 
-/** 一个只能通过已有 Evidence Record 证明的最小可发布主张。 */
+/** Learning Artifact 中一个原子且显式分类的可发布主张。 */
 export interface Claim {
   /** 由 Runtime 从本次 Journal event identity 派生的稳定 Claim identity。 */
   readonly claimId: string;
-  /** 当前最小切片显式只允许原始来源事实，后续分类须各自拥有独立 Gate 规则。 */
-  readonly kind: "source_fact";
+  /** 决定 Evidence Gate 与 renderer 如何解释该主张，而不是可互换的显示标签。 */
+  readonly kind: "source_fact" | "inference" | "design_recommendation";
   /** 面向 Learning Artifact 的简短主张文本，不能包含渲染后的 citation 字符串。 */
   readonly text: string;
-  /** 去重且按调用方明确顺序保存的 Evidence identities。 */
+  /**
+   * 去重且按调用方明确顺序保存的 Evidence identities。source fact 与 inference
+   * 必须非空；design recommendation 可以为空，也可以声明影响该建议的来源。
+   */
   readonly evidenceIds: readonly string[];
   /** Claim 成为 Run Journal 事实的 ISO 8601 UTC 时间。 */
   readonly recordedAt: string;
@@ -938,6 +945,43 @@ export interface ClaimRecordedPayload {
   readonly claim: Claim;
   /** 来自 Research Loop 时，对 durable Claim intent 的成功 observation。 */
   readonly researchObservation?: ResearchToolObservation | undefined;
+}
+
+/** Evidence Gate 失败后可持久化并重新注入 Research Loop 的稳定问题代码。 */
+export type EvidenceGateRepairCode =
+  | "invalid_claim_selection"
+  | "unknown_claim_id"
+  | "claim_evidence_required"
+  | "unknown_evidence_id"
+  | "invalid_evidence_kind"
+  | "lineage_mismatch"
+  | "snapshot_integrity_failure"
+  | "snapshot_range_invalid"
+  | "excerpt_mismatch"
+  | "approval_invalid"
+  | "proposal_invalid"
+  | "budget_violation";
+
+/** 不消耗 Research Tool 预算、但会成为 Journal 事实的 Evidence Gate repair。 */
+export interface EvidenceGateRepair {
+  /** 由承载事件 identity 派生的稳定 repair identity。 */
+  readonly repairId: string;
+  /** Harness 分配的稳定失败分类，模型不能自由编写。 */
+  readonly code: EvidenceGateRepairCode;
+  /** 面向 Trace/Model View 的简短确定性问题说明。 */
+  readonly summary: string;
+  /** Harness 给 Research Loop 的具体下一步，而不是开放式错误字符串。 */
+  readonly recommendedAction: string;
+  /** 本次失败前是否已经完成一次 Artifact proposal Model generation。 */
+  readonly artifactProposalTurnConsumed: boolean;
+  /** repair 成为 Run Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly requestedAt: string;
+}
+
+/** `evidence_gate_repair_requested` 事件携带的完整确定性 repair 事实。 */
+export interface EvidenceGateRepairRequestedPayload {
+  /** reducer 必须按 event identity、code 与时间重新验证的 repair。 */
+  readonly repair: EvidenceGateRepair;
 }
 
 /** 模型只能选择既有 Claim、不能自造 citation identity 的有界 Markdown 提案。 */
@@ -1171,6 +1215,10 @@ export type ResearchRunEvent =
   | RunEvent<"evidence_recorded", EvidenceRecordedPayload>
   | RunEvent<"claim_recorded", ClaimRecordedPayload>
   | RunEvent<
+      "evidence_gate_repair_requested",
+      EvidenceGateRepairRequestedPayload
+    >
+  | RunEvent<
       "learning_artifact_draft_proposed",
       LearningArtifactDraftProposedPayload
     >
@@ -1291,6 +1339,12 @@ export interface RunTraceEvent {
   readonly evidenceId?: string;
   /** 仅 `claim_recorded` 暴露的结构化 Claim identity。 */
   readonly claimId?: string;
+  /** Claim 事件暴露的分类，供 artifact Claim label 直接 join Trace。 */
+  readonly claimKind?: Claim["kind"];
+  /** Claim 事件按原始顺序暴露的 Evidence identities。 */
+  readonly evidenceIds?: readonly string[];
+  /** Evidence Gate repair 事件暴露的稳定问题代码。 */
+  readonly evidenceGateRepairCode?: EvidenceGateRepairCode;
   /** 仅 draft proposal 事件暴露的私有 content-addressed Markdown artifact identity。 */
   readonly draftArtifactId?: string;
   /** 仅 publication approval 事件暴露的 durable receipt identity。 */

@@ -364,6 +364,7 @@ function modelView(): ModelView {
       wallTimeMs: 30_000,
     },
     evidenceGaps: [],
+    evidenceGateRepairs: [],
     pendingIntents: [],
     relevantEvidence: [],
     recentObservations: [],

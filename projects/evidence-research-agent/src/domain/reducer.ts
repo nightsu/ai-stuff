@@ -1,7 +1,9 @@
+import { isDeepStrictEqual } from "node:util";
 import { isAbsolute } from "node:path";
 
 import {
   assertEvidenceGateBudget,
+  createEvidenceGateRepair,
   EvidenceGateError,
   evaluateEvidenceGate,
 } from "./evidence-gate.js";
@@ -281,6 +283,7 @@ function applyRunEvent(
           modelTurns: [],
           researchToolObservations: [],
           evidenceGaps: [],
+          evidenceGateRepairs: [],
           pendingToolIntents: [],
           suspendedDurationMs: 0,
           retryAttempts: [],
@@ -722,6 +725,43 @@ function applyRunEvent(
         event,
       );
     }
+    case "evidence_gate_repair_requested": {
+      if (current.state.type !== "research_complete") {
+        throw new IllegalRunEventError(
+          "只有 research_complete Run 可以请求 Evidence Gate repair",
+        );
+      }
+      const expected = createEvidenceGateRepair({
+        eventId: event.eventId,
+        code: event.payload.repair.code,
+        artifactProposalTurnConsumed:
+          event.payload.repair.artifactProposalTurnConsumed,
+        requestedAt: event.occurredAt,
+      });
+      if (!isDeepStrictEqual(event.payload.repair, expected)) {
+        throw new IllegalRunEventError("Evidence Gate repair 公共字段无效");
+      }
+      const { completion: _completion, ...evidenceBacked } = current.state;
+      const gateWaitDurationMs = elapsedMilliseconds(
+        current.state.completion.completedAt,
+        event.occurredAt,
+      );
+      return {
+        ...current,
+        state: {
+          ...evidenceBacked,
+          type: "researching",
+          suspendedDurationMs:
+            evidenceBacked.suspendedDurationMs + gateWaitDurationMs,
+          evidenceGateRepairs: [
+            ...current.state.evidenceGateRepairs,
+            event.payload.repair,
+          ],
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
     case "run_budget_exhausted": {
       if (
         current.state.type !== "researching" &&
@@ -909,6 +949,7 @@ function applyRunEvent(
                     ...(typeof current.state.researchToolObservations)[number][],
                   ],
                 evidenceGaps: current.state.evidenceGaps,
+                evidenceGateRepairs: current.state.evidenceGateRepairs,
                 pendingToolIntents: [],
                 ...(current.state.latestSteering === undefined
                   ? {}
@@ -924,6 +965,7 @@ function applyRunEvent(
                 modelTurns: [],
                 researchToolObservations: [],
                 evidenceGaps: [],
+                evidenceGateRepairs: [],
                 pendingToolIntents: [],
                 proposedAt: event.occurredAt,
               },
@@ -1312,6 +1354,9 @@ function traceLineage(
   | "sourceSnapshotId"
   | "evidenceId"
   | "claimId"
+  | "claimKind"
+  | "evidenceIds"
+  | "evidenceGateRepairCode"
   | "draftArtifactId"
   | "publicationApprovalId"
   | "learningArtifactSha256"
@@ -1411,7 +1456,14 @@ function traceLineage(
     };
   }
   if (event.type === "claim_recorded") {
-    return { claimId: event.payload.claim.claimId };
+    return {
+      claimId: event.payload.claim.claimId,
+      claimKind: event.payload.claim.kind,
+      evidenceIds: event.payload.claim.evidenceIds,
+    };
+  }
+  if (event.type === "evidence_gate_repair_requested") {
+    return { evidenceGateRepairCode: event.payload.repair.code };
   }
   if (event.type === "learning_artifact_draft_proposed") {
     return { draftArtifactId: event.payload.draftArtifact.artifactId };
@@ -1822,12 +1874,15 @@ function validateClaim(
       "recordedAt",
     ]) ||
     claim.claimId.trim() === "" ||
-    claim.kind !== "source_fact" ||
+    !["source_fact", "inference", "design_recommendation"].includes(
+      claim.kind,
+    ) ||
     claim.text.trim() === "" ||
     hasPreRenderedCitationToken(claim.text) ||
     claim.recordedAt !== occurredAt ||
     !isIsoUtc(claim.recordedAt) ||
-    claim.evidenceIds.length === 0 ||
+    (claim.kind !== "design_recommendation" &&
+      claim.evidenceIds.length === 0) ||
     !claim.evidenceIds.every((evidenceId) => evidenceId.trim() !== "") ||
     new Set(claim.evidenceIds).size !== claim.evidenceIds.length ||
     claims.some((prior) => prior.claimId === claim.claimId) ||
@@ -1891,7 +1946,12 @@ function validateLearningArtifactDraft(
   let markdown: string;
   try {
     assertEvidenceGateBudget({
-      modelTurnsUsed: 2 + researching.modelTurns.length,
+      modelTurnsUsed:
+        2 +
+        researching.modelTurns.length +
+        researching.evidenceGateRepairs.filter(
+          (repair) => repair.artifactProposalTurnConsumed,
+        ).length,
       toolCallsUsed: countLogicalToolCalls(
         researching.sourceReadObservations,
         researching.researchToolObservations,

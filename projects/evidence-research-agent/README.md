@@ -1,6 +1,6 @@
 # Evidence Research Agent
 
-这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #11：除确定性的 Scripted Model、OpenAI-compatible live adapter 与 durable Run control 外，Harness 还用 per-run durable Run Operation lease 串行化 mutation，并让 replay-safe sibling reads 有界并发执行。
+这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #12：除确定性的 Scripted Model、OpenAI-compatible live adapter、durable Run control 与有界并发读取外，Harness 还执行完整 Claim-to-Evidence lineage Gate，并把可修复失败作为 durable observation 返回 Research Loop。
 
 当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。同一 Model Turn 开头连续、已通过顺序 preflight 的 `search_sources` / `read_source` 会按 `safeReadConcurrency` 有界并发；状态型工具仍严格顺序执行。live adapter 只做单次 generation：工具没有 AI SDK `execute`，也不使用 `ToolLoopAgent`、`stopWhen`、自动多步执行、`useChat` 或 SDK history。`read-source` CLI、publication CLI 与 publication crash reconciliation 仍属于后续 tickets。
 
@@ -260,6 +260,20 @@ try {
     evidenceIds: [evidence.evidenceId],
   });
 
+  await runtime.recordClaim({
+    runId: afterRead.runId,
+    kind: "inference",
+    text: "Projection 因此可以作为可替换的派生视图。",
+    evidenceIds: [evidence.evidenceId],
+  });
+
+  await runtime.recordClaim({
+    runId: afterRead.runId,
+    kind: "design_recommendation",
+    text: "建议只通过 Journal 事实恢复 Projection。",
+    evidenceIds: [],
+  });
+
   const waiting = await runtime.proposeLearningArtifact({
     runId: afterRead.runId,
     // 必须在 Output Root 内；Runtime 会冻结 root、canonical path 与 parent identity。
@@ -304,15 +318,16 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 - heartbeat 与 expiry 使用独立 control-plane clock，不消耗 Research Loop wall time。owner 崩溃后 lease 只证明 ownership 已过期；接管者必须从 Run Journal 恢复 pending attempt/tool/cancellation，不能根据 lease 猜业务结果。
 - `search_sources` 通过可注入 `SourceSearchPort` 使用默认固定参数 `rg` adapter；它在启动搜索前复核批准 root identity，并把 extensions、exclusions、共享 secret discovery globs 与 file-size bound 下推到 discovery，每个返回命中还会再走共享 realpath preflight。完整命中列表进入私有 JSON Artifact，Journal/Trace 只保留引用和数量，下一轮 Model View 再按需校验展开；搜索不会创建 Source Snapshot。
 - `readSource` 仍只接受 `{ rootIndex, relativePath, startLine, endLine }`，且只允许 `researching` Run；显式完成后会在文件/CAS I/O 前拒绝新读取。成功读取才会保存完整原始 UTF-8 字节到私有 `source-sha256:<hash>` Snapshot；`denied`/`failed` 只写安全 observation，不创建 Snapshot。
-- 一个 Evidence Record 只能逐字段绑定一个现有成功 observation 的 `observationId`、`toolCallId`、Snapshot identity、规范范围和 excerpt hash。一个 Claim 显式标为 `source_fact`，且只能引用当前 Run 已登记的 Evidence IDs。
-- Evidence Gate 会拒绝空、未知或重复的 Claim/Evidence 关系，并从 Journal 重算已批准 Run Budget 的 model turns、tool calls、按 Source Snapshot identity 去重的 distinct sources、source bytes 与 wall time。它不通过时不创建 draft artifact、更不会触碰用户 target。
-- `ModelPort.proposeLearningArtifact` 只能返回标题、摘要和**既有** Claim IDs 的展示顺序。Markdown renderer 是唯一生成 `【Evidence: <id>】` citation 的地方，并固定输出 `Claims`、`Evidence Index` 与紧凑 `Tool usage`；title、summary 或 Claim 中夹带的预渲染 `【Evidence:` token 会被拒绝，因此模型不能伪造可见引文。
+- 一个 Evidence Record 只能逐字段绑定一个现有成功 observation 的 `observationId`、`toolCallId`、Snapshot identity、规范范围和 excerpt hash。Claim 必须显式分类：`source_fact` 与 `inference` 至少引用一个既有 Evidence；`design_recommendation` 可无 Evidence，提供时也必须有效。
+- Evidence Gate 不信任 live source 或仅自洽的 Journal 字段：它从私有 CAS 按 content identity 读取完整 immutable Snapshot bytes，重新验证 Source Scope、completed tool-call lineage、1-based range、logical lines、excerpt 和 hash。live 文件后续变化不会追溯破坏既有 Evidence，Snapshot 损坏或范围/摘录不匹配则 fail closed。
+- Gate 失败会追加 typed `evidence_gate_repair_requested` 并从 `research_complete` 回到 `researching`。下一 Model View 固定显示 stable code、summary 与 recommended action；已完成但 schema-invalid 的 Artifact proposal generation 也以 `proposal_invalid` repair 计入 Run Budget，repair 不伪装成 Research Tool call，也不进入 terminal `failed`。若批准的 Source Root path/device/inode 已失效，则在调用 draft 模型前记录 `approval_invalid`，并要求创建和批准新的 Research Run/Source Scope。
+- `ModelPort.proposeLearningArtifact` 只能返回标题、摘要和**既有** Claim IDs 的展示顺序。Markdown renderer 是唯一生成 `【Evidence: <id>】` citation 的地方；Claim 行显示 ID/分类，Evidence Index 对共享 Evidence 去重并同时显示 Snapshot/range/tool-call identity。Trace 的 Claim event 暴露 kind 与 Evidence IDs，任一 artifact Claim 都能沿结构化 identity 追到 source read。title、summary 或 Claim 中夹带的预渲染 `【Evidence:` token 会被拒绝。
 - `outputRoot` 是 Runtime 打开时显式配置、且与 private Runtime Home 不重叠的 canonical 目录。private Markdown draft 的 hash、Output Root identity、canonical target path 和目标父目录 `device`/`inode` 共同构成 publication binding。任何 binding、root 或 parent identity 变化都会使旧 approval 失效。
-- normal publish 不覆盖不同既有内容：publisher 使用同目录 `0600` temporary file、fsync 和 atomic hard-link no-clobber publication。已有文件若字节完全一致则幂等成功；final symlink、非文件、不同字节或父目录替换都会 fail closed。
+- normal publish 不覆盖不同既有内容：publisher 使用同目录 `0600` temporary file、fsync 和 atomic hard-link no-clobber publication。真正写出前会再次从私有 CAS 验证 approved draft 的完整 Snapshot lineage；draft/approval 后 Snapshot 缺失或篡改会保持 `ready_to_publish` 并 fail closed。已有文件若字节完全一致则幂等成功；final symlink、非文件、不同字节或父目录替换同样会被拒绝。
 
 ## Journal、Trace 与恢复边界
 
-Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 Retry Attempts、completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim、research completion/budget/retry suspension、terminal failure、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。`ResearchLoopLifecycleHooks` 在 attempt started、Model Turn 以及五个 Research Tool 的命名 durable seam 注入中断：attempt started 后的中断证明未完成 I/O 可以跨重启分类并按 policy 恢复；search/read 还覆盖 CAS Artifact/Snapshot 写入后与 Journal 事务提交后；Evidence/Claim/completion 覆盖 Journal commit 前后。成功事实若 SQLite commit 失败，命令只返回稳定错误，Journal 中仍只有 `in_progress` attempt；它不会声称 Model Turn 已持久化。`complete_research` 若在同一时刻暴露预算耗尽，会把 `research_completed` 与 `run_budget_exhausted` 放进一个 SQLite event batch，崩溃无法留下 exhausted 但可发布的单独 `research_complete`。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文、provider payload 或 OS 错误。
+Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 Retry Attempts、completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim kind/Evidence IDs、Evidence Gate repair code、research completion/budget/retry suspension、terminal failure、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。`ResearchLoopLifecycleHooks` 在 attempt started、Model Turn 以及五个 Research Tool 的命名 durable seam 注入中断：attempt started 后的中断证明未完成 I/O 可以跨重启分类并按 policy 恢复；search/read 还覆盖 CAS Artifact/Snapshot 写入后与 Journal 事务提交后；Evidence/Claim/completion 覆盖 Journal commit 前后。成功事实若 SQLite commit 失败，命令只返回稳定错误，Journal 中仍只有 `in_progress` attempt；它不会声称 Model Turn 已持久化。`complete_research` 若在同一时刻暴露预算耗尽，会把 `research_completed` 与 `run_budget_exhausted` 放进一个 SQLite event batch，崩溃无法留下 exhausted 但可发布的单独 `research_complete`。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文、provider payload 或 OS 错误。
 
 `publication_approved` 只表示用户授权了精确 draft/target，状态为 `ready_to_publish`。重启不会自动写文件；只有显式 `publishLearningArtifact` 成功返回后才追加 `learning_artifact_published` 并进入 `completed`。如果进程在外部写入尝试和该 Journal 事件之间崩溃，当前实现不会把“文件可能存在”猜成完成；完整 effect crash reconciliation 留给 Issue #14。
 

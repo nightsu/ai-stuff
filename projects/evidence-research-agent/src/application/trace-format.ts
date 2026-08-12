@@ -35,6 +35,15 @@ export function formatRunTrace(
           ? undefined
           : `evidence=${event.evidenceId}`,
         event.claimId === undefined ? undefined : `claim=${event.claimId}`,
+        event.claimKind === undefined
+          ? undefined
+          : `claim-kind=${event.claimKind}`,
+        event.evidenceIds === undefined
+          ? undefined
+          : `evidence-ids=${event.evidenceIds.join(",")}`,
+        event.evidenceGateRepairCode === undefined
+          ? undefined
+          : `evidence-gate-repair=${event.evidenceGateRepairCode}`,
         event.draftArtifactId === undefined
           ? undefined
           : `draft=${event.draftArtifactId}`,

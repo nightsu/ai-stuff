@@ -3,13 +3,17 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 
 import {
   createPlanApprovalBinding,
   createPublicationApprovalBinding,
+  formatRunTrace,
+  hashCanonicalJson,
   ResearchAgentRuntime,
   ScriptedModel,
 } from "../../src/index.js";
+import { hashUtf8Text } from "../../src/domain/integrity.js";
 import type {
   IdGenerator,
   Clock,
@@ -34,6 +38,301 @@ afterEach(async () => {
 });
 
 describe("ResearchAgentRuntime Learning Artifact publication", () => {
+  it("renders source facts, inferences, and design recommendations without treating interpretation as upstream fact", async () => {
+    const fixture = await createEvidenceReadyRun({
+      proposalClaimIds: [
+        "claim-event-007",
+        "claim-event-008",
+        "claim-event-009",
+      ],
+    });
+    const current = await fixture.runtime.inspectRun({ runId: fixture.runId });
+    if (current.state.type !== "researching") {
+      throw new Error("测试夹具要求仍处于 researching");
+    }
+    const evidence = current.state.evidenceRecords[0];
+    if (evidence === undefined) {
+      throw new Error("测试夹具要求一个可复用 Evidence Record");
+    }
+
+    await fixture.runtime.recordClaim({
+      runId: fixture.runId,
+      kind: "inference",
+      text: "因此 Projection 可以作为可替换的派生视图。",
+      evidenceIds: [evidence.evidenceId],
+    });
+    await fixture.runtime.recordClaim({
+      runId: fixture.runId,
+      kind: "design_recommendation",
+      text: "建议只通过 Journal 事实恢复 Projection。",
+      evidenceIds: [],
+    });
+    const targetPath = join(fixture.outputDirectory, "claim-kinds.md");
+
+    try {
+      const waiting = await fixture.runtime.proposeLearningArtifact({
+        runId: fixture.runId,
+        targetPath,
+      });
+      if (waiting.state.type !== "waiting_publication_approval") {
+        throw new Error("测试要求等待 publication approval");
+      }
+      await fixture.runtime.approvePublication({
+        runId: fixture.runId,
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      });
+      await fixture.runtime.publishLearningArtifact({ runId: fixture.runId });
+
+      await expect(readFile(targetPath, "utf8")).resolves.toContain(
+        "claim-event-007 [source_fact]",
+      );
+      await expect(readFile(targetPath, "utf8")).resolves.toContain(
+        "claim-event-008 [inference]",
+      );
+      await expect(readFile(targetPath, "utf8")).resolves.toContain(
+        "claim-event-009 [design_recommendation]",
+      );
+      await expect(readFile(targetPath, "utf8")).resolves.toContain(
+        `claim-event-008 [inference]: 因此 Projection 可以作为可替换的派生视图。 【Evidence: ${evidence.evidenceId}】`,
+      );
+      await expect(readFile(targetPath, "utf8")).resolves.toContain(
+        "claim-event-009 [design_recommendation]: 建议只通过 Journal 事实恢复 Projection。",
+      );
+      await expect(readFile(targetPath, "utf8")).resolves.not.toContain(
+        "claim-event-009 [design_recommendation]: 建议只通过 Journal 事实恢复 Projection。 【Evidence:",
+      );
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("reuses one Evidence across Claims while preserving one artifact-to-Trace lineage chain", async () => {
+    const fixture = await createEvidenceReadyRun({
+      proposalClaimIds: ["claim-event-007", "claim-event-008"],
+    });
+    const current = await fixture.runtime.inspectRun({ runId: fixture.runId });
+    if (current.state.type !== "researching") {
+      throw new Error("测试夹具要求仍处于 researching");
+    }
+    const evidence = current.state.evidenceRecords[0];
+    if (evidence === undefined) {
+      throw new Error("测试夹具要求一个可复用 Evidence Record");
+    }
+    await fixture.runtime.recordClaim({
+      runId: fixture.runId,
+      kind: "inference",
+      text: "Projection 因此可以从 Journal 确定性重建。",
+      evidenceIds: [evidence.evidenceId],
+    });
+    const targetPath = join(fixture.outputDirectory, "shared-evidence.md");
+
+    try {
+      const waiting = await fixture.runtime.proposeLearningArtifact({
+        runId: fixture.runId,
+        targetPath,
+      });
+      if (waiting.state.type !== "waiting_publication_approval") {
+        throw new Error("测试要求等待 publication approval");
+      }
+      await fixture.runtime.approvePublication({
+        runId: fixture.runId,
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      });
+      await fixture.runtime.publishLearningArtifact({ runId: fixture.runId });
+
+      const markdown = await readFile(targetPath, "utf8");
+      expect(markdown.match(new RegExp(`^\\- ${evidence.evidenceId}:`, "gm")))
+        .toHaveLength(1);
+      expect(markdown).toContain(
+        `${evidence.sourceSnapshotId} lines ${evidence.startLine}-${evidence.endLine}; read_source ${evidence.toolCallId}`,
+      );
+      expect(markdown.match(new RegExp(`【Evidence: ${evidence.evidenceId}】`, "g")))
+        .toHaveLength(2);
+
+      const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+      expect(trace.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "claim_recorded",
+          claimId: "claim-event-007",
+          claimKind: "source_fact",
+          evidenceIds: [evidence.evidenceId],
+        }),
+        expect.objectContaining({
+          type: "claim_recorded",
+          claimId: "claim-event-008",
+          claimKind: "inference",
+          evidenceIds: [evidence.evidenceId],
+        }),
+        expect.objectContaining({
+          type: "evidence_recorded",
+          evidenceId: evidence.evidenceId,
+          sourceSnapshotId: evidence.sourceSnapshotId,
+          toolCallId: evidence.toolCallId,
+        }),
+      ]));
+      expect(formatRunTrace(trace, "human")).toContain(
+        `claim=claim-event-008 claim-kind=inference evidence-ids=${evidence.evidenceId}`,
+      );
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("validates Evidence against immutable Source Snapshot bytes instead of the changed live source", async () => {
+    const fixture = await createEvidenceReadyRun();
+    await writeFile(
+      join(fixture.sourceRoot, "source.md"),
+      "live source 后来已经变化。\n",
+      "utf8",
+    );
+
+    try {
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "snapshot-backed.md"),
+        }),
+      ).resolves.toMatchObject({
+        state: { type: "waiting_publication_approval" },
+      });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("invalidates legacy explicit Plan Approval when the approved Source Root identity changes", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const approvedRoot = `${fixture.sourceRoot}-approved`;
+    await rename(fixture.sourceRoot, approvedRoot);
+    await mkdir(fixture.sourceRoot);
+    await writeFile(
+      join(fixture.sourceRoot, "source.md"),
+      "替代目录不能继承原计划审批。\n",
+      "utf8",
+    );
+
+    try {
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "legacy-approval-invalid.md"),
+        }),
+      ).rejects.toThrow(/Evidence/);
+      await expect(
+        fixture.runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        lastEventSequence: 7,
+        state: { type: "researching", evidenceGateRepairs: [] },
+      });
+    } finally {
+      fixture.runtime.close();
+      await rm(approvedRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("blocks a draft when the private Source Snapshot bytes no longer match their content identity", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const current = await fixture.runtime.inspectRun({ runId: fixture.runId });
+    if (current.state.type !== "researching") {
+      throw new Error("测试夹具要求仍处于 researching");
+    }
+    const observation = current.state.sourceReadObservations[0];
+    if (observation?.status !== "succeeded") {
+      throw new Error("测试夹具要求一个成功来源 observation");
+    }
+    await writeFile(
+      join(fixture.runtimeHome, observation.sourceSnapshot.relativePath),
+      "title\nRun Journal 是 forged history。\nProjection 可从 Journal 重建。\n",
+      "utf8",
+    );
+
+    try {
+      await expect(
+        fixture.runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "corrupt-snapshot.md"),
+        }),
+      ).rejects.toThrow(/Evidence/);
+      await expect(
+        fixture.runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "researching" } });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("revalidates immutable Source Snapshot lineage immediately before publication", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "tampered-after-approval.md");
+    const current = await fixture.runtime.inspectRun({ runId: fixture.runId });
+    if (current.state.type !== "researching") {
+      throw new Error("测试夹具要求 draft 前处于 researching");
+    }
+    const observation = current.state.sourceReadObservations[0];
+    if (observation?.status !== "succeeded") {
+      throw new Error("测试夹具要求一个成功 Source Snapshot observation");
+    }
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    await writeFile(
+      join(fixture.runtimeHome, observation.sourceSnapshot.relativePath),
+      "已被篡改的 Snapshot bytes。\n",
+      "utf8",
+    );
+
+    try {
+      await expect(
+        fixture.runtime.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Learning Artifact/);
+      await expect(readFile(targetPath, "utf8")).rejects.toThrow();
+      await expect(
+        fixture.runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "ready_to_publish" } });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("blocks a self-consistent forged range whose excerpt does not match the immutable Snapshot", async () => {
+    const fixture = await createEvidenceReadyRun();
+    fixture.runtime.close();
+    tamperEvidenceRange(fixture.runtimeHome, fixture.runId);
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel(
+        [],
+        [{
+          title: "Journal 的可恢复性",
+          summary: "必须从 immutable Snapshot 验证精确范围。",
+          claimIds: ["claim-event-007"],
+        }],
+      ),
+    });
+
+    try {
+      await expect(
+        runtime.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "forged-range.md"),
+        }),
+      ).rejects.toThrow(/Evidence/);
+      await expect(runtime.inspectRun({ runId: fixture.runId })).resolves
+        .toMatchObject({ state: { type: "researching" } });
+    } finally {
+      runtime.close();
+    }
+  });
+
   it("uses a ScriptedModel proposal to move approved plan through evidence gate, exact publication approval, and readable completed Markdown", async () => {
     const fixture = await createEvidenceReadyRun();
     const targetPath = join(fixture.outputDirectory, "journal-learning.md");
@@ -677,6 +976,8 @@ async function createEvidenceReadyRun(options: {
   readonly runtimeHome: string;
   /** 用户可发布 Markdown 的受控临时目录。 */
   readonly outputDirectory: string;
+  /** 成功读取发生后仍可改变、但不应替代 immutable Snapshot 的 live Source Root。 */
+  readonly sourceRoot: string;
 }> {
   const runtimeHome = await createTemporaryDirectory("artifact-runtime-");
   const sourceRoot = await createTemporaryDirectory("artifact-source-");
@@ -769,7 +1070,72 @@ async function createEvidenceReadyRun(options: {
       evidenceIds: [evidence.evidenceId],
     });
   }
-  return { runtime, runId: waiting.runId, runtimeHome, outputDirectory };
+  return {
+    runtime,
+    runId: waiting.runId,
+    runtimeHome,
+    outputDirectory,
+    sourceRoot,
+  };
+}
+
+function tamperEvidenceRange(runtimeHome: string, runId: string): void {
+  const database = new Database(join(runtimeHome, "runtime.sqlite"));
+  try {
+    const readRow = database.prepare(
+      "SELECT payload_json FROM run_events WHERE run_id = ? AND sequence = 5",
+    ).get(runId) as {
+      /** 成功 source read 事件载荷的原始 JSON。 */
+      readonly payload_json: string;
+    } | undefined;
+    const evidenceRow = database.prepare(
+      "SELECT payload_json FROM run_events WHERE run_id = ? AND sequence = 6",
+    ).get(runId) as {
+      /** Evidence 事件载荷的原始 JSON。 */
+      readonly payload_json: string;
+    } | undefined;
+    if (readRow === undefined || evidenceRow === undefined) {
+      throw new Error("测试夹具要求固定的 read/Evidence 事件");
+    }
+    const readPayload = JSON.parse(readRow.payload_json) as {
+      /** 测试要构造自洽但与 Snapshot bytes 不一致的成功 observation。 */
+      observation: Record<string, unknown>;
+    };
+    const evidencePayload = JSON.parse(evidenceRow.payload_json) as {
+      /** 测试要同步伪造、从而绕过仅逐字段 join 的 Evidence Record。 */
+      evidence: Record<string, unknown>;
+    };
+    Object.assign(readPayload.observation, {
+      startLine: 1,
+      endLine: 2,
+      requestHash: hashCanonicalJson({
+        rootIndex: 0,
+        relativePath: "source.md",
+        startLine: 1,
+        endLine: 2,
+      }),
+      excerpt: "Run Journal 是 canonical history。\nProjection 可从 Journal 重建。",
+      excerptHash: hashUtf8Text(
+        "Run Journal 是 canonical history。\nProjection 可从 Journal 重建。",
+      ),
+    });
+    Object.assign(evidencePayload.evidence, {
+      startLine: 1,
+      endLine: 2,
+      excerptHash: readPayload.observation.excerptHash,
+    });
+    const update = database.prepare(
+      "UPDATE run_events SET payload_json = ? WHERE run_id = ? AND sequence = ?",
+    );
+    const transaction = database.transaction(() => {
+      database.exec("DROP TRIGGER run_events_are_append_only_on_update");
+      update.run(JSON.stringify(readPayload), runId, 5);
+      update.run(JSON.stringify(evidencePayload), runId, 6);
+    });
+    transaction();
+  } finally {
+    database.close();
+  }
 }
 
 function runBudget(overrides: Partial<RunBudget> = {}): RunBudget {

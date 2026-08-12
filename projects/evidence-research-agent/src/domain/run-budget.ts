@@ -54,7 +54,12 @@ export function calculateRemainingRunBudget(
   return {
     modelTurns: Math.max(
       0,
-      context.runBudget.maxModelTurns - 1 - context.state.modelTurns.length,
+      context.runBudget.maxModelTurns -
+        1 -
+        context.state.modelTurns.length -
+        context.state.evidenceGateRepairs.filter(
+          (repair) => repair.artifactProposalTurnConsumed,
+        ).length,
     ),
     toolCalls: Math.max(
       0,

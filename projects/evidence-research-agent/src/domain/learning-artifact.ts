@@ -68,11 +68,12 @@ export function renderLearningArtifact(
     const citations = claim.evidenceIds
       .map((evidenceId) => `【Evidence: ${evidenceId}】`)
       .join(" ");
-    return `- ${claim.text} ${citations}`;
+    const citationSuffix = citations === "" ? "" : ` ${citations}`;
+    return `- ${claim.claimId} [${claim.kind}]: ${claim.text}${citationSuffix}`;
   });
   const evidenceLines = gate.evidenceRecords.map(
     (evidence) =>
-      `- ${evidence.evidenceId}: ${evidence.sourceSnapshotId} lines ${evidence.startLine}-${evidence.endLine}`,
+      `- ${evidence.evidenceId}: ${evidence.sourceSnapshotId} lines ${evidence.startLine}-${evidence.endLine}; read_source ${evidence.toolCallId}`,
   );
   const toolLines = gate.evidenceRecords.map(
     (evidence) => `- read_source: ${evidence.toolCallId}`,
