@@ -943,6 +943,10 @@ function validateStartedAttempt(
   const newSequence = previousAttempt === undefined;
   const latestSequenceClosed = latestAttempt === undefined ||
     latestAttempt.outcome === "succeeded" ||
+    (latestAttempt.retrySequenceKind === "model_turn" &&
+      latestAttempt.outcome === "permanent_failure" &&
+      latestAttempt.failure?.category === "model_permanent" &&
+      latestAttempt.failure.code === "model_generation_aborted") ||
     (latestAttempt.retrySequenceKind === "search_sources" &&
       latestAttempt.outcome === "permanent_failure" &&
       state.researchToolObservations.some(

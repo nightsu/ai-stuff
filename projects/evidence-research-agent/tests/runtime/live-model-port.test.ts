@@ -359,9 +359,11 @@ describe("ResearchAgentRuntime live Model Port seam", () => {
     const model = new OpenAiCompatibleModelPort(
       liveConfig(apiKey),
       {
-        streamText: (options) => ({
-          stream: generation++ === 0
-            ? stream([
+        streamText: (options) => {
+          const currentGeneration = generation++;
+          return {
+            stream: currentGeneration === 0
+              ? stream([
                 {
                   type: "tool-call",
                   toolCallId: "plan-call",
@@ -377,14 +379,29 @@ describe("ResearchAgentRuntime live Model Port seam", () => {
                   finishReason: "tool-calls",
                   totalUsage: usage(20, 8),
                 },
-              ])
-            : (async function* () {
-                yield { type: "text-delta", id: "text-1", text: "partial" };
-                controller.abort();
-                expect(options.abortSignal).toBe(controller.signal);
-                yield { type: "abort", reason: "cancelled" };
-              })(),
-        }),
+                ])
+              : currentGeneration === 1
+                ? (async function* () {
+                    yield { type: "text-delta", id: "text-1", text: "partial" };
+                    controller.abort();
+                    expect(options.abortSignal).toBe(controller.signal);
+                    yield { type: "abort", reason: "cancelled" };
+                  })()
+                : stream([
+                    {
+                      type: "tool-call",
+                      toolCallId: "complete-call",
+                      toolName: "complete_research",
+                      input: { unresolvedQuestions: [], evidenceGaps: [] },
+                    },
+                    {
+                      type: "finish",
+                      finishReason: "tool-calls",
+                      totalUsage: usage(8, 4),
+                    },
+                  ]),
+          };
+        },
       },
     );
     const runtime = ResearchAgentRuntime.open({
@@ -486,6 +503,15 @@ describe("ResearchAgentRuntime live Model Port seam", () => {
             code: "model_generation_aborted",
           },
         });
+        const completed = await restarted.advanceResearch({ runId: waiting.runId });
+        expect(completed.state.type).toBe("research_complete");
+        if (completed.state.type !== "research_complete") {
+          throw new Error("重启后应能用新的 generation 继续 Research Run");
+        }
+        expect(completed.state.retryAttempts).toMatchObject([
+          { outcome: "permanent_failure" },
+          { outcome: "succeeded" },
+        ]);
       } finally {
         restarted.close();
       }
