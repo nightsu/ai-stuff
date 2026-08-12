@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  IllegalSourceReadStateError,
   ModelViewTooLargeError,
   ResearchAgentRuntime,
   ResearchLoopError,
@@ -1428,6 +1429,90 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
     }
   });
 
+  it("recovers a missing completion-time suspension without charging later idle time", async () => {
+    const fixture = await createApprovedLoopRun([], { maxModelTurns: 2 });
+    fixture.runtime.close();
+    const completedAt = fixedClock().now();
+    const store = new SqliteRunStore(fixture.runtimeHome);
+    store.appendEvents(fixture.runId, 4, [
+      modelTurnCompletedEvent(fixture.runId, 5, [
+        {
+          intentId: "complete",
+          name: "complete_research",
+          input: { unresolvedQuestions: [] },
+        },
+      ]),
+      researchCompletedEvent(fixture.runId, 6, completedAt),
+    ]);
+    store.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputRoot,
+      model: new ScriptedModel([], [], []),
+      clock: { now: () => "2026-08-12T10:00:00.000Z" },
+      ids: sequentialIds(100),
+    });
+    try {
+      await expect(
+        restarted.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "budget_exhausted",
+          researchOutcome: "research_complete",
+          exhaustedDimension: "model_turns",
+          remainingBudget: {
+            modelTurns: 0,
+            wallTimeMs: 60_000,
+          },
+        },
+      });
+      await expect(
+        restarted.rebuildRunProjection({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "budget_exhausted",
+          exhaustedDimension: "model_turns",
+        },
+      });
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("rejects public source reads after explicit completion before source execution", async () => {
+    const fixture = await createApprovedLoopRun([
+      turn("complete", "complete_research", { unresolvedQuestions: [] }),
+    ]);
+    try {
+      const completed = await fixture.runtime.advanceResearch({
+        runId: fixture.runId,
+      });
+      expect(completed.state.type).toBe("research_complete");
+      await expect(
+        fixture.runtime.readSource({
+          runId: fixture.runId,
+          request: {
+            rootIndex: 0,
+            relativePath: "journal.md",
+            startLine: 1,
+            endLine: 1,
+          },
+        }),
+      ).rejects.toBeInstanceOf(IllegalSourceReadStateError);
+      await expect(
+        fixture.runtime.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "research_complete",
+          sourceReadObservations: [],
+        },
+      });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
   it("keeps plan approval wait outside the Evidence Gate wall-time check", async () => {
     let clockCalls = 0;
     const clock: Clock = {
@@ -1637,6 +1722,33 @@ function modelTurnCompletedEvent(
         finishReason: "tool_calls",
         toolIntents,
         completedAt: occurredAt,
+      },
+    },
+  };
+}
+
+function researchCompletedEvent(
+  runId: string,
+  sequence: number,
+  occurredAt: string,
+): ResearchRunEvent {
+  return {
+    eventId: `event-recovery-completion-${sequence}`,
+    runId,
+    sequence,
+    type: "research_completed",
+    occurredAt,
+    payload: {
+      completion: { unresolvedQuestions: [], completedAt: occurredAt },
+      observation: {
+        observationId: `observation-recovery-completion-${sequence}`,
+        toolCallId: `tool-call-recovery-completion-${sequence}`,
+        intentId: "complete",
+        toolName: "complete_research",
+        status: "succeeded",
+        summary: "研究显式完成，保留 0 个未解决问题",
+        output: { unresolvedQuestions: [] },
+        observedAt: occurredAt,
       },
     },
   };

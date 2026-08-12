@@ -112,6 +112,7 @@ stateDiagram-v2
   researching --> researching: claim_recorded
   researching --> research_complete: research_completed
   researching --> budget_exhausted: run_budget_exhausted
+  research_complete --> budget_exhausted: run_budget_exhausted
   research_complete --> waiting_publication_approval: learning_artifact_draft_proposed
   waiting_publication_approval --> ready_to_publish: publication_approved
   ready_to_publish --> completed: learning_artifact_published

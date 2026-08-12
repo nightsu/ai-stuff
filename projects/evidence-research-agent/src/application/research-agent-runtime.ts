@@ -831,7 +831,11 @@ export class ResearchAgentRuntime {
         );
         return exhausted === undefined
           ? current
-          : this.#suspendForBudget(current, "model");
+          : this.#suspendForBudget(
+              current,
+              "model",
+              current.state.completion.completedAt,
+            );
       }
       if (current.state.type !== "researching") {
         throw new ResearchLoopError();
@@ -1314,8 +1318,8 @@ export class ResearchAgentRuntime {
   #suspendForBudget(
     current: RunProjection,
     phase: "model" | "tool",
+    occurredAt = this.#clock.now(),
   ): RunProjection {
-    const occurredAt = this.#clock.now();
     // dimension 与 payload 必须都从 event 自己的 occurredAt 重算；若前一拍是
     // model_turns、后一拍 wall_time 先耗尽，复用旧 dimension 会让 replay 拒绝。
     const remainingBudget = this.#remainingBudget(current, occurredAt);
@@ -1363,10 +1367,7 @@ export class ResearchAgentRuntime {
       // payload 或 identity；readSource 的公开错误边界不把它们转交给调用方。
       throw new SourceReadPersistenceError();
     }
-    if (
-      current.state.type !== "researching" &&
-      current.state.type !== "research_complete"
-    ) {
+    if (current.state.type !== "researching") {
       throw new IllegalSourceReadStateError();
     }
 
