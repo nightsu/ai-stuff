@@ -31,6 +31,8 @@ export interface ArtifactStoreLifecycleHooks {
   readonly afterSourceSnapshotDirectoryPreparation?: () =>
     | void
     | Promise<void>;
+  /** Markdown draft prefix 已准备完成、创建同目录临时文件前运行。 */
+  readonly beforeMarkdownArtifactWrite?: () => void | Promise<void>;
 }
 
 /** 一段 canonical 私有目录在准备时捕获的文件系统 identity。 */
@@ -141,6 +143,7 @@ export class ContentAddressedArtifactStore {
       "sha256",
       sha256.slice(0, 2),
     ]);
+    await this.#hooks.beforeMarkdownArtifactWrite?.();
     const absolutePath = join(prefixChain.directory, `${sha256}.md`);
     await publishExactBytes(bytes, absolutePath, prefixChain);
 

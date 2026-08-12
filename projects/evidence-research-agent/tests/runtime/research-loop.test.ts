@@ -1703,7 +1703,15 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
       const trace = await runtime.traceRun({ runId: waiting.runId });
       expect(trace.events.filter((event) => event.type === "model_turn_completed"))
         .toHaveLength(5);
-      expect(trace.events.at(-2)?.type).toBe("research_completed");
+      const researchCompletedIndex = trace.events.findIndex(
+        (event) => event.type === "research_completed",
+      );
+      const artifactAttemptIndex = trace.events.findIndex((event) =>
+        event.type === "retry_attempt_started" &&
+        event.retrySequenceKind === "artifact_proposal"
+      );
+      expect(researchCompletedIndex).toBeGreaterThanOrEqual(0);
+      expect(artifactAttemptIndex).toBeGreaterThan(researchCompletedIndex);
     } finally {
       runtime.close();
     }
@@ -1982,7 +1990,7 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
     }
   });
 
-  it("recovers an orphaned search Artifact by re-executing the still-pending durable intent", async () => {
+  it("does not replay a default Search after an orphaned result Artifact is written", async () => {
     let interruptOnce = true;
     let searchCalls = 0;
     const sourceSearch: SourceSearchPort = {
@@ -2022,6 +2030,10 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
         type: "researching",
         pendingToolIntents: [expect.objectContaining({ intentId: "search" })],
         researchToolObservations: [],
+        retryAttempts: [
+          expect.objectContaining({ retrySequenceKind: "model_turn", outcome: "succeeded" }),
+          expect.objectContaining({ retrySequenceKind: "search_sources", outcome: "in_progress" }),
+        ],
       });
     } finally {
       fixture.runtime.close();
@@ -2041,13 +2053,18 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
     try {
       await expect(
         restarted.advanceResearch({ runId: fixture.runId }),
-      ).resolves.toMatchObject({ state: { type: "research_complete" } });
-      expect(searchCalls).toBe(2);
-      expect(restartedModel.researchViews).toHaveLength(1);
-      expect(restartedModel.researchViews[0]?.recentObservations[0]).toMatchObject({
-        intentId: "search",
-        output: { matches: [expect.objectContaining({ relativePath: "journal.md" })] },
+      ).resolves.toMatchObject({
+        state: {
+          type: "retry_exhausted",
+          retrySequenceKind: "search_sources",
+          failure: {
+            category: "infrastructure_transient",
+            code: "search_interrupted",
+          },
+        },
       });
+      expect(searchCalls).toBe(1);
+      expect(restartedModel.researchViews).toHaveLength(0);
     } finally {
       restarted.close();
     }
@@ -2534,7 +2551,16 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
       });
       await expect(
         fixture.runtime.advanceResearch({ runId: fixture.runId }),
-      ).rejects.toBeInstanceOf(ResearchLoopError);
+      ).resolves.toMatchObject({
+        state: {
+          type: "failed",
+          retrySequenceKind: "model_turn",
+          failure: {
+            category: "model_permanent",
+            code: "model_generation_failed",
+          },
+        },
+      });
       await expect(
         fixture.runtime.proposeLearningArtifact({
           runId: fixture.runId,

@@ -679,7 +679,12 @@ const researchToolObservationSchema = z
 const retryAttemptCommonFields = {
   attemptId: z.string().trim().min(1),
   retrySequenceId: z.string().trim().min(1),
-  retrySequenceKind: z.enum(["model_turn", "search_sources"]),
+  retrySequenceKind: z.enum([
+    "plan_generation",
+    "model_turn",
+    "search_sources",
+    "artifact_proposal",
+  ]),
   attemptNumber: z.number().int().positive(),
   retryPolicy: retryPolicySchema,
   startedAt: z.iso.datetime(),
@@ -705,6 +710,13 @@ const completedRetryAttemptSchema = z.object({
   durationMs: z.number().int().nonnegative(),
   failure: normalizedFailureSchema.optional(),
   retryDelayMs: z.number().int().nonnegative().optional(),
+}).strict();
+
+const outerModelRetryAttemptSchema = completedRetryAttemptSchema.extend({
+  retrySequenceKind: z.enum(["plan_generation", "artifact_proposal"]),
+  toolCallId: z.never().optional(),
+  intentId: z.never().optional(),
+  latestSteering: z.never().optional(),
 }).strict();
 
 const retryAttemptSchema = z.union([
@@ -916,6 +928,7 @@ const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
   z.object({
     type: z.literal("planning"),
     startedAt: z.iso.datetime(),
+    retryAttempts: z.array(retryAttemptSchema).default([]),
   }),
   z.object({
     type: z.literal("waiting_plan_approval"),
@@ -958,19 +971,44 @@ const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
   }),
   z.object({
     type: z.literal("retry_exhausted"),
+    planningStartedAt: z.iso.datetime(),
+    retryAttempts: z.array(retryAttemptSchema),
+    retrySequenceId: z.string().trim().min(1),
+    retrySequenceKind: z.literal("plan_generation"),
+    attemptsUsed: z.number().int().positive(),
+    failure: normalizedFailureSchema,
+  }),
+  z.object({
+    type: z.literal("retry_exhausted"),
     ...evidenceBackedStateFields,
     retrySequenceId: z.string().trim().min(1),
-    retrySequenceKind: z.enum(["model_turn", "search_sources"]),
+    retrySequenceKind: z.enum(["model_turn", "search_sources", "artifact_proposal"]),
     attemptsUsed: z.number().int().positive(),
     failure: normalizedFailureSchema,
   }),
   z.object({
     type: z.literal("failed"),
+    planningStartedAt: z.iso.datetime(),
+    retryAttempts: z.array(retryAttemptSchema),
+    retrySequenceId: z.string().trim().min(1),
+    retrySequenceKind: z.literal("plan_generation"),
+    failure: normalizedFailureSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("failed"),
     ...evidenceBackedStateFields,
     retrySequenceId: z.string().trim().min(1),
-    retrySequenceKind: z.enum(["model_turn", "search_sources"]),
+    retrySequenceKind: z.enum(["model_turn", "search_sources", "artifact_proposal"]),
     failure: normalizedFailureSchema,
-  }),
+  }).strict(),
+  z.object({
+    type: z.literal("failed"),
+    ...evidenceBackedStateFields,
+    retrySequenceId: z.string().trim().min(1),
+    retrySequenceKind: z.literal("artifact_proposal"),
+    failure: normalizedFailureSchema,
+    completion: researchCompletionSchema,
+  }).strict(),
   z.object({
     type: z.literal("budget_exhausted"),
     ...evidenceBackedStateFields,
@@ -1023,7 +1061,11 @@ const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
     type: z.literal("cancelled"),
     cancelledState: z.lazy(() => z.union([
       z.object({ type: z.literal("created") }),
-      z.object({ type: z.literal("planning"), startedAt: z.iso.datetime() }),
+      z.object({
+        type: z.literal("planning"),
+        startedAt: z.iso.datetime(),
+        retryAttempts: z.array(retryAttemptSchema).default([]),
+      }),
       z.object({
         type: z.literal("waiting_plan_approval"),
         planArtifact: artifactReferenceSchema,
@@ -1071,9 +1113,22 @@ const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
       }),
       z.object({
         type: z.literal("retry_exhausted"),
+        planningStartedAt: z.iso.datetime(),
+        retryAttempts: z.array(retryAttemptSchema),
+        retrySequenceId: z.string().trim().min(1),
+        retrySequenceKind: z.literal("plan_generation"),
+        attemptsUsed: z.number().int().positive(),
+        failure: normalizedFailureSchema,
+      }),
+      z.object({
+        type: z.literal("retry_exhausted"),
         ...evidenceBackedStateFields,
         retrySequenceId: z.string().trim().min(1),
-        retrySequenceKind: z.enum(["model_turn", "search_sources"]),
+        retrySequenceKind: z.enum([
+          "model_turn",
+          "search_sources",
+          "artifact_proposal",
+        ]),
         attemptsUsed: z.number().int().positive(),
         failure: normalizedFailureSchema,
       }),
@@ -1135,7 +1190,9 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
   z.object({
     ...eventEnvelopeSchema,
     type: z.literal("planning_started"),
-    payload: z.object({}),
+    payload: z.object({
+      attempt: inProgressRetryAttemptSchema.optional(),
+    }).strict(),
   }),
   z.object({
     ...eventEnvelopeSchema,
@@ -1143,6 +1200,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     payload: z.object({
       planArtifact: artifactReferenceSchema,
       approvalBinding: planApprovalBindingSchema,
+      attempt: outerModelRetryAttemptSchema.optional(),
     }),
   }),
   z.object({
@@ -1238,7 +1296,12 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     type: z.literal("run_retry_exhausted"),
     payload: z.object({
       retrySequenceId: z.string().trim().min(1),
-      retrySequenceKind: z.enum(["model_turn", "search_sources"]),
+      retrySequenceKind: z.enum([
+        "plan_generation",
+        "model_turn",
+        "search_sources",
+        "artifact_proposal",
+      ]),
       attemptsUsed: z.number().int().positive(),
       failure: normalizedFailureSchema,
     }).strict(),
@@ -1248,8 +1311,14 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     type: z.literal("run_failed"),
     payload: z.object({
       retrySequenceId: z.string().trim().min(1),
-      retrySequenceKind: z.enum(["model_turn", "search_sources"]),
+      retrySequenceKind: z.enum([
+        "plan_generation",
+        "model_turn",
+        "search_sources",
+        "artifact_proposal",
+      ]),
       failure: normalizedFailureSchema,
+      attempt: outerModelRetryAttemptSchema.optional(),
     }).strict(),
   }).strict(),
   z.object({
@@ -1286,6 +1355,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     type: z.literal("evidence_gate_repair_requested"),
     payload: z.object({
       repair: evidenceGateRepairSchema,
+      attempt: outerModelRetryAttemptSchema.optional(),
     }).strict(),
   }).strict(),
   z.object({
@@ -1297,6 +1367,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
       evaluatorInputHash: sha256Schema,
       evaluatorIdentity: evaluatorIdentitySchema,
       failure: evaluatorReviewFailureSchema,
+      attempt: outerModelRetryAttemptSchema.optional(),
     }).strict(),
   }).strict(),
   z.object({
@@ -1348,6 +1419,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
           publicationTarget: publicationTargetSchema,
           publicationBinding: publicationApprovalBindingSchema,
           publicationApprovalSummary: publicationApprovalSummarySchema,
+          attempt: outerModelRetryAttemptSchema.optional(),
         })
         .strict(),
     })

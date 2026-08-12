@@ -10,6 +10,7 @@ import {
   formatRunTrace,
   InfrastructureFailureError,
   ResearchAgentRuntime,
+  ResearchLoopError,
 } from "../../src/index.js";
 import type {
   Clock,
@@ -38,6 +39,1173 @@ afterEach(async () => {
 });
 
 describe("ResearchAgentRuntime retry policy", () => {
+  it("terminally closes default plan postprocessing failure and never resamples after restart", async () => {
+    const runtimeHome = await createTemporaryDirectory("default-plan-postprocess-runtime-");
+    const sourceRoot = await createTemporaryDirectory("default-plan-postprocess-source-");
+    const ids = sequentialIds();
+    const clock = incrementingClock();
+    let planCalls = 0;
+    const model: ModelPort = {
+      proposePlan: async () => {
+        planCalls += 1;
+        return {
+          title: "默认单次计划",
+          objectives: ["后处理失败不得重采样"],
+          steps: [{ id: "step-1", description: "提交 durable attempt" }],
+        };
+      },
+      proposeLearningArtifact: async () => {
+        throw new Error("测试不生成 artifact");
+      },
+    };
+    const first = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      ids,
+      clock,
+      researchLoopHooks: {
+        beforePlanProposalJournalAppend: () => {
+          throw new Error("simulated plan journal failure");
+        },
+      },
+    });
+    await expect(first.createRun({
+      question: "默认计划后处理失败如何恢复？",
+      sourceScope: {
+        roots: [sourceRoot],
+        exclusions: [],
+        allowedExtensions: [".md"],
+        maxFileBytes: 4_096,
+        maxTotalBytes: 4_096,
+      },
+      runBudget: generousBudget(),
+    })).rejects.toBeInstanceOf(ResearchLoopError);
+    const database = new Database(join(runtimeHome, "runtime.sqlite"));
+    const row = database.prepare("SELECT run_id AS runId FROM runs").get() as {
+      /** 后处理失败后仍可定位的 durable Run identity。 */
+      readonly runId: string;
+    };
+    database.close();
+    await expect(first.inspectRun({ runId: row.runId })).resolves.toMatchObject({
+      state: {
+        type: "failed",
+        retrySequenceKind: "plan_generation",
+        failure: {
+          category: "invariant_violation",
+          code: "plan_persistence_failed",
+        },
+        retryAttempts: [expect.objectContaining({ outcome: "succeeded" })],
+      },
+    });
+    first.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      ids,
+      clock,
+    });
+    try {
+      await expect(restarted.resumeRun({ runId: row.runId })).rejects.toThrow();
+      expect(planCalls).toBe(1);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("persists plan generation started before provider I/O and resumes the same sequence after restart", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-plan-restart-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-plan-restart-source-");
+    const policy = {
+      version: "retry-plan-restart-v1",
+      modelMaxAttempts: 3,
+      toolMaxAttempts: 2,
+      baseDelayMs: 10,
+      maxDelayMs: 50,
+    } as const;
+    const ids = sequentialIds();
+    const clock = incrementingClock();
+    let interrupt = true;
+    let planCalls = 0;
+    const model: ModelPort = {
+      proposePlan: async () => {
+        planCalls += 1;
+        return {
+          title: "恢复计划生成",
+          objectives: ["重启后沿同一 Retry Sequence 继续"],
+          steps: [{ id: "step-1", description: "恢复 interrupted attempt" }],
+        };
+      },
+      proposeLearningArtifact: async () => {
+        throw new Error("测试不生成 artifact");
+      },
+    };
+    const first = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      ids,
+      clock,
+      retryPolicy: policy,
+      retryScheduler: { wait: async () => undefined },
+      researchLoopHooks: {
+        afterPlanRetryAttemptStarted: () => {
+          if (!interrupt) return;
+          interrupt = false;
+          throw new Error("模拟 plan provider I/O 前中断");
+        },
+      },
+    });
+
+    await expect(first.createRun({
+      question: "计划 generation 中断后如何恢复？",
+      sourceScope: {
+        roots: [sourceRoot],
+        exclusions: [],
+        allowedExtensions: [".md"],
+        maxFileBytes: 4_096,
+        maxTotalBytes: 4_096,
+      },
+      runBudget: generousBudget(),
+    })).rejects.toThrow();
+    const database = new Database(join(runtimeHome, "runtime.sqlite"));
+    const runId = database.prepare("SELECT run_id AS runId FROM runs").get() as {
+      /** 创建流程中断后仍由 SQLite 保留的 Research Run identity。 */
+      runId: string;
+    };
+    database.close();
+    expect(planCalls).toBe(0);
+    const interrupted = await first.inspectRun({ runId: runId.runId });
+    expect(interrupted.state).toMatchObject({
+      type: "planning",
+      retryAttempts: [expect.objectContaining({
+        retrySequenceKind: "plan_generation",
+        attemptNumber: 1,
+        outcome: "in_progress",
+      })],
+    });
+    first.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      ids,
+      clock,
+      retryPolicy: policy,
+      retryScheduler: { wait: async () => undefined },
+    });
+    try {
+      const waiting = await restarted.resumeRun({ runId: runId.runId });
+      expect(waiting.state.type).toBe("waiting_plan_approval");
+      expect(planCalls).toBe(1);
+      const trace = await restarted.traceRun({ runId: runId.runId });
+      const planAttempts = trace.events.filter((event) =>
+        event.retrySequenceKind === "plan_generation"
+      );
+      expect(planAttempts).toEqual([
+        expect.objectContaining({
+          type: "retry_attempt_started",
+          attemptNumber: 1,
+          attemptOutcome: "in_progress",
+        }),
+        expect.objectContaining({
+          type: "retry_attempt_failed",
+          attemptNumber: 1,
+          attemptOutcome: "retryable_failure",
+          failureCode: "plan_generation_interrupted",
+        }),
+        expect.objectContaining({
+          type: "retry_attempt_started",
+          attemptNumber: 2,
+          attemptOutcome: "in_progress",
+        }),
+        expect.objectContaining({
+          type: "plan_proposed",
+          attemptNumber: 2,
+          attemptOutcome: "succeeded",
+        }),
+      ]);
+      expect(new Set(planAttempts.map((event) => event.retrySequenceId)).size).toBe(1);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("retries transient plan generation and records each physical attempt", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-plan-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-plan-source-");
+    let planCalls = 0;
+    const waits: number[] = [];
+    const model: ModelPort = {
+      proposePlan: async () => {
+        planCalls += 1;
+        if (planCalls === 1) {
+          throw new InfrastructureFailureError("rate_limited", {
+            retryAfterMs: 75,
+          });
+        }
+        return {
+          title: "重试计划生成",
+          objectives: ["让 planning failure 可恢复且可审计"],
+          steps: [{ id: "step-1", description: "生成 exact plan" }],
+        };
+      },
+      proposeLearningArtifact: async () => {
+        throw new Error("测试不生成 artifact");
+      },
+    };
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      retryPolicy: {
+        version: "retry-v1",
+        modelMaxAttempts: 3,
+        toolMaxAttempts: 2,
+        baseDelayMs: 10,
+        maxDelayMs: 50,
+      },
+      retryScheduler: {
+        wait: async (delayMs) => {
+          waits.push(delayMs);
+        },
+      },
+    });
+
+    try {
+      const waiting = await runtime.createRun({
+        question: "计划生成如何重试？",
+        sourceScope: {
+          roots: [sourceRoot],
+          exclusions: [],
+          allowedExtensions: [".md"],
+          maxFileBytes: 4_096,
+          maxTotalBytes: 4_096,
+        },
+        runBudget: generousBudget(),
+      });
+      expect(waiting.state.type).toBe("waiting_plan_approval");
+      expect(planCalls).toBe(2);
+      expect(waits).toEqual([75]);
+      const trace = await runtime.traceRun({ runId: waiting.runId });
+      expect(trace.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "retry_attempt_failed",
+          retrySequenceKind: "plan_generation",
+          attemptNumber: 1,
+          attemptOutcome: "retryable_failure",
+        }),
+        expect.objectContaining({
+          type: "plan_proposed",
+          retrySequenceKind: "plan_generation",
+          attemptNumber: 2,
+          attemptOutcome: "succeeded",
+        }),
+      ]));
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("terminally closes an invalid completed plan and never resamples it after restart", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-plan-invalid-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-plan-invalid-source-");
+    const ids = sequentialIds();
+    const clock = incrementingClock();
+    let planCalls = 0;
+    const model: ModelPort = {
+      proposePlan: async () => {
+        planCalls += 1;
+        return {
+          title: "invalid plan",
+          objectives: [],
+          steps: [],
+        } as never;
+      },
+      proposeLearningArtifact: async () => {
+        throw new Error("测试不生成 artifact");
+      },
+    };
+    const retryPolicy = {
+      version: "retry-plan-invalid-v1",
+      modelMaxAttempts: 3,
+      toolMaxAttempts: 2,
+      baseDelayMs: 10,
+      maxDelayMs: 50,
+    } as const;
+    const first = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      ids,
+      clock,
+      retryPolicy,
+    });
+    await expect(first.createRun({
+      question: "无效计划是否会被重采样？",
+      sourceScope: {
+        roots: [sourceRoot],
+        exclusions: [],
+        allowedExtensions: [".md"],
+        maxFileBytes: 4_096,
+        maxTotalBytes: 4_096,
+      },
+      runBudget: generousBudget(),
+    })).rejects.toThrow();
+    const database = new Database(join(runtimeHome, "runtime.sqlite"));
+    const row = database.prepare("SELECT run_id AS runId FROM runs").get() as {
+      /** schema-invalid planning 后仍可从 durable store 定位的 Run identity。 */
+      readonly runId: string;
+    };
+    database.close();
+    await expect(first.inspectRun({ runId: row.runId })).resolves.toMatchObject({
+      state: {
+        type: "failed",
+        retrySequenceKind: "plan_generation",
+        failure: { category: "model_contract", code: "invalid_research_plan" },
+        retryAttempts: [expect.objectContaining({
+          attemptNumber: 1,
+          outcome: "permanent_failure",
+        })],
+      },
+    });
+    first.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      ids,
+      clock,
+      retryPolicy,
+    });
+    try {
+      await expect(restarted.resumeRun({ runId: row.runId })).rejects.toThrow();
+      expect(planCalls).toBe(1);
+      const trace = await restarted.traceRun({ runId: row.runId });
+      expect(trace.events.slice(-2)).toEqual([
+        expect.objectContaining({
+          type: "retry_attempt_failed",
+          attemptOutcome: "permanent_failure",
+          failureCode: "invalid_research_plan",
+        }),
+        expect.objectContaining({
+          type: "run_failed",
+          retrySequenceKind: "plan_generation",
+          failureCode: "invalid_research_plan",
+        }),
+      ]);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("persists a permanent planning provider failure as a terminal Run", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-plan-permanent-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-plan-permanent-source-");
+    let planCalls = 0;
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      model: {
+        proposePlan: async () => {
+          planCalls += 1;
+          throw new Error("secret planning provider payload");
+        },
+        proposeLearningArtifact: async () => {
+          throw new Error("测试不生成 artifact");
+        },
+      },
+      ids: sequentialIds(),
+      clock: incrementingClock(),
+      retryPolicy: {
+        version: "retry-plan-permanent-v1",
+        modelMaxAttempts: 3,
+        toolMaxAttempts: 2,
+        baseDelayMs: 10,
+        maxDelayMs: 50,
+      },
+    });
+    try {
+      await expect(runtime.createRun({
+        question: "永久 planning failure 如何结算？",
+        sourceScope: {
+          roots: [sourceRoot],
+          exclusions: [],
+          allowedExtensions: [".md"],
+          maxFileBytes: 4_096,
+          maxTotalBytes: 4_096,
+        },
+        runBudget: generousBudget(),
+      })).rejects.toThrow();
+      const database = new Database(join(runtimeHome, "runtime.sqlite"));
+      const row = database.prepare("SELECT run_id AS runId FROM runs").get() as {
+        /** provider permanent failure 后保留的 Research Run identity。 */
+        readonly runId: string;
+      };
+      database.close();
+      const failed = await runtime.inspectRun({ runId: row.runId });
+      expect(failed.state).toMatchObject({
+        type: "failed",
+        retrySequenceKind: "plan_generation",
+        failure: { category: "model_permanent", code: "model_generation_failed" },
+        retryAttempts: [expect.objectContaining({ outcome: "permanent_failure" })],
+      });
+      expect(planCalls).toBe(1);
+      expect(JSON.stringify(failed)).not.toContain("secret planning provider payload");
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("retries transient Learning Artifact proposal without duplicating the logical proposal", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-artifact-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-artifact-source-");
+    const outputRoot = await createTemporaryDirectory("retry-artifact-output-");
+    await writeFile(
+      join(sourceRoot, "journal.md"),
+      "Run Journal 是 canonical history。\n",
+      "utf8",
+    );
+    let proposalCalls = 0;
+    const model: ModelPort = {
+      proposePlan: async () => ({
+        title: "形成可发布 Claim",
+        objectives: ["验证 artifact proposal retry"],
+        steps: [{ id: "step-1", description: "读取 journal.md" }],
+      }),
+      proposeLearningArtifact: async (request) => {
+        proposalCalls += 1;
+        if (proposalCalls === 1) {
+          throw new InfrastructureFailureError("service_unavailable");
+        }
+        return {
+          title: "可恢复 draft",
+          summary: "瞬时失败不会产生第二个逻辑 draft。",
+          claimIds: [request.claims[0]?.claimId ?? "missing-claim"],
+        };
+      },
+    };
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      outputRoot,
+      model,
+      evaluator: {
+        identity: {
+          provider: "scripted",
+          model: "scripted-evaluator",
+          promptVersion: "evaluator-v1",
+        },
+        reviewClaims: async (request) => ({
+          verdicts: request.claims.map((claim) => ({
+            claimId: claim.claimId,
+            verdict: "supported" as const,
+          })),
+        }),
+      },
+      retryPolicy: {
+        version: "retry-v1",
+        modelMaxAttempts: 2,
+        toolMaxAttempts: 2,
+        baseDelayMs: 5,
+        maxDelayMs: 20,
+      },
+      retryScheduler: { wait: async () => undefined },
+    });
+
+    try {
+      const waiting = await runtime.createRun({
+        question: "Artifact proposal 如何安全重试？",
+        sourceScope: {
+          roots: [sourceRoot],
+          exclusions: [],
+          allowedExtensions: [".md"],
+          maxFileBytes: 4_096,
+          maxTotalBytes: 4_096,
+        },
+        runBudget: generousBudget(),
+      });
+      if (waiting.state.type !== "waiting_plan_approval") {
+        throw new Error("测试要求等待计划审批");
+      }
+      await runtime.approvePlan({
+        runId: waiting.runId,
+        bindingHash: waiting.state.approvalBinding.bindingHash,
+      });
+      const read = await runtime.readSource({
+        runId: waiting.runId,
+        request: {
+          rootIndex: 0,
+          relativePath: "journal.md",
+          startLine: 1,
+          endLine: 1,
+        },
+      });
+      if (read.state.type !== "researching") throw new Error("需要 researching");
+      const observation = read.state.sourceReadObservations[0];
+      if (observation?.status !== "succeeded") throw new Error("需要 read success");
+      const evidenced = await runtime.recordEvidence({
+        runId: waiting.runId,
+        observationId: observation.observationId,
+      });
+      if (evidenced.state.type !== "researching") throw new Error("需要 Evidence");
+      const evidence = evidenced.state.evidenceRecords[0];
+      if (evidence === undefined) throw new Error("需要 Evidence Record");
+      await runtime.recordClaim({
+        runId: waiting.runId,
+        kind: "source_fact",
+        text: "Run Journal 是 canonical history。",
+        evidenceIds: [evidence.evidenceId],
+      });
+      const draft = await runtime.proposeLearningArtifact({
+        runId: waiting.runId,
+        targetPath: join(outputRoot, "report.md"),
+      });
+      expect(draft.state.type).toBe("waiting_publication_approval");
+      expect(proposalCalls).toBe(2);
+      const trace = await runtime.traceRun({ runId: waiting.runId });
+      expect(trace.events.filter((event) =>
+        event.retrySequenceKind === "artifact_proposal"
+      )).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "retry_attempt_failed",
+          attemptNumber: 1,
+          attemptOutcome: "retryable_failure",
+        }),
+        expect.objectContaining({
+          type: "learning_artifact_draft_proposed",
+          attemptNumber: 2,
+          attemptOutcome: "succeeded",
+        }),
+      ]));
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("recovers an interrupted Artifact proposal after restart without replaying the interrupted I/O", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-artifact-restart-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-artifact-restart-source-");
+    const outputRoot = await createTemporaryDirectory("retry-artifact-restart-output-");
+    await writeFile(
+      join(sourceRoot, "journal.md"),
+      "Run Journal 是 canonical history。\n",
+      "utf8",
+    );
+    const policy = {
+      version: "retry-artifact-restart-v1",
+      modelMaxAttempts: 3,
+      toolMaxAttempts: 2,
+      baseDelayMs: 5,
+      maxDelayMs: 20,
+    } as const;
+    const ids = sequentialIds();
+    const clock = incrementingClock();
+    let interrupt = true;
+    let proposalCalls = 0;
+    const model: ModelPort = {
+      proposePlan: async () => ({
+        title: "恢复 Artifact proposal",
+        objectives: ["重启后不重放 interrupted I/O"],
+        steps: [{ id: "step-1", description: "形成 exact draft" }],
+      }),
+      proposeLearningArtifact: async (request) => {
+        proposalCalls += 1;
+        return {
+          title: "恢复后的 draft",
+          summary: "Interrupted attempt 已闭合后才执行新 attempt。",
+          claimIds: [request.claims[0]?.claimId ?? "missing-claim"],
+        };
+      },
+    };
+    const evaluator = {
+      identity: {
+        provider: "scripted",
+        model: "scripted-evaluator",
+        promptVersion: "evaluator-v1",
+      },
+      reviewClaims: async (request: import("../../src/index.js").EvaluatorReviewRequest) => ({
+        verdicts: request.claims.map((claim) => ({
+          claimId: claim.claimId,
+          verdict: "supported" as const,
+        })),
+      }),
+    };
+    const first = ResearchAgentRuntime.open({
+      runtimeHome,
+      outputRoot,
+      model,
+      evaluator,
+      ids,
+      clock,
+      retryPolicy: policy,
+      retryScheduler: { wait: async () => undefined },
+      researchLoopHooks: {
+        afterArtifactRetryAttemptStarted: () => {
+          if (!interrupt) return;
+          interrupt = false;
+          throw new Error("模拟 Artifact provider I/O 前中断");
+        },
+      },
+    });
+    const waiting = await first.createRun({
+      question: "Artifact proposal 中断后如何恢复？",
+      sourceScope: {
+        roots: [sourceRoot],
+        exclusions: [],
+        allowedExtensions: [".md"],
+        maxFileBytes: 4_096,
+        maxTotalBytes: 4_096,
+      },
+      runBudget: generousBudget(),
+    });
+    if (waiting.state.type !== "waiting_plan_approval") {
+      throw new Error("测试要求等待计划审批");
+    }
+    await first.approvePlan({
+      runId: waiting.runId,
+      bindingHash: waiting.state.approvalBinding.bindingHash,
+    });
+    const read = await first.readSource({
+      runId: waiting.runId,
+      request: {
+        rootIndex: 0,
+        relativePath: "journal.md",
+        startLine: 1,
+        endLine: 1,
+      },
+    });
+    if (read.state.type !== "researching") throw new Error("需要 researching");
+    const observation = read.state.sourceReadObservations[0];
+    if (observation?.status !== "succeeded") throw new Error("需要 read success");
+    const evidenced = await first.recordEvidence({
+      runId: waiting.runId,
+      observationId: observation.observationId,
+    });
+    if (evidenced.state.type !== "researching") throw new Error("需要 Evidence");
+    const evidence = evidenced.state.evidenceRecords[0];
+    if (evidence === undefined) throw new Error("需要 Evidence Record");
+    await first.recordClaim({
+      runId: waiting.runId,
+      kind: "source_fact",
+      text: "Run Journal 是 canonical history。",
+      evidenceIds: [evidence.evidenceId],
+    });
+    const targetPath = join(outputRoot, "restart.md");
+    await expect(first.proposeLearningArtifact({
+      runId: waiting.runId,
+      targetPath,
+    })).rejects.toMatchObject({ name: "LearningArtifactDraftError" });
+    expect(proposalCalls).toBe(0);
+    const interrupted = await first.inspectRun({ runId: waiting.runId });
+    expect(interrupted.state).toMatchObject({
+      type: "researching",
+      retryAttempts: [expect.objectContaining({
+        retrySequenceKind: "artifact_proposal",
+        attemptNumber: 1,
+        outcome: "in_progress",
+      })],
+    });
+    first.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome,
+      outputRoot,
+      model,
+      evaluator,
+      ids,
+      clock,
+      retryPolicy: policy,
+      retryScheduler: { wait: async () => undefined },
+    });
+    try {
+      const draft = await restarted.proposeLearningArtifact({
+        runId: waiting.runId,
+        targetPath,
+      });
+      expect(draft.state.type).toBe("waiting_publication_approval");
+      expect(proposalCalls).toBe(1);
+      const trace = await restarted.traceRun({ runId: waiting.runId });
+      const attempts = trace.events.filter((event) =>
+        event.retrySequenceKind === "artifact_proposal"
+      );
+      expect(attempts).toEqual([
+        expect.objectContaining({
+          type: "retry_attempt_started",
+          attemptNumber: 1,
+          attemptOutcome: "in_progress",
+        }),
+        expect.objectContaining({
+          type: "retry_attempt_failed",
+          attemptNumber: 1,
+          attemptOutcome: "retryable_failure",
+          failureCode: "artifact_proposal_interrupted",
+        }),
+        expect.objectContaining({
+          type: "retry_attempt_started",
+          attemptNumber: 2,
+          attemptOutcome: "in_progress",
+        }),
+        expect.objectContaining({
+          type: "learning_artifact_draft_proposed",
+          attemptNumber: 2,
+          attemptOutcome: "succeeded",
+        }),
+      ]);
+      expect(new Set(attempts.map((event) => event.retrySequenceId)).size).toBe(1);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("suspends artifact proposal after the frozen retry limit and rejects a fresh sequence", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-artifact-exhausted-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-artifact-exhausted-source-");
+    const outputRoot = await createTemporaryDirectory("retry-artifact-exhausted-output-");
+    await writeFile(
+      join(sourceRoot, "journal.md"),
+      "Run Journal 是 canonical history。\n",
+      "utf8",
+    );
+    let proposalCalls = 0;
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      outputRoot,
+      model: {
+        proposePlan: async () => ({
+          title: "验证 proposal exhaustion",
+          objectives: ["达到冻结上限后暂停"],
+          steps: [{ id: "step-1", description: "形成 Claim" }],
+        }),
+        proposeLearningArtifact: async () => {
+          proposalCalls += 1;
+          throw new InfrastructureFailureError("service_unavailable");
+        },
+      },
+      retryPolicy: {
+        version: "retry-artifact-exhausted-v1",
+        modelMaxAttempts: 2,
+        toolMaxAttempts: 2,
+        baseDelayMs: 5,
+        maxDelayMs: 20,
+      },
+      retryScheduler: { wait: async () => undefined },
+    });
+    try {
+      const waiting = await runtime.createRun({
+        question: "Artifact proposal 耗尽后会怎样？",
+        sourceScope: {
+          roots: [sourceRoot],
+          exclusions: [],
+          allowedExtensions: [".md"],
+          maxFileBytes: 4_096,
+          maxTotalBytes: 4_096,
+        },
+        runBudget: generousBudget(),
+      });
+      if (waiting.state.type !== "waiting_plan_approval") {
+        throw new Error("测试要求等待计划审批");
+      }
+      await runtime.approvePlan({
+        runId: waiting.runId,
+        bindingHash: waiting.state.approvalBinding.bindingHash,
+      });
+      const read = await runtime.readSource({
+        runId: waiting.runId,
+        request: {
+          rootIndex: 0,
+          relativePath: "journal.md",
+          startLine: 1,
+          endLine: 1,
+        },
+      });
+      if (read.state.type !== "researching") throw new Error("需要 researching");
+      const observation = read.state.sourceReadObservations[0];
+      if (observation?.status !== "succeeded") throw new Error("需要 read success");
+      const evidenced = await runtime.recordEvidence({
+        runId: waiting.runId,
+        observationId: observation.observationId,
+      });
+      if (evidenced.state.type !== "researching") throw new Error("需要 Evidence");
+      const evidence = evidenced.state.evidenceRecords[0];
+      if (evidence === undefined) throw new Error("需要 Evidence Record");
+      await runtime.recordClaim({
+        runId: waiting.runId,
+        kind: "source_fact",
+        text: "Run Journal 是 canonical history。",
+        evidenceIds: [evidence.evidenceId],
+      });
+      const targetPath = join(outputRoot, "exhausted.md");
+      await expect(runtime.proposeLearningArtifact({
+        runId: waiting.runId,
+        targetPath,
+      })).rejects.toThrow();
+      const suspended = await runtime.inspectRun({ runId: waiting.runId });
+      expect(suspended.state).toMatchObject({
+        type: "retry_exhausted",
+        retrySequenceKind: "artifact_proposal",
+        attemptsUsed: 2,
+      });
+      await expect(runtime.proposeLearningArtifact({
+        runId: waiting.runId,
+        targetPath,
+      })).rejects.toMatchObject({ name: "IllegalLearningArtifactStateError" });
+      expect(proposalCalls).toBe(2);
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("closes Artifact proposal exhaustion from research_complete without losing completion", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-artifact-complete-exhausted-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-artifact-complete-exhausted-source-");
+    const outputRoot = await createTemporaryDirectory("retry-artifact-complete-exhausted-output-");
+    await writeFile(join(sourceRoot, "journal.md"), "Run Journal 是 canonical history。\n", "utf8");
+    let proposalCalls = 0;
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      outputRoot,
+      model: {
+        proposePlan: async () => ({
+          title: "完成后 proposal exhaustion",
+          objectives: ["保留 research completion"],
+          steps: [{ id: "step-1", description: "形成 Claim 并完成研究" }],
+        }),
+        proposeLearningArtifact: async () => {
+          proposalCalls += 1;
+          throw new InfrastructureFailureError("service_unavailable");
+        },
+        generateResearchTurn: async () => ({
+          text: "证据已齐，完成研究。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [{
+            intentId: "complete-artifact-exhaustion",
+            name: "complete_research",
+            input: { unresolvedQuestions: ["provider unavailable"] },
+          }],
+        }),
+      },
+      retryPolicy: {
+        version: "retry-artifact-complete-exhausted-v1",
+        modelMaxAttempts: 2,
+        toolMaxAttempts: 2,
+        baseDelayMs: 5,
+        maxDelayMs: 20,
+      },
+      retryScheduler: { wait: async () => undefined },
+      ids: sequentialIds(),
+      clock: incrementingClock(),
+    });
+    try {
+      const runId = await createClaimedRun(runtime, sourceRoot);
+      await expect(runtime.advanceResearch({ runId })).resolves.toMatchObject({
+        state: { type: "research_complete" },
+      });
+      await expect(runtime.proposeLearningArtifact({
+        runId,
+        targetPath: join(outputRoot, "exhausted.md"),
+      })).rejects.toThrow();
+      await expect(runtime.inspectRun({ runId })).resolves.toMatchObject({
+        state: {
+          type: "retry_exhausted",
+          retrySequenceKind: "artifact_proposal",
+          attemptsUsed: 2,
+          completion: { unresolvedQuestions: ["provider unavailable"] },
+          retryAttempts: expect.arrayContaining([
+            expect.objectContaining({ outcome: "retryable_failure" }),
+            expect.objectContaining({ outcome: "retry_exhausted" }),
+          ]),
+        },
+      });
+      expect(proposalCalls).toBe(2);
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("closes a permanent Artifact proposal failure from research_complete", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-artifact-complete-permanent-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-artifact-complete-permanent-source-");
+    const outputRoot = await createTemporaryDirectory("retry-artifact-complete-permanent-output-");
+    await writeFile(join(sourceRoot, "journal.md"), "Run Journal 是 canonical history。\n", "utf8");
+    let proposalCalls = 0;
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      outputRoot,
+      model: {
+        proposePlan: async () => ({
+          title: "完成后 permanent proposal failure",
+          objectives: ["进入明确 failed 终态"],
+          steps: [{ id: "step-1", description: "形成 Claim 并完成研究" }],
+        }),
+        proposeLearningArtifact: async () => {
+          proposalCalls += 1;
+          throw new Error("secret artifact provider payload");
+        },
+        generateResearchTurn: async () => ({
+          text: "完成研究。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [{
+            intentId: "complete-artifact-permanent",
+            name: "complete_research",
+            input: { unresolvedQuestions: [] },
+          }],
+        }),
+      },
+      retryPolicy: {
+        version: "retry-artifact-complete-permanent-v1",
+        modelMaxAttempts: 2,
+        toolMaxAttempts: 2,
+        baseDelayMs: 5,
+        maxDelayMs: 20,
+      },
+      ids: sequentialIds(),
+      clock: incrementingClock(),
+    });
+    try {
+      const runId = await createClaimedRun(runtime, sourceRoot);
+      await runtime.advanceResearch({ runId });
+      await expect(runtime.proposeLearningArtifact({
+        runId,
+        targetPath: join(outputRoot, "failed.md"),
+      })).rejects.toThrow();
+      const failed = await runtime.inspectRun({ runId });
+      expect(failed.state).toMatchObject({
+        type: "failed",
+        retrySequenceKind: "artifact_proposal",
+        completion: { unresolvedQuestions: [] },
+        failure: { category: "model_permanent", code: "model_generation_failed" },
+        retryAttempts: expect.arrayContaining([
+          expect.objectContaining({ outcome: "permanent_failure" }),
+        ]),
+      });
+      expect(proposalCalls).toBe(1);
+      expect(JSON.stringify(failed)).not.toContain("secret artifact provider payload");
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("suspends before the next Artifact proposal attempt when backoff exhausts wall time", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-artifact-wall-time-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-artifact-wall-time-source-");
+    const outputRoot = await createTemporaryDirectory("retry-artifact-wall-time-output-");
+    await writeFile(join(sourceRoot, "journal.md"), "Run Journal 是 canonical history。\n", "utf8");
+    let elapsedMs = 0;
+    let proposalCalls = 0;
+    const clock: Clock = {
+      now: () => new Date(Date.UTC(2026, 7, 12, 8, 0, 0, elapsedMs)).toISOString(),
+    };
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      outputRoot,
+      model: {
+        proposePlan: async () => ({
+          title: "Artifact backoff budget",
+          objectives: ["下一 provider I/O 前暂停"],
+          steps: [{ id: "step-1", description: "形成 Claim" }],
+        }),
+        proposeLearningArtifact: async (request) => {
+          proposalCalls += 1;
+          if (proposalCalls === 1) {
+            throw new InfrastructureFailureError("rate_limited", {
+              retryAfterMs: 10,
+            });
+          }
+          return {
+            title: "不应生成",
+            summary: "第二次 provider I/O 不应发生。",
+            claimIds: [request.claims[0]?.claimId ?? "missing"],
+          };
+        },
+      },
+      retryPolicy: {
+        version: "retry-artifact-wall-time-v1",
+        modelMaxAttempts: 3,
+        toolMaxAttempts: 2,
+        baseDelayMs: 10,
+        maxDelayMs: 20,
+      },
+      retryScheduler: {
+        wait: async (delayMs) => {
+          elapsedMs += delayMs;
+        },
+      },
+      ids: sequentialIds(),
+      clock,
+    });
+    try {
+      const waiting = await runtime.createRun({
+        question: "Artifact retry backoff 是否服从 wall-time？",
+        sourceScope: {
+          roots: [sourceRoot],
+          exclusions: [],
+          allowedExtensions: [".md"],
+          maxFileBytes: 4_096,
+          maxTotalBytes: 4_096,
+        },
+        runBudget: { ...generousBudget(), maxWallTimeMs: 5 },
+      });
+      if (waiting.state.type !== "waiting_plan_approval") {
+        throw new Error("测试要求等待计划审批");
+      }
+      await runtime.approvePlan({
+        runId: waiting.runId,
+        bindingHash: waiting.state.approvalBinding.bindingHash,
+      });
+      const read = await runtime.readSource({
+        runId: waiting.runId,
+        request: {
+          rootIndex: 0,
+          relativePath: "journal.md",
+          startLine: 1,
+          endLine: 1,
+        },
+      });
+      if (read.state.type !== "researching") throw new Error("需要 researching");
+      const observation = read.state.sourceReadObservations[0];
+      if (observation?.status !== "succeeded") throw new Error("需要 read success");
+      const evidenced = await runtime.recordEvidence({
+        runId: waiting.runId,
+        observationId: observation.observationId,
+      });
+      if (evidenced.state.type !== "researching") throw new Error("需要 Evidence");
+      const evidence = evidenced.state.evidenceRecords[0];
+      if (evidence === undefined) throw new Error("需要 Evidence Record");
+      await runtime.recordClaim({
+        runId: waiting.runId,
+        kind: "source_fact",
+        text: "Run Journal 是 canonical history。",
+        evidenceIds: [evidence.evidenceId],
+      });
+      await expect(runtime.proposeLearningArtifact({
+        runId: waiting.runId,
+        targetPath: join(outputRoot, "wall-time.md"),
+      })).rejects.toThrow();
+      await expect(runtime.inspectRun({ runId: waiting.runId })).resolves.toMatchObject({
+        state: {
+          type: "budget_exhausted",
+          exhaustedDimension: "wall_time",
+          retryAttempts: [expect.objectContaining({
+            retrySequenceKind: "artifact_proposal",
+            outcome: "retryable_failure",
+          })],
+        },
+      });
+      expect(proposalCalls).toBe(1);
+      expect(elapsedMs).toBe(5);
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("closes a successful but schema-invalid Artifact proposal attempt with the repair fact", async () => {
+    const runtimeHome = await createTemporaryDirectory("retry-artifact-invalid-runtime-");
+    const sourceRoot = await createTemporaryDirectory("retry-artifact-invalid-source-");
+    const outputRoot = await createTemporaryDirectory("retry-artifact-invalid-output-");
+    await writeFile(
+      join(sourceRoot, "journal.md"),
+      "Run Journal 是 canonical history。\n",
+      "utf8",
+    );
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      outputRoot,
+      model: {
+        proposePlan: async () => ({
+          title: "验证无效 proposal attempt",
+          objectives: ["完成 attempt 不能被误报为 interrupted"],
+          steps: [{ id: "step-1", description: "形成 Claim" }],
+        }),
+        proposeLearningArtifact: async () => ({
+          title: "无效 draft",
+          summary: "第一句。第二句。",
+          claimIds: ["missing-claim"],
+        }),
+        generateResearchTurn: async () => ({
+          text: "证据已齐，显式完成研究。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [{
+            intentId: "complete-invalid-proposal",
+            name: "complete_research",
+            input: { unresolvedQuestions: [] },
+          }],
+        }),
+      },
+      retryPolicy: {
+        version: "retry-artifact-invalid-v1",
+        modelMaxAttempts: 2,
+        toolMaxAttempts: 2,
+        baseDelayMs: 5,
+        maxDelayMs: 20,
+      },
+      retryScheduler: { wait: async () => undefined },
+    });
+    try {
+      const waiting = await runtime.createRun({
+        question: "无效 Artifact proposal 如何计账？",
+        sourceScope: {
+          roots: [sourceRoot],
+          exclusions: [],
+          allowedExtensions: [".md"],
+          maxFileBytes: 4_096,
+          maxTotalBytes: 4_096,
+        },
+        runBudget: generousBudget(),
+      });
+      if (waiting.state.type !== "waiting_plan_approval") {
+        throw new Error("测试要求等待计划审批");
+      }
+      await runtime.approvePlan({
+        runId: waiting.runId,
+        bindingHash: waiting.state.approvalBinding.bindingHash,
+      });
+      const read = await runtime.readSource({
+        runId: waiting.runId,
+        request: {
+          rootIndex: 0,
+          relativePath: "journal.md",
+          startLine: 1,
+          endLine: 1,
+        },
+      });
+      if (read.state.type !== "researching") throw new Error("需要 researching");
+      const observation = read.state.sourceReadObservations[0];
+      if (observation?.status !== "succeeded") throw new Error("需要 read success");
+      const evidenced = await runtime.recordEvidence({
+        runId: waiting.runId,
+        observationId: observation.observationId,
+      });
+      if (evidenced.state.type !== "researching") throw new Error("需要 Evidence");
+      const evidence = evidenced.state.evidenceRecords[0];
+      if (evidence === undefined) throw new Error("需要 Evidence Record");
+      await runtime.recordClaim({
+        runId: waiting.runId,
+        kind: "source_fact",
+        text: "Run Journal 是 canonical history。",
+        evidenceIds: [evidence.evidenceId],
+      });
+      const complete = await runtime.advanceResearch({ runId: waiting.runId });
+      expect(complete.state.type).toBe("research_complete");
+      await expect(runtime.proposeLearningArtifact({
+        runId: waiting.runId,
+        targetPath: join(outputRoot, "invalid.md"),
+      })).rejects.toThrow();
+      const projection = await runtime.inspectRun({ runId: waiting.runId });
+      expect(projection.state).toMatchObject({
+        type: "researching",
+        evidenceGateRepairs: [expect.objectContaining({
+          code: "proposal_invalid",
+          artifactProposalTurnConsumed: true,
+        })],
+        retryAttempts: expect.arrayContaining([expect.objectContaining({
+          retrySequenceKind: "artifact_proposal",
+          outcome: "succeeded",
+        })]),
+      });
+    } finally {
+      runtime.close();
+    }
+  });
+
   it("retries a transient Model Turn with the provider hint without creating another logical turn", async () => {
     const runtimeHome = await createTemporaryDirectory("retry-model-runtime-");
     const sourceRoot = await createTemporaryDirectory("retry-model-source-");
@@ -700,6 +1868,277 @@ describe("ResearchAgentRuntime retry policy", () => {
       await expect(restarted.advanceResearch({ runId: waiting.runId }))
         .resolves.toMatchObject({ state: { type: "research_complete" } });
       expect(generationCalls).toBe(1);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("does not replay a default Model Turn after its commit window is interrupted", async () => {
+    const runtimeHome = await createTemporaryDirectory("default-model-commit-runtime-");
+    const sourceRoot = await createTemporaryDirectory("default-model-commit-source-");
+    const ids = sequentialIds();
+    const clock = incrementingClock();
+    let generationCalls = 0;
+    let interrupt = true;
+    const model = completingModel(() => {
+      generationCalls += 1;
+    });
+    const first = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      ids,
+      clock,
+      researchLoopHooks: {
+        beforeModelTurnJournalAppend: () => {
+          if (!interrupt) return;
+          interrupt = false;
+          throw new Error("模拟默认 Model Turn commit 前中断");
+        },
+      },
+    });
+    const waiting = await createWaitingRun(first, sourceRoot);
+    await first.approvePlan({
+      runId: waiting.runId,
+      bindingHash: waiting.bindingHash,
+    });
+    await expect(first.advanceResearch({ runId: waiting.runId }))
+      .rejects.toMatchObject({ name: "ResearchLoopError" });
+    await expect(first.inspectRun({ runId: waiting.runId })).resolves.toMatchObject({
+      state: {
+        type: "researching",
+        modelTurns: [],
+        retryAttempts: [expect.objectContaining({
+          retrySequenceKind: "model_turn",
+          retryPolicy: expect.objectContaining({ version: "retry-disabled-v1" }),
+          outcome: "in_progress",
+        })],
+      },
+    });
+    expect(generationCalls).toBe(1);
+    first.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      ids,
+      clock,
+    });
+    try {
+      await expect(restarted.advanceResearch({ runId: waiting.runId })).resolves.toMatchObject({
+        state: {
+          type: "retry_exhausted",
+          retrySequenceKind: "model_turn",
+          failure: {
+            category: "infrastructure_transient",
+            code: "model_turn_interrupted",
+          },
+        },
+      });
+      expect(generationCalls).toBe(1);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("does not replay a default serial Search after its commit window is interrupted", async () => {
+    const runtimeHome = await createTemporaryDirectory("default-search-commit-runtime-");
+    const sourceRoot = await createTemporaryDirectory("default-search-commit-source-");
+    const ids = sequentialIds();
+    const clock = incrementingClock();
+    let modelCalls = 0;
+    let searchCalls = 0;
+    let interrupt = true;
+    const model: ModelPort = {
+      ...completingModel(() => undefined),
+      generateResearchTurn: async () => {
+        modelCalls += 1;
+        return {
+          text: "搜索。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [{
+            intentId: "search",
+            name: "search_sources",
+            input: { query: "canonical", maxResults: 1 },
+          }],
+        };
+      },
+    };
+    const first = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      sourceSearch: {
+        search: async () => {
+          searchCalls += 1;
+          return [];
+        },
+      },
+      ids,
+      clock,
+      researchLoopHooks: {
+        afterSearchResultArtifactWrite: () => {
+          if (!interrupt) return;
+          interrupt = false;
+          throw new Error("模拟默认 Search commit 前中断");
+        },
+      },
+    });
+    const waiting = await createWaitingRun(first, sourceRoot);
+    await first.approvePlan({
+      runId: waiting.runId,
+      bindingHash: waiting.bindingHash,
+    });
+    await expect(first.advanceResearch({ runId: waiting.runId }))
+      .rejects.toMatchObject({ name: "ResearchLoopError" });
+    await expect(first.inspectRun({ runId: waiting.runId })).resolves.toMatchObject({
+      state: {
+        type: "researching",
+        retryAttempts: [
+          expect.objectContaining({ retrySequenceKind: "model_turn", outcome: "succeeded" }),
+          expect.objectContaining({
+            retrySequenceKind: "search_sources",
+            retryPolicy: expect.objectContaining({ version: "retry-disabled-v1" }),
+            outcome: "in_progress",
+          }),
+        ],
+      },
+    });
+    expect(modelCalls).toBe(1);
+    expect(searchCalls).toBe(1);
+    first.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      sourceSearch: {
+        search: async () => {
+          searchCalls += 1;
+          return [];
+        },
+      },
+      ids,
+      clock,
+    });
+    try {
+      await expect(restarted.advanceResearch({ runId: waiting.runId })).resolves.toMatchObject({
+        state: {
+          type: "retry_exhausted",
+          retrySequenceKind: "search_sources",
+          failure: {
+            category: "infrastructure_transient",
+            code: "search_interrupted",
+          },
+        },
+      });
+      expect(modelCalls).toBe(1);
+      expect(searchCalls).toBe(1);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("does not replay a default batched Search after its commit window is interrupted", async () => {
+    const runtimeHome = await createTemporaryDirectory("default-batch-search-runtime-");
+    const sourceRoot = await createTemporaryDirectory("default-batch-search-source-");
+    const ids = sequentialIds();
+    const clock = incrementingClock();
+    let modelCalls = 0;
+    let searchCalls = 0;
+    let interrupt = true;
+    const model: ModelPort = {
+      ...completingModel(() => undefined),
+      generateResearchTurn: async () => {
+        modelCalls += 1;
+        return {
+          text: "并发搜索。",
+          evidenceGaps: [],
+          finishReason: "tool_calls",
+          toolIntents: [
+            {
+              intentId: "search-1",
+              name: "search_sources",
+              input: { query: "canonical", maxResults: 1 },
+            },
+            {
+              intentId: "search-2",
+              name: "search_sources",
+              input: { query: "projection", maxResults: 1 },
+            },
+          ],
+        };
+      },
+    };
+    const first = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      sourceSearch: {
+        search: async () => {
+          searchCalls += 1;
+          return [];
+        },
+      },
+      ids,
+      clock,
+      safeReadConcurrency: 1,
+      researchLoopHooks: {
+        afterSearchResultArtifactWrite: () => {
+          if (!interrupt) return;
+          interrupt = false;
+          throw new Error("模拟默认 batched Search commit 前中断");
+        },
+      },
+    });
+    const waiting = await createWaitingRun(first, sourceRoot);
+    await first.approvePlan({
+      runId: waiting.runId,
+      bindingHash: waiting.bindingHash,
+    });
+    await expect(first.advanceResearch({ runId: waiting.runId }))
+      .rejects.toThrow();
+    await expect(first.inspectRun({ runId: waiting.runId })).resolves.toMatchObject({
+      state: {
+        type: "researching",
+        retryAttempts: [
+          expect.objectContaining({ retrySequenceKind: "model_turn", outcome: "succeeded" }),
+          expect.objectContaining({
+            retrySequenceKind: "search_sources",
+            intentId: "search-1",
+            retryPolicy: expect.objectContaining({ version: "retry-disabled-v1" }),
+            outcome: "in_progress",
+          }),
+        ],
+      },
+    });
+    expect(modelCalls).toBe(1);
+    expect(searchCalls).toBe(1);
+    first.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome,
+      model,
+      sourceSearch: {
+        search: async () => {
+          searchCalls += 1;
+          return [];
+        },
+      },
+      ids,
+      clock,
+      safeReadConcurrency: 1,
+    });
+    try {
+      await expect(restarted.advanceResearch({ runId: waiting.runId })).resolves.toMatchObject({
+        state: {
+          type: "retry_exhausted",
+          retrySequenceKind: "search_sources",
+          failure: {
+            category: "infrastructure_transient",
+            code: "search_interrupted",
+          },
+        },
+      });
+      expect(modelCalls).toBe(1);
+      expect(searchCalls).toBe(1);
     } finally {
       restarted.close();
     }
@@ -2131,6 +3570,43 @@ async function createWaitingRun(
     bindingHash: waiting.state.approvalBinding.bindingHash,
     approvalBinding: waiting.state.approvalBinding,
   };
+}
+
+async function createClaimedRun(
+  runtime: ResearchAgentRuntime,
+  sourceRoot: string,
+): Promise<string> {
+  const waiting = await createWaitingRun(runtime, sourceRoot);
+  await runtime.approvePlan({
+    runId: waiting.runId,
+    bindingHash: waiting.bindingHash,
+  });
+  const read = await runtime.readSource({
+    runId: waiting.runId,
+    request: {
+      rootIndex: 0,
+      relativePath: "journal.md",
+      startLine: 1,
+      endLine: 1,
+    },
+  });
+  if (read.state.type !== "researching") throw new Error("需要 researching");
+  const observation = read.state.sourceReadObservations[0];
+  if (observation?.status !== "succeeded") throw new Error("需要 read success");
+  const evidenced = await runtime.recordEvidence({
+    runId: waiting.runId,
+    observationId: observation.observationId,
+  });
+  if (evidenced.state.type !== "researching") throw new Error("需要 Evidence");
+  const evidence = evidenced.state.evidenceRecords[0];
+  if (evidence === undefined) throw new Error("需要 Evidence Record");
+  await runtime.recordClaim({
+    runId: waiting.runId,
+    kind: "source_fact",
+    text: "Run Journal 是 canonical history。",
+    evidenceIds: [evidence.evidenceId],
+  });
+  return waiting.runId;
 }
 
 /** 测试推进已进入计划审批边界的最小 durable identity。 */

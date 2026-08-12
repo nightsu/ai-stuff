@@ -19,6 +19,7 @@ import type {
   ResearchPlan,
   RunBudget,
   RunProjection,
+  ResearchRunState,
 } from "./domain/types.js";
 
 /** 让 CLI 测试可以捕获输出而不替换全局 console。 */
@@ -224,6 +225,7 @@ export async function runCli(
             json: { type: "boolean", default: false },
             "run-id": { type: "string" },
             "runtime-home": { type: "string" },
+            "tool-call-id": { type: "string" },
           },
         });
         const runtimeHome = resolve(values["runtime-home"] ?? ".runtime");
@@ -233,7 +235,12 @@ export async function runCli(
           model: new ScriptedModel([]),
         });
         try {
-          const trace = await runtime.traceRun({ runId });
+          const trace = await runtime.traceRun({
+            runId,
+            ...(values["tool-call-id"] === undefined
+              ? {}
+              : { toolCallId: values["tool-call-id"] }),
+          });
           io.stdout(formatRunTrace(trace, values.json ? "json" : "human"));
         } finally {
           runtime.close();
@@ -606,15 +613,53 @@ function createLearningPlan(question: string): ResearchPlan {
 }
 
 function formatProjection(projection: RunProjection, json: boolean): string {
+  const requiredNextAction = requiredNextActionForState(projection.state);
   if (json) {
-    return JSON.stringify(projection, null, 2);
+    return JSON.stringify({ ...projection, requiredNextAction }, null, 2);
   }
   return [
     `Run: ${projection.runId}`,
     `State: ${projection.state.type}`,
     `Question: ${projection.question}`,
     `Last event: #${projection.lastEventSequence}`,
+    `Next action: ${requiredNextAction}`,
   ].join("\n");
+}
+
+function requiredNextActionForState(state: ResearchRunState): string {
+  switch (state.type) {
+    case "created":
+      return "wait_for_plan";
+    case "planning":
+      return "resume";
+    case "waiting_plan_approval":
+      return "approve_plan";
+    case "researching":
+      return "advance";
+    case "research_complete":
+      return "propose_artifact";
+    case "waiting_evaluator_resolution":
+      return "retry_or_skip_evaluator";
+    case "waiting_publication_approval":
+      return "approve_publication";
+    case "ready_to_publish":
+    case "publication_pending":
+      return "publish";
+    case "publication_executing":
+    case "publication_unknown":
+    case "publication_conflict":
+      return "reconcile";
+    case "budget_exhausted":
+      return "extend_budget";
+    case "retry_exhausted":
+      return "inspect_retry_and_decide";
+    case "user_paused":
+      return "resume_or_cancel";
+    case "completed":
+    case "cancelled":
+    case "failed":
+      return "none";
+  }
 }
 
 function requireOption(value: string | undefined, name: string): string {

@@ -90,6 +90,7 @@ it("creates, inspects, approves, and traces one Run through process-like CLI cal
   expect(JSON.parse(output.pop() ?? "null")).toMatchObject({
     runId: created.runId,
     state: { type: "waiting_plan_approval" },
+    requiredNextAction: "approve_plan",
   });
 
   const approvalArgs = [
@@ -148,6 +149,133 @@ it("creates, inspects, approves, and traces one Run through process-like CLI cal
     ),
   ).toBe(0);
   expect(JSON.parse(output.pop() ?? "null")).toEqual({});
+  expect(errorOutput).toEqual([]);
+});
+
+it("shows a default permanent planning failure as terminal", async () => {
+  const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-planning-"));
+  runtimeHomes.push(runtimeHome);
+  const output: string[] = [];
+  const errorOutput: string[] = [];
+  const io = {
+    stdout: (line: string) => output.push(line),
+    stderr: (line: string) => errorOutput.push(line),
+  };
+  const runtime = ResearchAgentRuntime.open({
+    runtimeHome,
+    model: {
+      proposePlan: async () => {
+        throw new Error("simulated interrupted planning");
+      },
+      proposeLearningArtifact: async () => {
+        throw new Error("测试不生成 artifact");
+      },
+    },
+  });
+  await expect(runtime.createRun({
+    question: "中断 planning 后下一步是什么？",
+    sourceScope: {
+      roots: [runtimeHome],
+      exclusions: [],
+      allowedExtensions: [".md"],
+      maxFileBytes: 4_096,
+      maxTotalBytes: 4_096,
+    },
+    runBudget: {
+      version: "budget-v1",
+      maxModelTurns: 4,
+      maxToolCalls: 4,
+      maxDistinctSources: 2,
+      maxSourceBytes: 4_096,
+      maxWallTimeMs: 60_000,
+    },
+  })).rejects.toThrow();
+  const database = new (await import("better-sqlite3")).default(
+    join(runtimeHome, "runtime.sqlite"),
+  );
+  const row = database.prepare("SELECT run_id AS runId FROM runs").get() as {
+    /** CLI inspect 目标 Research Run identity。 */
+    readonly runId: string;
+  };
+  database.close();
+  runtime.close();
+
+  expect(await runCli([
+    "inspect",
+    "--runtime-home",
+    runtimeHome,
+    "--run-id",
+    row.runId,
+    "--json",
+  ], io)).toBe(0);
+  expect(JSON.parse(output.pop() ?? "null")).toMatchObject({
+    state: {
+      type: "failed",
+      retrySequenceKind: "plan_generation",
+      failure: {
+        category: "model_permanent",
+        code: "model_generation_failed",
+      },
+    },
+    requiredNextAction: "none",
+  });
+  expect(errorOutput).toEqual([]);
+});
+
+it("shows the required next action and filters Trace by exact tool-call identity", async () => {
+  const fixture = await createCliReadyPublicationRun("trace-filter.md");
+  const output: string[] = [];
+  const errorOutput: string[] = [];
+  const io = {
+    stdout: (line: string) => output.push(line),
+    stderr: (line: string) => errorOutput.push(line),
+  };
+  const runtime = ResearchAgentRuntime.open({
+    runtimeHome: fixture.runtimeHome,
+    outputRoot: fixture.outputRoot,
+    model: new ScriptedModel([]),
+  });
+  let toolCallId: string;
+  try {
+    const projection = await runtime.inspectRun({ runId: fixture.runId });
+    if (projection.state.type !== "ready_to_publish") {
+      throw new Error("测试要求 ready_to_publish Run");
+    }
+    toolCallId = projection.state.sourceReadObservations[0]?.toolCallId ?? "";
+  } finally {
+    runtime.close();
+  }
+
+  expect(await runCli([
+    "inspect",
+    "--runtime-home",
+    fixture.runtimeHome,
+    "--run-id",
+    fixture.runId,
+  ], io)).toBe(0);
+  expect(output.pop()).toContain("Next action: publish");
+
+  expect(await runCli([
+    "trace",
+    "--runtime-home",
+    fixture.runtimeHome,
+    "--run-id",
+    fixture.runId,
+    "--tool-call-id",
+    toolCallId,
+    "--json",
+  ], io)).toBe(0);
+  const trace = JSON.parse(output.pop() ?? "null") as {
+    /** 精确过滤后只保留匹配 lineage 的 Trace events。 */
+    events: Array<{
+      /** 当前 Trace event 绑定的 Research Tool call identity。 */
+      toolCallId?: string;
+    }>;
+  };
+  expect(trace.events.length).toBeGreaterThan(0);
+  expect(trace.events.every((event) => event.toolCallId === toolCallId)).toBe(
+    true,
+  );
   expect(errorOutput).toEqual([]);
 });
 

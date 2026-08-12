@@ -8,8 +8,8 @@
 | --- | --- | --- |
 | Journal / Projection transaction | event 与 artifact/snapshot registry 原子提交；缓存可从 Journal 重建；commit failure 不虚报 completed fact | `tests/runtime/research-agent-runtime.test.ts`、`tests/runtime/source-read.test.ts`、`tests/runtime/retry-policy.test.ts` |
 | Approval consumption | plan 与 publication Receipt 在 commit 前中断时不被消费；commit 后中断时保留 exact Receipt，重复命令返回同一 Projection 且不追加第二个 approval event | `tests/runtime/plan-approval.test.ts`、`tests/runtime/learning-artifact-publication.test.ts` |
-| Model stream / Model Turn | partial stream 在 cancel/error 时不进入 Journal；completed Model Turn commit 前可重试，commit 后不重采样；usage 与 Experiment Identity 只在完整结果后持久化 | `tests/runtime/live-model-port.test.ts`、`tests/runtime/research-loop.test.ts`、`tests/runtime/retry-policy.test.ts` |
-| Research Tool lifecycle | search/read 的 CAS-before-Journal 与 Journal-after-commit 边界、Evidence/Claim/completion 的 commit 前后边界均可重启恢复；已提交 intent 不重复执行 | `tests/runtime/research-loop.test.ts` |
+| Model stream / Model Turn | plan、Research Loop Turn 与 Artifact proposal 都在 provider I/O 前 durable start；partial/interrupted attempt 重启后先闭合再沿原 sequence 恢复，耗尽不新开序列；plan schema/Evaluator/draft CAS failure 也闭合已完成 attempt，非法 publication target 在 proposal 前拒绝；Artifact backoff 在下一 provider I/O 前服从 wall-time；completed Model Turn commit 后不重采样 | `tests/runtime/live-model-port.test.ts`、`tests/runtime/research-loop.test.ts`、`tests/runtime/retry-policy.test.ts`、`tests/runtime/learning-artifact-publication.test.ts` |
+| Research Tool lifecycle | search/read 的 CAS-before-Journal 与 Journal-after-commit 边界、Evidence/Claim/completion 的 commit 前后边界均有明确恢复结论；默认 Search commit-window 中断进入 `retry_exhausted` 且不盲目重放，显式 policy 才允许 retry，已提交 intent 不重复执行 | `tests/runtime/research-loop.test.ts`、`tests/runtime/retry-policy.test.ts` |
 | Run Operation lease | 同 Run mutation 互斥、read-only 与不同 Run 可并行；heartbeat、expiry、takeover 与 stale-owner fencing 不代替业务事实 | `tests/runtime/run-operation.test.ts` |
 | Cancel request | durable request 可跨 requester/owner 崩溃被下一命令消费；stream、pending tool、completed result 与 completion race 都保持 terminal cancellation 语义 | `tests/runtime/run-control.test.ts`、`tests/runtime/run-operation.test.ts` |
 | Parallel reads | sibling search/read 只在顺序 preflight 后并发；真实完成顺序进入 Journal，而 Projection/Model View 恢复模型 intent 顺序；预算 reservation 与 retry 各自隔离 | `tests/runtime/research-loop.test.ts` |
@@ -24,8 +24,8 @@
 | 新 Runtime 从同一 Runtime Home 重建全部测试 Run，completed Model Turn、tool call、Publication Effect 不盲目重跑 | Run Journal canonical、Projection rebuild、pending intent recovery、explicit reconciliation | 上述 Model/Tool/Publication 行；`pnpm check` |
 | fault matrix 覆盖 transaction、approval、stream、tool、lease、cancel、parallel、Gate、rename、reconcile | 本文件的 fault matrix；命名 lifecycle hooks | `tests/runtime/**` 与 `tests/infrastructure/**` |
 | realpath/symlink/secret/binary/size、approval invalidation、预算恢复、取消竞态、lease expiry、并行顺序、evidence lineage | Source policy、approval binding、Run Budget extension、cancel control plane、deterministic scheduler、Claim/Evidence model | `private-source-access.test.ts`、`source-scope-canonicalization.test.ts`、`run-control.test.ts`、`run-operation.test.ts`、`research-loop.test.ts`、`learning-artifact-publication.test.ts` |
-| 固定 fixture 重复运行真实 OpenAI-compatible model，并记录 identity、budget、cost、latency、verdict | `evals/fixtures/local-journal-plan-v1.json`、`evals/results/local-journal-plan-v1.json` | `pnpm build && pnpm eval:live`；已记录 Ollama `qwen3-coder:30b` 2/2 pass |
-| live eval 与 deterministic suite 分离，不依赖一次成功或 LLM judge | `eval:live` 不在 `check` 中；verdict 为 deterministic plan contract | `tests/evals/live-plan-eval.test.ts`、`package.json` |
+| 固定 fixture 重复运行真实 OpenAI-compatible model，并记录 identity、budget、Claim support、boundary violations、unnecessary tools、cost、latency、verdict 与重复可靠性 | `evals/fixtures/local-journal-plan-v1.json`、`evals/results/local-journal-plan-v1.json` | `pnpm build && pnpm eval:live`；deterministic research contract 不使用 LLM judge |
+| live eval 与 deterministic suite 分离，不依赖一次成功或 LLM judge | `eval:live` 不在 `check` 中；verdict 为 deterministic research contract | `tests/evals/live-plan-eval.test.ts`、`package.json` |
 | TypeScript 对象字段逐字段 TSDoc；中文注释解释不变量/取舍/失败路径 | 自动字段审计覆盖项目 `.ts/.tsx`；人工复核 runtime/CLI/eval 新控制流 | `tests/documentation/field-docs.test.ts`；code review |
 | 组件/端口、状态机、Claim/Evidence lineage、Publication Effect Mermaid 与代码一致 | `docs/architecture.md` 四幅图 | `tests/documentation/mermaid.test.ts` |
 | CLI 可创建、审批、推进、检查、trace、暂停、恢复、取消、publication approval、publish、reconcile | `run`、`approve-plan`、`advance`、`inspect`、`trace`、`operation`、`pause`、`resume`、`cancel`、`extend-budget`、`propose-artifact`、`retry-evaluator`、`skip-evaluator`、`approve-publication`、`publish`、`reconcile` | `tests/cli/cli.test.ts` 的 process-like graduation、isolated control、publish 与 crash-reconcile fixtures |
@@ -48,4 +48,4 @@ EVIDENCE_MODEL_NAME=qwen3-coder:30b \
 pnpm eval:live
 ```
 
-最后一次记录结果为 2/2 trials passed；latency 分别为 16,717 ms 与 4,913 ms。API charge 为 USD 0；本地硬件与电力未计量。adapter 当前没有从 plan generation 暴露 token usage，因此结果明确记录为 `unavailable`，不使用估算值。
+结果 schema v2 每个 trial 记录 plan + fixed-Evidence Research Turn、Claim support、boundary violations、unnecessary tool count 和聚合 pass rate。API charge 为 USD 0；本地硬件与电力未计量。adapter 当前没有从 plan generation 暴露 token usage，因此结果明确记录为 `unavailable`，不使用估算值。

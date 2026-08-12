@@ -78,6 +78,10 @@ describe("ResearchAgentRuntime source reads", () => {
     });
     const observation = onlySuccessfulObservation(updated);
     const trace = await restarted.traceRun({ runId: fixture.runId });
+    const filteredTrace = await restarted.traceRun({
+      runId: fixture.runId,
+      toolCallId: observation.toolCallId,
+    });
     const sourceTrace = trace.events.at(-1);
 
     expect(updated.lastEventSequence).toBe(5);
@@ -119,6 +123,12 @@ describe("ResearchAgentRuntime source reads", () => {
       observationStatus: "succeeded",
       sourceSnapshotId: observation.sourceSnapshot.snapshotId,
     });
+    expect(filteredTrace.events).toEqual([
+      expect.objectContaining({
+        type: "source_read_observed",
+        toolCallId: observation.toolCallId,
+      }),
+    ]);
     expect(await readFile(join(fixture.runtimeHome, observation.sourceSnapshot.relativePath))).toEqual(
       fixture.sourceBytes,
     );

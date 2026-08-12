@@ -10,6 +10,7 @@ import {
   createPublicationApprovalBinding,
   formatRunTrace,
   hashCanonicalJson,
+  ModelGenerationAbortedError,
   ResearchAgentRuntime,
   ScriptedEvaluator,
   ScriptedModel,
@@ -18,6 +19,7 @@ import { hashUtf8Text } from "../../src/domain/integrity.js";
 import type {
   IdGenerator,
   Clock,
+  RetryPolicy,
   RunBudget,
   SourceScope,
 } from "../../src/index.js";
@@ -39,6 +41,106 @@ afterEach(async () => {
 });
 
 describe("ResearchAgentRuntime Learning Artifact publication", () => {
+  it("freezes an exact proposal when Evaluator cancellation interrupts the first review", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const current = await fixture.runtime.inspectRun({ runId: fixture.runId });
+    if (current.state.type !== "researching") {
+      throw new Error("测试要求可提出 Artifact 的 researching state");
+    }
+    const claimId = current.state.claims[0]?.claimId;
+    if (claimId === undefined) throw new Error("测试要求一个 durable Claim");
+    fixture.runtime.close();
+    let proposalCalls = 0;
+    let reviewCalls = 0;
+    const proposal = {
+      title: "Evaluator cancellation",
+      summary: "取消 review 后只重试 exact isolated evaluation。",
+      claimIds: [claimId],
+    } as const;
+    const first = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      ids: createIds(100),
+      clock: fixedPublicationClock(),
+      model: {
+        proposePlan: async () => {
+          throw new Error("测试不重新规划");
+        },
+        proposeLearningArtifact: async () => {
+          proposalCalls += 1;
+          return proposal;
+        },
+      },
+      evaluator: {
+        identity: {
+          provider: "scripted",
+          model: "cancelled-evaluator",
+          promptVersion: "evidence-evaluator-v1",
+        },
+        reviewClaims: async () => {
+          reviewCalls += 1;
+          throw new ModelGenerationAbortedError();
+        },
+      },
+    });
+    await expect(first.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath: join(fixture.outputDirectory, "cancelled-evaluator.md"),
+    })).rejects.toBeInstanceOf(ModelGenerationAbortedError);
+    await expect(first.inspectRun({ runId: fixture.runId })).resolves.toMatchObject({
+      state: {
+        type: "waiting_evaluator_resolution",
+        proposal,
+        retryAttempts: [expect.objectContaining({
+          retrySequenceKind: "artifact_proposal",
+          outcome: "succeeded",
+        })],
+      },
+    });
+    first.close();
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      ids: createIds(200),
+      clock: fixedPublicationClock(),
+      model: {
+        proposePlan: async () => {
+          throw new Error("测试不重新规划");
+        },
+        proposeLearningArtifact: async () => {
+          proposalCalls += 1;
+          throw new Error("重启后不得重采样 proposal");
+        },
+      },
+      evaluator: {
+        identity: {
+          provider: "scripted",
+          model: "cancelled-evaluator",
+          promptVersion: "evidence-evaluator-v1",
+        },
+        reviewClaims: async (request) => {
+          reviewCalls += 1;
+          return {
+            verdicts: request.claims.map((claim) => ({
+              claimId: claim.claimId,
+              verdict: "supported" as const,
+            })),
+          };
+        },
+      },
+    });
+    try {
+      await expect(
+        restarted.retryEvaluatorReview({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "waiting_publication_approval" } });
+      expect(proposalCalls).toBe(1);
+      expect(reviewCalls).toBe(2);
+    } finally {
+      restarted.close();
+    }
+  });
+
   it("runs an isolated advisory Evaluator Review before exposing a publish-ready report", async () => {
     const fixture = await createEvidenceReadyRun();
     const targetPath = join(fixture.outputDirectory, "evaluated-report.md");
@@ -113,18 +215,31 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
   });
 
   it("suspends on Evaluator failure and retries the exact review without regenerating the proposal", async () => {
-    const fixture = await createEvidenceReadyRun();
+    const retryPolicy = {
+      version: "artifact-evaluator-retry-v1",
+      modelMaxAttempts: 2,
+      toolMaxAttempts: 2,
+      baseDelayMs: 5,
+      maxDelayMs: 20,
+    } as const;
+    const fixture = await createEvidenceReadyRun({ retryPolicy });
+    const evidenceReady = await fixture.runtime.inspectRun({ runId: fixture.runId });
+    if (evidenceReady.state.type !== "researching") {
+      throw new Error("测试要求可提出 Artifact 的 researching state");
+    }
+    const claimId = evidenceReady.state.claims[0]?.claimId;
+    if (claimId === undefined) throw new Error("测试要求一个 Claim");
     fixture.runtime.close();
     const model = new ScriptedModel([], [{
       title: "Evaluator retry",
       summary: "失败后只重试 isolated review。",
-      claimIds: ["claim-event-007"],
+      claimIds: [claimId],
     }]);
     const evaluator = new ScriptedEvaluator([
       new Error("private provider body"),
       {
         verdicts: [{
-          claimId: "claim-event-007",
+          claimId,
           verdict: "uncertain",
         }],
       },
@@ -140,6 +255,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
       clock: fixedPublicationClock(),
       model,
       evaluator,
+      retryPolicy,
     });
     const targetPath = join(fixture.outputDirectory, "retry-review.md");
 
@@ -152,7 +268,20 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         type: "waiting_evaluator_resolution",
         proposal: { title: "Evaluator retry" },
         evaluatorFailures: [{ attempt: 1, code: "evaluation_failed" }],
+        retryAttempts: expect.arrayContaining([expect.objectContaining({
+          retrySequenceKind: "artifact_proposal",
+          outcome: "succeeded",
+        })]),
       });
+      if (suspended.state.type !== "waiting_evaluator_resolution") {
+        throw new Error("测试要求等待 Evaluator resolution");
+      }
+      expect(suspended.state.retryAttempts).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({
+          retrySequenceKind: "artifact_proposal",
+          outcome: "in_progress",
+        })]),
+      );
 
       const waiting = await runtime.retryEvaluatorReview({ runId: fixture.runId });
       expect(waiting.state).toMatchObject({
@@ -161,7 +290,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
           kind: "reviewed",
           review: {
             verdicts: [{
-              claimId: "claim-event-007",
+              claimId,
               verdict: "uncertain",
             }],
           },
@@ -805,7 +934,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         "tool-call-001",
       );
       const trace = await restarted.traceRun({ runId: fixture.runId });
-      expect(trace.events.slice(-7)).toEqual([
+      expect(trace.events.slice(-8)).toEqual([
         expect.objectContaining({
           type: "evidence_recorded",
           evidenceId: "evidence-event-006",
@@ -813,6 +942,11 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         expect.objectContaining({
           type: "claim_recorded",
           claimId: "claim-event-007",
+        }),
+        expect.objectContaining({
+          type: "retry_attempt_started",
+          retrySequenceKind: "artifact_proposal",
+          attemptOutcome: "in_progress",
         }),
         expect.objectContaining({
           type: "learning_artifact_draft_proposed",
@@ -987,8 +1121,56 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         }),
       ).rejects.toThrow(/Evidence/);
       const projection = await fixture.runtime.inspectRun({ runId: fixture.runId });
-      expect(projection.state.type).toBe("researching");
-      expect(projection.lastEventSequence).toBe(7);
+      expect(projection).toMatchObject({
+        lastEventSequence: 9,
+        state: {
+          type: "researching",
+          evidenceGateRepairs: [expect.objectContaining({
+            code: "unknown_claim_id",
+            artifactProposalTurnConsumed: true,
+          })],
+          retryAttempts: [expect.objectContaining({
+            retrySequenceKind: "artifact_proposal",
+            outcome: "succeeded",
+          })],
+        },
+      });
+      if (projection.state.type !== "researching") {
+        throw new Error("Gate repair 后必须回到 researching");
+      }
+      const validClaimId = projection.state.claims[0]?.claimId;
+      if (validClaimId === undefined) throw new Error("测试要求一个 durable Claim");
+      fixture.runtime.close();
+      const repaired = ResearchAgentRuntime.open({
+        runtimeHome: fixture.runtimeHome,
+        outputRoot: fixture.outputDirectory,
+        ids: createIds(100),
+        clock: fixedPublicationClock(),
+        model: new ScriptedModel([], [{
+          title: "修复后的选择",
+          summary: "下一条显式命令可以开启新的 Artifact proposal sequence。",
+          claimIds: [validClaimId],
+        }]),
+        evaluator: new ScriptedEvaluator(),
+      });
+      try {
+        await expect(
+          repaired.proposeLearningArtifact({
+            runId: fixture.runId,
+            targetPath: join(fixture.outputDirectory, "repaired.md"),
+          }),
+        ).resolves.toMatchObject({ state: { type: "waiting_publication_approval" } });
+        const trace = await repaired.traceRun({ runId: fixture.runId });
+        const artifactAttempts = trace.events.filter((event) =>
+          event.retrySequenceKind === "artifact_proposal" &&
+          event.attemptOutcome === "succeeded"
+        );
+        expect(artifactAttempts).toHaveLength(2);
+        expect(new Set(artifactAttempts.map((event) => event.retrySequenceId)).size)
+          .toBe(2);
+      } finally {
+        repaired.close();
+      }
     } finally {
       fixture.runtime.close();
     }
@@ -1206,16 +1388,36 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         }),
       ).rejects.toThrow(/Learning Artifact/);
       const projection = await maliciousRuntime.inspectRun({ runId: fixture.runId });
-      expect(projection.state.type).toBe("researching");
-      expect(projection.lastEventSequence).toBe(7);
+      expect(projection).toMatchObject({
+        lastEventSequence: 9,
+        state: {
+          type: "researching",
+          evidenceGateRepairs: [expect.objectContaining({
+            code: "proposal_invalid",
+            artifactProposalTurnConsumed: true,
+          })],
+          retryAttempts: [expect.objectContaining({
+            retrySequenceKind: "artifact_proposal",
+            outcome: "succeeded",
+          })],
+        },
+      });
     } finally {
       maliciousRuntime.close();
     }
   });
 
-  it("rejects a publication target outside the configured Output Root", async () => {
-    const fixture = await createEvidenceReadyRun();
+  it("rejects a publication target outside the configured Output Root before sampling an Artifact proposal", async () => {
+    const retryPolicy = {
+      version: "artifact-target-preflight-v1",
+      modelMaxAttempts: 2,
+      toolMaxAttempts: 2,
+      baseDelayMs: 5,
+      maxDelayMs: 20,
+    } as const;
+    const fixture = await createEvidenceReadyRun({ retryPolicy });
     const outsideDirectory = await createTemporaryDirectory("artifact-outside-");
+    const before = await fixture.runtime.inspectRun({ runId: fixture.runId });
 
     try {
       await expect(
@@ -1226,9 +1428,104 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
       ).rejects.toThrow(/Learning Artifact/);
       const projection = await fixture.runtime.inspectRun({ runId: fixture.runId });
       expect(projection.state.type).toBe("researching");
-      expect(projection.lastEventSequence).toBe(7);
+      expect(projection).toEqual(before);
+      expect(fixture.model.learningArtifactRequests).toHaveLength(0);
+      const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+      expect(trace.events.some((event) =>
+        event.retrySequenceKind === "artifact_proposal"
+      )).toBe(false);
     } finally {
       fixture.runtime.close();
+    }
+  });
+
+  it("terminally closes a default single-attempt Artifact proposal when draft CAS persistence fails", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const evidenceReady = await fixture.runtime.inspectRun({ runId: fixture.runId });
+    if (evidenceReady.state.type !== "researching") {
+      throw new Error("测试要求可提出 Artifact 的 researching state");
+    }
+    const claimId = evidenceReady.state.claims[0]?.claimId;
+    if (claimId === undefined) throw new Error("测试要求一个 Claim");
+    fixture.runtime.close();
+    const model = new ScriptedModel([], [{
+      title: "CAS failure",
+      summary: "已完成提案不能在 CAS 失败后被重新采样。",
+      claimIds: [claimId],
+    }]);
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      ids: createIds(100),
+      clock: fixedPublicationClock(),
+      model,
+      evaluator: new ScriptedEvaluator(),
+      artifactStoreHooks: {
+        beforeMarkdownArtifactWrite: () => {
+          throw new Error("simulated draft CAS failure");
+        },
+      },
+    });
+
+    const draftError = await runtime.proposeLearningArtifact({
+        runId: fixture.runId,
+        targetPath: join(fixture.outputDirectory, "cas-failed.md"),
+      }).then(() => undefined, (error: unknown) => error);
+    expect(draftError).toMatchObject({ name: "LearningArtifactDraftError" });
+    expect(model.learningArtifactRequests).toHaveLength(1);
+    await expect(
+      runtime.inspectRun({ runId: fixture.runId }),
+    ).resolves.toMatchObject({
+      state: {
+        type: "failed",
+        retrySequenceKind: "artifact_proposal",
+        failure: {
+          category: "invariant_violation",
+          code: "artifact_draft_persistence_failed",
+        },
+        retryAttempts: [expect.objectContaining({
+          retrySequenceKind: "artifact_proposal",
+          outcome: "succeeded",
+        })],
+      },
+    });
+    runtime.close();
+
+    let restartedProposalCalls = 0;
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      ids: createIds(100),
+      clock: fixedPublicationClock(),
+      model: {
+        proposePlan: async () => {
+          throw new Error("terminal Run 不会重新规划");
+        },
+        proposeLearningArtifact: async () => {
+          restartedProposalCalls += 1;
+          throw new Error("terminal Run 不得重新采样 Artifact proposal");
+        },
+      },
+    });
+    try {
+      await expect(
+        restarted.proposeLearningArtifact({
+          runId: fixture.runId,
+          targetPath: join(fixture.outputDirectory, "cas-failed.md"),
+        }),
+      ).rejects.toThrow();
+      expect(restartedProposalCalls).toBe(0);
+      const trace = await restarted.traceRun({ runId: fixture.runId });
+      expect(trace.events.at(-1)).toEqual(
+        expect.objectContaining({
+          type: "run_failed",
+          retrySequenceKind: "artifact_proposal",
+          attemptOutcome: "succeeded",
+          failureCode: "artifact_draft_persistence_failed",
+        }),
+      );
+    } finally {
+      restarted.close();
     }
   });
 
@@ -2358,9 +2655,15 @@ async function createEvidenceReadyRun(options: {
   readonly otherSourceText?: string;
   /** 测试可注入的 UTC Clock；用于将 research 执行窗口与人工 approval 分离。 */
   readonly clock?: Clock;
+  /** 可选自动 retry policy；用于验证 publication 前 generation 的 durable attempts。 */
+  readonly retryPolicy?: RetryPolicy;
+  /** 私有 draft CAS 的命名失败注入点。 */
+  readonly artifactStoreHooks?: import("../../src/index.js").ArtifactStoreLifecycleHooks;
 } = {}): Promise<{
   /** 当前测试仍持有、可继续提出 draft 的 Runtime。 */
   readonly runtime: ResearchAgentRuntime;
+  /** fixture 持有的 Scripted Model，可从公开 adapter 观测 proposal 是否被采样。 */
+  readonly model: ScriptedModel;
   /** 完成计划审批的 durable Run identity。 */
   readonly runId: string;
   /** 私有 Journal、Projection 与 CAS 所在的 Runtime Home。 */
@@ -2386,30 +2689,37 @@ async function createEvidenceReadyRun(options: {
   const ids = createIds();
   const clock = options.clock ?? fixedPublicationClock();
   const evaluator = new ScriptedEvaluator();
+  const model = new ScriptedModel(
+    [
+      {
+        title: "从来源建立可发布学习工件",
+        objectives: ["验证 Evidence Gate"],
+        steps: [{ id: "step-001", description: "读取 source.md" }],
+      },
+    ],
+    [
+      {
+        title: options.proposalTitle ?? "Journal 的可恢复性",
+        summary:
+          options.proposalSummary ??
+          "这个 Learning Artifact 只渲染已登记 Claim 的结构化 Evidence 引用。",
+        claimIds: options.proposalClaimIds ?? ["claim-event-007"],
+      },
+    ],
+  );
   const runtime = ResearchAgentRuntime.open({
     runtimeHome,
     outputRoot: outputDirectory,
     clock,
     ids,
-    model: new ScriptedModel(
-      [
-        {
-          title: "从来源建立可发布学习工件",
-          objectives: ["验证 Evidence Gate"],
-          steps: [{ id: "step-001", description: "读取 source.md" }],
-        },
-      ],
-      [
-        {
-          title: options.proposalTitle ?? "Journal 的可恢复性",
-          summary:
-            options.proposalSummary ??
-            "这个 Learning Artifact 只渲染已登记 Claim 的结构化 Evidence 引用。",
-          claimIds: options.proposalClaimIds ?? ["claim-event-007"],
-        },
-      ],
-    ),
+    model,
     evaluator,
+    ...(options.retryPolicy === undefined
+      ? {}
+      : { retryPolicy: options.retryPolicy }),
+    ...(options.artifactStoreHooks === undefined
+      ? {}
+      : { artifactStoreHooks: options.artifactStoreHooks }),
   });
   const waiting = await runtime.createRun({
     question: "为什么 Journal 可以驱动可恢复状态？",
@@ -2466,6 +2776,7 @@ async function createEvidenceReadyRun(options: {
   }
   return {
     runtime,
+    model,
     runId: waiting.runId,
     runtimeHome,
     outputDirectory,
@@ -2477,13 +2788,13 @@ function tamperEvidenceRange(runtimeHome: string, runId: string): void {
   const database = new Database(join(runtimeHome, "runtime.sqlite"));
   try {
     const readRow = database.prepare(
-      "SELECT payload_json FROM run_events WHERE run_id = ? AND sequence = 5",
+      "SELECT payload_json FROM run_events WHERE run_id = ? AND type = 'source_read_observed' ORDER BY sequence LIMIT 1",
     ).get(runId) as {
       /** 成功 source read 事件载荷的原始 JSON。 */
       readonly payload_json: string;
     } | undefined;
     const evidenceRow = database.prepare(
-      "SELECT payload_json FROM run_events WHERE run_id = ? AND sequence = 6",
+      "SELECT payload_json FROM run_events WHERE run_id = ? AND type = 'evidence_recorded' ORDER BY sequence LIMIT 1",
     ).get(runId) as {
       /** Evidence 事件载荷的原始 JSON。 */
       readonly payload_json: string;
@@ -2519,12 +2830,12 @@ function tamperEvidenceRange(runtimeHome: string, runId: string): void {
       excerptHash: readPayload.observation.excerptHash,
     });
     const update = database.prepare(
-      "UPDATE run_events SET payload_json = ? WHERE run_id = ? AND sequence = ?",
+      "UPDATE run_events SET payload_json = ? WHERE run_id = ? AND type = ?",
     );
     const transaction = database.transaction(() => {
       database.exec("DROP TRIGGER run_events_are_append_only_on_update");
-      update.run(JSON.stringify(readPayload), runId, 5);
-      update.run(JSON.stringify(evidencePayload), runId, 6);
+      update.run(JSON.stringify(readPayload), runId, "source_read_observed");
+      update.run(JSON.stringify(evidencePayload), runId, "evidence_recorded");
     });
     transaction();
   } finally {

@@ -25,6 +25,9 @@ flowchart LR
   Provider -->|"text/tool-input deltas + finish + usage"| AiSdk
   AiSdk -->|"completed provider-neutral result"| Model
   Model --> Loop["Bounded Research Loop"]
+  Harness --> OuterAttempts["Outer Model retry<br/>plan + artifact proposal"]
+  OuterAttempts -->|"started / failed / succeeded attempt"| Journal
+  OuterAttempts --> Retry
   Loop --> Attempts["Attempt controller<br/>approved policy + wall time"]
   Attempts -->|"retry_attempt_started"| Journal
   Attempts --> Retry["Retry Scheduler<br/>provider hint + bounded backoff"]
@@ -132,13 +135,13 @@ OpenAI-compatible adapter 的工具定义只有 description 与 Zod input schema
 
 Retry Policy 与 question、plan artifact、Source Scope 和 Run Budget 一起在 `run_created` 时成为 durable fact，并由 Plan Approval binding 精确授权。Runtime 重启时即使传入不同或空的本地配置，现有 Run 的下一 Retry Sequence 仍使用 Journal 中已批准的 policy；每个 sequence 的首次 attempt 又把完整 policy 冻结进 attempt，确保 sequence 中途重启时策略也不会变化。
 
-Model generation 与 `search_sources` 都遵循同一个 attempt protocol：外部 I/O 前提交 `retry_attempt_started`；成功 Model Turn/Search observation 与 `succeeded` attempt 同事务提交；瞬时基础设施 failure 追加带 duration、safe code、provider hint 与实际 delay 的失败 attempt；未知 Model error、Model schema error 与 invariant violation 进入 terminal `failed`；达到 attempt 上限进入 suspended `retry_exhausted`。普通只读 Search failure 是 `tool_execution` observation，交回下一轮 Model View，而不是终止 Run。Search retries 共享同一 `toolCallId`，预算只计算一次逻辑调用。
+Research Loop Model generation、`search_sources`、planning 与 Artifact proposal 遵循同一 durable started-attempt protocol：外部 I/O 前持久化 attempt；默认 plan 把单次 attempt 原子嵌入 `planning_started`，其余路径提交独立 `retry_attempt_started`。默认 Research Loop 使用派生 event/sequence identity，不消耗注入式 ID/Clock，因此不会改写既有 Model Turn、Tool Call、Observation、Evidence 或 Claim identity。成功 Model Turn/Search observation/plan 与 `succeeded` attempt 同事务提交；成功 Artifact proposal 则与随后第一个 durable outcome（Gate repair、Evaluator failure、draft 或后处理 permanent failure）同事务闭合。publication target containment 在 proposal I/O 前完成；draft CAS 失败由一个 `run_failed` 事实同时保留 succeeded attempt 与安全 failure code，重启不能把它误判为 interrupted 并重新采样。瞬时基础设施 failure 追加带 duration、safe code、provider hint 与实际 delay 的 `retry_attempt_failed`；未知 Model error、Model schema error 与 invariant violation 进入 terminal `failed`；达到 attempt 上限进入 suspended `retry_exhausted`。默认 `retry-disabled-v1` 对 Model/Search 只允许一次物理调用，所以 commit-window 崩溃会被明确分类且不重放；显式 Retry Policy 才允许沿原 sequence 继续。planning 中断由普通 `resume` 沿同一 sequence 恢复，Artifact proposal 中断由原命令先闭合 interrupted attempt 再继续，二者都不会在耗尽后隐式开启新 sequence。Artifact proposal backoff 在下一次 provider I/O 前重算 wall-time，耗尽则先进入 `budget_exhausted`。普通只读 Search failure 是 `tool_execution` observation，交回下一轮 Model View，而不是终止 Run。Search retries 共享同一 `toolCallId`，预算只计算一次逻辑调用。
 
 provider hint 是服务端最短等待，不能被本地 backoff 上限截短；本地指数 backoff 本身受 `maxDelayMs` 限制。attempt start 初始化 Research Loop wall-time，等待也消耗该时间；每次等待后、下一外部 I/O 前重新计算批准预算，耗尽则先 durable 进入 `budget_exhausted`。因此 retry 同时受 attempt policy 与 wall-time policy 约束。
 
 Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_turn_completed`。该事件同时把有序 tool intents 变为 durable pending work；重启后的 `advanceResearch` 会先消费这些 pending intents，而不是再次 generation。scheduler 只取开头连续的 safe read intents：schema、root identity、Source Scope 与 read-byte reservation 按模型顺序执行，批准的外部 I/O 再受 `safeReadConcurrency` 限制。Artifact/Snapshot 完成后通过短 commit queue 按真实完成先后进入 Journal；reducer 只在当前 Model Turn 内按 intent ordinal 重排 observations，因而历史 turn 不漂移，下一 Model View 也不受调度影响。后续 Evidence、Claim 与 completion 继续严格顺序。
 
-`ResearchLoopLifecycleHooks` 为测试暴露 Model Turn 以及五个 Research Tool 的命名 Fault Injection Points：Model Turn 有 Journal append 前/后；search/read 有私有 CAS 写入后与 Journal/registry 原子提交后；Evidence、Claim 和 completion 有 Journal commit 前/后。`ApprovalLifecycleHooks` 同样覆盖 plan/publication Receipt commit 前后。commit 前中断时 canonical waiting/pending work 保留，重启会重试；commit 后中断时 Journal 已消费 intent 或审批，重启返回同一 Projection 而不追加第二个事实。search/read 的孤立 CAS 对象不能冒充 Journal 事实。启用 Retry Policy 时 sibling searches 各自先 durable start attempt，completion 可乱序闭合；transient retry 只推进对应 Retry Sequence，并复用原逻辑 `toolCallId`。
+`ResearchLoopLifecycleHooks` 为测试暴露 Model Turn 以及五个 Research Tool 的命名 Fault Injection Points：Model Turn 有 Journal append 前/后；search/read 有私有 CAS 写入后与 Journal/registry 原子提交后；Evidence、Claim 和 completion 有 Journal commit 前/后。`ApprovalLifecycleHooks` 同样覆盖 plan/publication Receipt commit 前后。Model/Search commit 前中断时 started attempt 仍是 canonical fact：默认单次协议重启后进入 `retry_exhausted`，显式 Retry Policy 才会重试；read/Evidence/Claim/completion 等没有外部不可幂等调用的 pending work 仍可按各自协议恢复。commit 后中断时 Journal 已消费 intent 或审批，重启返回同一 Projection 而不追加第二个事实。search/read 的孤立 CAS 对象不能冒充 Journal 事实。所有 sibling searches 各自先 durable start attempt，completion 可乱序闭合；显式 transient retry 只推进对应 Retry Sequence，并复用原逻辑 `toolCallId`。
 
 `search_sources` 与 `read_source` 共享 Source Scope 权限边界。搜索通过可注入 `SourceSearchPort` 调用默认的固定参数 `rg` adapter，下推 extension、exclusion、secret 与 file-size 过滤，启动前复核批准 root identity，每个命中再过 realpath preflight。完整命中列表写入私有 JSON Artifact；Journal observation 只保存 artifact 引用和 `matchCount`，下一轮 Model View 再按需校验并展开最近结果。搜索仍不创建 Source Snapshot。只有成功 explicit read 才冻结完整原始 UTF-8 字节；`invalid`、`denied`、`stale` 与 `failed` 都只落安全 observation。Evidence Record 也没有读取 live file 的能力，只能由 Runtime 从已持久化的成功 observation 逐字段派生。
 
@@ -149,7 +152,7 @@ Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_tu
 3. **Claim** 解决“要在学习工件中表达什么”。`source_fact` 与 `inference` 至少引用一个既有 Evidence；`design_recommendation` 可以无 Evidence，若提供则仍必须有效。分类决定 Gate/renderer 语义，不能把 inference 或 recommendation 渲染成未标注的上游事实。
 4. **Evidence Gate** 在 `research_complete` 后先检查 Claim/Evidence IDs、分类与计划审批，再把 Evidence 逐字段连接到 completed `read_source` observation。它随后按 content identity 安全读取私有 Snapshot bytes，独立重算 UTF-8 logical lines、1-based inclusive range 与 excerpt hash；live source 后续变化不参与验证。Gate 同时从 Journal 重算 model turns（包括已完成但失败的 Artifact proposal）、Research Tool calls、不同 Source Snapshots、source bytes 与 Research Loop wall time。
 5. **Repair loop** 在 Gate 失败时追加 `evidence_gate_repair_requested`：事实包含稳定 code、确定性 summary/action，以及是否已消耗 Artifact proposal Model Turn。completed result 即使未通过 proposal schema，也会用 `proposal_invalid` 计入模型预算；Source Root path/device/inode 失配则在模型调用前产生 `approval_invalid`，要求新的 Run 与审批。Reducer 验证该映射后把 `research_complete` 恢复为 `researching`；下一 Model View 固定保留 repair，不将它伪装成 Research Tool call 或 runtime failure。
-6. **Evaluator Review** 使用独立 port、独立 versioned prompt 和最小输入。每个 Claim 必须恰好得到一个同序 `supported`、`partially_supported`、`unsupported`、`contradicted` 或 `uncertain` verdict。成功结果进入私有 JSON Artifact；identity 同时绑定 evaluator model、prompt version、exact input hash 与 review artifact hash。failure 只持久化安全代码，进入 `waiting_evaluator_resolution`；retry 不重采样 Artifact proposal，skip 只记录 user-command identity。确定性测试也把 `ScriptedModel` 与 `ScriptedEvaluator` 分为两个 port；同一 live adapter 兼任两种能力时，仍通过不同 prompt 和最小 request 隔离 generation。
+6. **Evaluator Review** 使用独立 port、独立 versioned prompt 和最小输入。每个 Claim 必须恰好得到一个同序 `supported`、`partially_supported`、`unsupported`、`contradicted` 或 `uncertain` verdict。成功结果进入私有 JSON Artifact；identity 同时绑定 evaluator model、prompt version、exact input hash 与 review artifact hash。failure 只持久化安全代码，进入 `waiting_evaluator_resolution`；首次 failure 还与已成功完成的 Artifact proposal attempt 原子提交，避免 Trace 把完成的 provider I/O 永久误报为 `in_progress`。retry 不重采样 Artifact proposal，skip 只记录 user-command identity。确定性测试也把 `ScriptedModel` 与 `ScriptedEvaluator` 分为两个 port；同一 live adapter 兼任两种能力时，仍通过不同 prompt 和最小 request 隔离 generation。
 7. **确定性 renderer** 是唯一产生 `【Evidence: <id>】` 的位置。它要求 proposal summary 恰好一句话并渲染为 Conclusion，同时输出 Scope、分类 Claims/verdict、Uncertainty、Evidence Index 与 compact tool summary。Evidence Index 对共享 Evidence 去重，并展示 Snapshot/range/`read_source` lineage；tool summary 从 Journal 的 durable observations 分别计算五类 Research Tool calls，不能用 selected Evidence 数量代替。publication 执行前会再次读取 CAS Snapshot 和 review JSON，重验 bytes/hash、verdict coverage/order 与 input/review identity。
 
 Search result 与 Markdown draft 都写入私有通用 artifact namespace，并分别和引用它们的 `research_tool_observed` / `learning_artifact_draft_proposed` 事件在同一个 SQLite 事务中注册。store 会拒绝“事件引用却没有匹配 artifact registry 行”的批次；Projection cache 与 Trace 仍从 canonical Journal 派生，且不复制 search 行正文。
@@ -160,6 +163,9 @@ Search result 与 Markdown draft 都写入私有通用 artifact namespace，并�
 stateDiagram-v2
   [*] --> created: run_created
   created --> planning: planning_started
+  planning --> planning: retry_attempt_started / retry_attempt_failed
+  planning --> retry_exhausted: run_retry_exhausted
+  planning --> failed: run_failed
   planning --> waiting_plan_approval: plan_proposed
   waiting_plan_approval --> researching: plan_approved
   researching --> researching: retry_attempt_started
@@ -175,6 +181,9 @@ stateDiagram-v2
   researching --> failed: run_failed
   research_complete --> budget_exhausted: run_budget_exhausted
   research_complete --> researching: evidence_gate_repair_requested
+  research_complete --> research_complete: retry_attempt_started / retry_attempt_failed
+  research_complete --> retry_exhausted: run_retry_exhausted
+  research_complete --> failed: run_failed
   research_complete --> waiting_evaluator_resolution: evaluator_review_failed
   waiting_evaluator_resolution --> waiting_evaluator_resolution: evaluator_review_failed (retry failed)
   waiting_evaluator_resolution --> waiting_publication_approval: learning_artifact_draft_proposed<br/>(review retry succeeded / explicit skip)

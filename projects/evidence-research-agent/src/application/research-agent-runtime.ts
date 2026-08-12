@@ -90,6 +90,8 @@ import type {
   InProgressRetryAttempt,
   NormalizedFailure,
   RetrySequenceKind,
+  OuterModelRetryAttempt,
+  RetryAttempt,
   RunOperationKind,
   RunOperationLease,
   RunOperationView,
@@ -97,7 +99,10 @@ import type {
   SourceAccessDenialCode,
   SourceAccessFailureCode,
 } from "../domain/types.js";
-import { ContentAddressedArtifactStore } from "../infrastructure/content-addressed-artifact-store.js";
+import {
+  type ArtifactStoreLifecycleHooks,
+  ContentAddressedArtifactStore,
+} from "../infrastructure/content-addressed-artifact-store.js";
 import {
   canonicalizeSourceScope,
   PrivateSourceAccess,
@@ -170,6 +175,8 @@ export interface OpenRuntimeOptions {
   readonly safeReadConcurrency?: number;
   /** Source Access 的可选测试边界；生产默认不注入协调行为。 */
   readonly sourceAccessHooks?: SourceAccessLifecycleHooks;
+  /** 私有 Artifact Store 的可选命名中断点；用于验证 draft CAS failure。 */
+  readonly artifactStoreHooks?: ArtifactStoreLifecycleHooks;
   /** Run Operation durable seam 的可选命名中断点。 */
   readonly runOperationHooks?: RunOperationLifecycleHooks;
   /** Plan/Publication Approval durable consumption 的命名故障注入点。 */
@@ -226,6 +233,14 @@ export interface RunOperationLifecycleHooks {
 
 /** Research Loop durable 边界上的命名故障注入点。 */
 export interface ResearchLoopLifecycleHooks {
+  /** plan generation attempt started 已提交、provider I/O 尚未执行前运行。 */
+  readonly afterPlanRetryAttemptStarted?: () => void | Promise<void>;
+  /** Artifact proposal attempt started 已提交、provider I/O 尚未执行前运行。 */
+  readonly afterArtifactRetryAttemptStarted?: () => void | Promise<void>;
+  /** plan provider 已成功、私有 plan artifact 写入前运行。 */
+  readonly beforePlanArtifactWrite?: () => void | Promise<void>;
+  /** plan artifact 已持久化、`plan_proposed` 追加 Journal 前运行。 */
+  readonly beforePlanProposalJournalAppend?: () => void | Promise<void>;
   /** Retry Attempt started fact 已提交、外部 Model/search I/O 尚未执行前运行。 */
   readonly afterRetryAttemptStarted?: () => void | Promise<void>;
   /** 完整 Model Turn 已构造、但尚未追加 Journal 前运行。 */
@@ -276,6 +291,8 @@ export interface InspectRunCommand {
 export interface TraceRunCommand {
   /** 要投影为 Trace 的 Research Run identity。 */
   readonly runId: string;
+  /** 省略时返回完整 Trace；提供时只保留该 Research Tool call 的 lineage events。 */
+  readonly toolCallId?: string | undefined;
 }
 
 /** 只读检查一个 Run 的 operation lease 与 cancellation request。 */
@@ -683,6 +700,11 @@ const runIdentityCommandSchema = z.object({
   runId: z.string().trim().min(1),
 });
 
+const traceRunCommandSchema = z.object({
+  runId: z.string().trim().min(1),
+  toolCallId: z.string().trim().min(1).optional(),
+}).strict();
+
 const approvePlanCommandSchema = z
   .object({
     runId: z.string().trim().min(1),
@@ -875,6 +897,10 @@ interface RetryContext {
   readonly toolCallId?: string | undefined;
   /** Model retry sequence 首次 attempt 冻结的最新 steering。 */
   readonly latestSteering?: string | undefined;
+  /** 默认单次协议使用、不消耗可注入 ID 序列的 started event identity。 */
+  readonly attemptEventId?: string | undefined;
+  /** 与默认单次 Retry Sequence start 共用的时间，避免重复推进可注入 Clock。 */
+  readonly attemptStartedAt?: string | undefined;
 }
 
 /** 在 Journal 提交 started fact 后返回的 canonical attempt 与新 Projection。 */
@@ -885,6 +911,16 @@ interface StartedAttemptResult {
   readonly attempt: InProgressRetryAttempt;
 }
 
+/** 外层 generation 完成后返回值、最新 Projection 与可选成功 attempt。 */
+interface OuterModelGenerationResult<Value> {
+  /** provider 返回且尚待调用方 schema 验证的 completed value。 */
+  readonly value: Value;
+  /** 已包含此前 transient failure attempt 事实的最新 Projection。 */
+  readonly projection: RunProjection;
+  /** 由最终领域事件原子闭合的成功 attempt；无自动 retry 时仍是 durable 单次协议。 */
+  readonly attempt: OuterModelRetryAttempt;
+}
+
 /** 完成外部 search 后、等待按真实完成顺序写入 Journal 的结果。 */
 interface PreparedSearchResult {
   /** 已按模型 intent 顺序预分配的 observation；retryable attempt 尚不消费 intent。 */
@@ -893,7 +929,7 @@ interface PreparedSearchResult {
   readonly completedAt: string;
   /** 成功 search 的私有匹配列表 artifact；非成功结果省略。 */
   readonly artifact?: PersistedArtifact | undefined;
-  /** 启用 Retry Policy 时需要闭合的 durable attempt。 */
+  /** 外部 Search I/O 完成后需要随 observation 原子闭合的 durable attempt。 */
   readonly attempt?: CompletedRetryAttempt | undefined;
 }
 
@@ -1034,7 +1070,10 @@ export class ResearchAgentRuntime {
     this.#sourceAccessHooks = Object.freeze({
       ...(options.sourceAccessHooks ?? {}),
     });
-    this.#artifacts = new ContentAddressedArtifactStore(runtimeHome);
+    this.#artifacts = new ContentAddressedArtifactStore(
+      runtimeHome,
+      options.artifactStoreHooks,
+    );
     this.#store = new SqliteRunStore(
       runtimeHome,
       () => this.#operationClock.now(),
@@ -1092,6 +1131,19 @@ export class ResearchAgentRuntime {
       heartbeatAt: acquiredAt,
       expiresAt: addMilliseconds(acquiredAt, this.#operationLeaseDurationMs),
     };
+    const defaultPlanAttemptEventId = `event-${runId}-plan_generation-2`;
+    const defaultPlanAttempt: InProgressRetryAttempt | undefined =
+      this.#retryEnabled
+        ? undefined
+        : {
+            attemptId: `attempt-${defaultPlanAttemptEventId}`,
+            retrySequenceId: `retry-sequence-${runId}-plan_generation-2`,
+            retrySequenceKind: "plan_generation",
+            attemptNumber: 1,
+            retryPolicy: noAutomaticRetryPolicy,
+            startedAt: createdAt,
+            outcome: "in_progress",
+          };
 
     const initialEvents: ResearchRunEvent[] = [
       {
@@ -1116,7 +1168,9 @@ export class ResearchAgentRuntime {
         sequence: 2,
         type: "planning_started",
         occurredAt: createdAt,
-        payload: {},
+        payload: defaultPlanAttempt === undefined
+          ? {}
+          : { attempt: defaultPlanAttempt },
       },
     ];
     this.#appendEvents(runId, 0, initialEvents, [], [], {
@@ -1125,66 +1179,117 @@ export class ResearchAgentRuntime {
 
     return this.#runAcquiredOperation(
       lease,
-      (_operation, operationSignal) => this.#completeRunCreation({
-        parsed,
-        runId,
-        sourceScope,
-        runBudget,
-        operationSignal,
-      }),
+      async (_operation, operationSignal) => {
+        if (defaultPlanAttempt !== undefined) {
+          await this.#runResearchLoopHook(
+            this.#researchLoopHooks.afterPlanRetryAttemptStarted,
+          );
+        }
+        return this.#completeRunCreation({
+          runId,
+          question: parsed.question,
+          sourceScope,
+          runBudget,
+          operationSignal,
+          useExistingPlanningAttempt: defaultPlanAttempt !== undefined,
+          ...(parsed.abortSignal === undefined
+            ? {}
+            : { abortSignal: parsed.abortSignal }),
+        });
+      },
     );
   }
 
   async #completeRunCreation(input: {
-    /** 已通过 command schema 的创建输入。 */
-    readonly parsed: z.infer<typeof createRunCommandSchema>;
     /** 已与初始 Journal 原子持久化的 Research Run identity。 */
     readonly runId: string;
+    /** 已写入 `run_created` 的精确研究问题。 */
+    readonly question: string;
     /** 已 canonicalize 并写入 `run_created` 的 Source Scope。 */
     readonly sourceScope: SourceScope;
     /** 已写入 `run_created` 且进入审批边界的 Run Budget。 */
     readonly runBudget: RunProjection["runBudget"];
     /** durable cancellation 或 owner loss 可中止 provider stream 的 signal。 */
     readonly operationSignal: AbortSignal;
+    /** create command 已随 `planning_started` 原子持久化 default attempt 时为 true。 */
+    readonly useExistingPlanningAttempt?: boolean | undefined;
+    /** 创建命令可选的 caller cancellation signal；恢复命令省略。 */
+    readonly abortSignal?: AbortSignal | undefined;
   }): Promise<RunProjection> {
-    const { parsed, runId, sourceScope, runBudget, operationSignal } = input;
-    const planAbortSignal = parsed.abortSignal === undefined
-      ? operationSignal
-      : AbortSignal.any([parsed.abortSignal, operationSignal]);
-
-    // Model 调用位于数据库短事务之外，避免用 SQLite 写锁包住不可预测的外部延迟。
-    // 若调用失败，Run 仍可从 planning 状态被 inspect；显式失败语义将在 ticket #7 加入。
-    const plan = parseResearchPlan(
-      await this.#model.proposePlan({
-        runId,
-        question: parsed.question,
-        sourceScope,
-      }, { abortSignal: planAbortSignal }),
-    );
-    const proposedAt = this.#clock.now();
-    const artifact = await this.#artifacts.putJson(
-      plan,
-      "application/json",
-      proposedAt,
-    );
-    const approvalBinding = createPlanApprovalBinding({
-      question: parsed.question,
-      planHash: artifact.sha256,
+    const {
+      runId,
+      question,
       sourceScope,
       runBudget,
-      experimentIdentity: this.#model.experimentIdentity,
-      ...(this.#retryEnabled ? { retryPolicy: this.#retryPolicy } : {}),
-    });
-    const planProposed: ResearchRunEvent = {
-      eventId: this.#ids.nextEventId(),
-      runId,
-      sequence: 3,
-      type: "plan_proposed",
-      occurredAt: proposedAt,
-      payload: { planArtifact: artifact, approvalBinding },
-    };
+      operationSignal,
+      abortSignal,
+      useExistingPlanningAttempt = false,
+    } = input;
+    const planAbortSignal = abortSignal === undefined
+      ? operationSignal
+      : AbortSignal.any([abortSignal, operationSignal]);
 
-    return this.#appendEvents(runId, 2, [planProposed], [artifact]);
+    // planning 也属于 provider I/O：事务外执行，但每个 transient failure 都先形成
+    // 安全 Journal 事实，再按冻结策略等待。这样 rate limit 不会让创建路径成为
+    // Research Loop 之外的隐藏单次调用。
+    const generated = await this.#retryOuterModelGeneration(
+      this.#store.readProjection(runId),
+      "plan_generation",
+      async () => parseResearchPlan(await this.#model.proposePlan({
+        runId,
+        question,
+        sourceScope,
+      }, { abortSignal: planAbortSignal })),
+      useExistingPlanningAttempt,
+    );
+    const plan = generated.value;
+    const proposedAt = generated.attempt.completedAt;
+    try {
+      await this.#runResearchLoopHook(
+        this.#researchLoopHooks.beforePlanArtifactWrite,
+      );
+      const artifact = await this.#artifacts.putJson(
+        plan,
+        "application/json",
+        proposedAt,
+      );
+      const approvalBinding = createPlanApprovalBinding({
+        question,
+        planHash: artifact.sha256,
+        sourceScope,
+        runBudget,
+        experimentIdentity: this.#model.experimentIdentity,
+        ...(this.#retryEnabled ? { retryPolicy: this.#retryPolicy } : {}),
+      });
+      const planProposed: ResearchRunEvent = {
+        eventId: this.#ids.nextEventId(),
+        runId,
+        sequence: generated.projection.lastEventSequence + 1,
+        type: "plan_proposed",
+        occurredAt: proposedAt,
+        payload: {
+          planArtifact: artifact,
+          approvalBinding,
+          attempt: generated.attempt,
+        },
+      };
+      await this.#runResearchLoopHook(
+        this.#researchLoopHooks.beforePlanProposalJournalAppend,
+      );
+      return this.#appendEvents(
+        runId,
+        generated.projection.lastEventSequence,
+        [planProposed],
+        [artifact],
+      );
+    } catch (error) {
+      this.#appendOuterModelPostprocessingFailure(
+        generated.projection,
+        generated.attempt,
+        "plan_persistence_failed",
+      );
+      throw new ResearchLoopError();
+    }
   }
 
   public async inspectRun(command: InspectRunCommand): Promise<RunProjection> {
@@ -1289,8 +1394,16 @@ export class ResearchAgentRuntime {
   }
 
   public async traceRun(command: TraceRunCommand): Promise<RunTrace> {
-    const { runId } = runIdentityCommandSchema.parse(command);
-    return buildRunTrace(this.#store.readEvents(runId));
+    const { runId, toolCallId } = traceRunCommandSchema.parse(command);
+    const trace = buildRunTrace(this.#store.readEvents(runId));
+    return toolCallId === undefined
+      ? trace
+      : {
+          ...trace,
+          events: trace.events.filter((event) =>
+            event.toolCallId === toolCallId
+          ),
+        };
   }
 
   public async inspectRunOperation(
@@ -1420,51 +1533,7 @@ export class ResearchAgentRuntime {
         remainingBudget,
         modelViewSteering,
       ));
-      if (current.retryPolicy === undefined) {
-        let generated: z.infer<typeof researchTurnOutputSchema>;
-        try {
-          generated = researchTurnOutputSchema.parse(
-            await this.#model.generateResearchTurn!(view, {
-              abortSignal: modelAbortSignal,
-            }),
-          );
-        } catch (error) {
-          if (error instanceof ModelGenerationAbortedError) throw error;
-          throw new ResearchLoopError();
-        }
-        const occurredAt = this.#clock.now();
-        const eventId = this.#ids.nextEventId();
-        const turn: ModelTurn = {
-          turnId: `turn-${eventId}`,
-          ...generated,
-          completedAt: occurredAt,
-        };
-        const event: ResearchRunEvent = {
-          eventId,
-          runId,
-          sequence: current.lastEventSequence + 1,
-          type: "model_turn_completed",
-          occurredAt,
-          payload: {
-            turn,
-            generationStartedAt: now,
-            ...(steering === undefined ? {} : { latestSteering: steering }),
-          },
-        };
-        try {
-          await this.#runResearchLoopHook(
-            this.#researchLoopHooks.beforeModelTurnJournalAppend,
-          );
-          this.#appendCompletedResearchResults(current, [event]);
-          await this.#runResearchLoopHook(
-            this.#researchLoopHooks.afterModelTurnJournalAppend,
-          );
-        } catch {
-          throw new ResearchLoopError();
-        }
-        continue;
-      }
-      const retryContext = this.#retryContext(current, "model_turn");
+      const retryContext = this.#retryContext(current, "model_turn", now);
       const effectiveSteering = retryContext.attemptNumber > 1
         ? retryContext.latestSteering
         : steering ?? current.state.latestSteering;
@@ -1485,6 +1554,8 @@ export class ResearchAgentRuntime {
         undefined,
         undefined,
         effectiveSteering,
+        retryContext.attemptEventId,
+        retryContext.attemptStartedAt,
       );
       let generated: z.infer<typeof researchTurnOutputSchema>;
       try {
@@ -1750,7 +1821,9 @@ export class ResearchAgentRuntime {
     // operation。等待返回后必须重新检查，不能再为 terminal Run 启动 attempt。
     if (operationSignal.aborted) return;
     const startedAt = this.#clock.now();
-    const eventId = this.#ids.nextEventId();
+    const eventId = current.retryPolicy === undefined
+      ? `event-${current.runId}-search_sources-${current.lastEventSequence + 1}`
+      : this.#ids.nextEventId();
     const attempt: InProgressRetryAttempt = {
       attemptId: `attempt-${eventId}`,
       retrySequenceId: previousAttempt.retrySequenceId,
@@ -1929,12 +2002,12 @@ export class ResearchAgentRuntime {
       operationSignal,
       async (candidate) => {
         let attempt: InProgressRetryAttempt | undefined;
-        if (candidate.kind === "search" && current.retryPolicy !== undefined) {
+        if (candidate.kind === "search") {
           const started = await this.#startBatchSearchAttempt(
             current.runId,
             candidate.intent,
             candidate.toolCallId,
-            current.retryPolicy,
+            current.retryPolicy ?? noAutomaticRetryPolicy,
           );
           attempt = started.attempt;
         }
@@ -2425,10 +2498,6 @@ export class ResearchAgentRuntime {
       this.#appendGenericToolObservation(current, intent, "invalid", "invalid_tool_schema");
       return;
     }
-    if (current.retryPolicy === undefined) {
-      await this.#executeSearchIntentOnce(current, intent, parsed.data);
-      return;
-    }
     const retryContext = this.#retryContext(current, "search_sources");
     if (retryContext.retryDelayMs !== undefined) {
       const waited = await this.#waitBeforeRetry(
@@ -2448,6 +2517,8 @@ export class ResearchAgentRuntime {
       toolCallId,
       intent.intentId,
       undefined,
+      retryContext.attemptEventId,
+      retryContext.attemptStartedAt,
     );
     let matches: readonly SourceSearchMatch[];
     try {
@@ -2540,62 +2611,6 @@ export class ResearchAgentRuntime {
         [event],
         [artifact],
       );
-      await this.#runResearchLoopHook(
-        this.#researchLoopHooks.afterSearchObservationJournalAppend,
-      );
-    } catch {
-      throw new ResearchLoopError();
-    }
-  }
-
-  async #executeSearchIntentOnce(
-    current: RunProjection,
-    intent: ResearchToolIntent,
-    input: z.infer<typeof searchSourcesInputSchema>,
-  ): Promise<void> {
-    let matches: readonly SourceSearchMatch[];
-    try {
-      matches = await this.#sourceSearch.search(current.sourceScope, input);
-    } catch {
-      this.#appendGenericToolObservation(current, intent, "failed", "search_failed");
-      return;
-    }
-    const observedAt = this.#clock.now();
-    let artifact: PersistedArtifact;
-    try {
-      artifact = await this.#artifacts.putJson(
-        matches,
-        "application/json",
-        observedAt,
-      );
-    } catch {
-      this.#appendGenericToolObservation(current, intent, "failed", "search_failed");
-      return;
-    }
-    await this.#runResearchLoopHook(
-      this.#researchLoopHooks.afterSearchResultArtifactWrite,
-    );
-    try {
-      const observation = this.#createResearchObservation(
-        intent,
-        "succeeded",
-        undefined,
-        `找到 ${matches.length} 个批准来源命中`,
-        {
-          searchResultArtifact: stripArtifactCreatedAt(artifact),
-          matchCount: matches.length,
-        },
-        observedAt,
-      );
-      const event: ResearchRunEvent = {
-        eventId: this.#ids.nextEventId(),
-        runId: current.runId,
-        sequence: current.lastEventSequence + 1,
-        type: "research_tool_observed",
-        occurredAt: observedAt,
-        payload: { observation },
-      };
-      this.#appendCompletedResearchResults(current, [event], [artifact]);
       await this.#runResearchLoopHook(
         this.#researchLoopHooks.afterSearchObservationJournalAppend,
       );
@@ -2815,9 +2830,176 @@ export class ResearchAgentRuntime {
     }
   }
 
+  async #retryOuterModelGeneration<Value>(
+    initial: RunProjection,
+    kind: "plan_generation" | "artifact_proposal",
+    generate: () => Promise<Value>,
+    useExistingAttempt = false,
+  ): Promise<OuterModelGenerationResult<Value>> {
+    const retryPolicy = initial.retryPolicy ?? noAutomaticRetryPolicy;
+    let projection = initial;
+    let attempts = this.#outerRetryAttempts(projection, kind);
+    const pending = attempts.find(
+      (attempt): attempt is InProgressRetryAttempt =>
+        attempt.outcome === "in_progress",
+    );
+    let existingStarted = pending !== undefined && useExistingAttempt
+      ? { projection, attempt: pending }
+      : undefined;
+    if (pending !== undefined && existingStarted === undefined) {
+      projection = this.#commitFailedAttempt(
+        projection,
+        this.#completeFailedAttempt(pending, {
+          category: "infrastructure_transient",
+          code: kind === "plan_generation"
+            ? "plan_generation_interrupted"
+            : "artifact_proposal_interrupted",
+        }),
+      );
+      if (projection.state.type === "retry_exhausted") {
+        throw new ResearchLoopError();
+      }
+      attempts = this.#outerRetryAttempts(projection, kind);
+    }
+
+    while (true) {
+      const previous = attempts.at(-1);
+      if (
+        existingStarted === undefined &&
+        previous !== undefined &&
+        previous.outcome !== "retryable_failure"
+      ) {
+        throw new ResearchLoopError();
+      }
+      if (
+        previous !== undefined &&
+        previous.outcome !== "in_progress" &&
+        previous.retryDelayMs !== undefined
+      ) {
+        if (kind === "artifact_proposal") {
+          const waited = await this.#waitBeforeRetry(
+            projection,
+            previous.retryDelayMs,
+            "model",
+          );
+          if (waited !== undefined) throw new ResearchLoopError();
+        } else {
+          await this.#retryScheduler.wait(previous.retryDelayMs);
+        }
+      }
+      const defaultIdentity = initial.retryPolicy === undefined &&
+          previous === undefined &&
+          !(kind === "plan_generation" && attempts.length > 0)
+        ? this.#defaultOuterAttemptIdentity(projection, kind)
+        : undefined;
+      const retrySequenceId = previous?.retrySequenceId ??
+        defaultIdentity?.retrySequenceId ??
+        `retry-sequence-${this.#ids.nextEventId()}`;
+      const attemptNumber = previous === undefined
+        ? 1
+        : previous.attemptNumber + 1;
+      const started = existingStarted ?? await this.#startAttempt(
+          projection,
+          kind,
+          retrySequenceId,
+          attemptNumber,
+          previous?.retryPolicy ?? retryPolicy,
+          undefined,
+          undefined,
+          undefined,
+          defaultIdentity?.eventId,
+          defaultIdentity?.startedAt,
+        );
+      existingStarted = undefined;
+      try {
+        const value = await generate();
+        const completedAt = this.#clock.now();
+        return {
+          value,
+          projection: started.projection,
+          attempt: this.#completeSucceededAttempt(
+            started.attempt,
+            completedAt,
+          ) as OuterModelRetryAttempt,
+        };
+      } catch (error) {
+        if (error instanceof ResearchLoopError) throw error;
+        const completed = this.#completeFailedAttempt(
+          started.attempt,
+          error instanceof InfrastructureFailureError
+            ? this.#normalizeInfrastructureFailure(error)
+            : this.#normalizeOuterModelFailure(error, kind),
+        );
+        if (error instanceof ModelGenerationAbortedError) {
+          // caller cancellation 只终止当前 provider attempt，不等于取消整个 Run。
+          // attempt 仍需 durable 闭合，重启后可明确区分主动中止与 crash interruption。
+          this.#commitAbortedAttempt(started.projection, completed);
+          throw error;
+        }
+        projection = this.#commitFailedAttempt(started.projection, completed);
+        if (completed.outcome !== "retryable_failure") throw error;
+        attempts = this.#outerRetryAttempts(projection, kind);
+      }
+    }
+  }
+
+  #outerRetryAttempts(
+    projection: RunProjection,
+    kind: "plan_generation" | "artifact_proposal",
+  ): readonly RetryAttempt[] {
+    let attempts: readonly RetryAttempt[];
+    if (kind === "plan_generation" && projection.state.type === "planning") {
+      attempts = projection.state.retryAttempts.filter(
+        (attempt) => attempt.retrySequenceKind === kind,
+      );
+    } else if (
+      kind === "artifact_proposal" &&
+      (projection.state.type === "researching" ||
+        projection.state.type === "research_complete")
+    ) {
+      attempts = projection.state.retryAttempts.filter(
+        (attempt) => attempt.retrySequenceKind === kind,
+      );
+    } else {
+      throw new ResearchLoopError();
+    }
+    const latest = attempts.at(-1);
+    if (
+      latest === undefined ||
+      (latest.outcome !== "in_progress" &&
+        latest.outcome !== "retryable_failure")
+    ) return [];
+    return attempts.filter(
+      (attempt) => attempt.retrySequenceId === latest.retrySequenceId,
+    );
+  }
+
+  #defaultOuterAttemptIdentity(
+    projection: RunProjection,
+    kind: "plan_generation" | "artifact_proposal",
+  ): {
+    /** 不消耗可注入 ID 序列的 deterministic event identity。 */
+    readonly eventId: string;
+    /** 由 Run、kind 与 sequence 派生的 durable Retry Sequence identity。 */
+    readonly retrySequenceId: string;
+    /** default plan 复用 planning start，避免把一次逻辑 generation 计成额外等待。 */
+    readonly startedAt?: string | undefined;
+  } {
+    const sequence = projection.lastEventSequence + 1;
+    const identity = `${projection.runId}-${kind}-${sequence}`;
+    return {
+      eventId: `event-${identity}`,
+      retrySequenceId: `retry-sequence-${identity}`,
+      ...(kind === "plan_generation" && projection.state.type === "planning"
+        ? { startedAt: projection.state.startedAt }
+        : {}),
+    };
+  }
+
   #retryContext(
     current: RunProjection,
     retrySequenceKind: RetrySequenceKind,
+    defaultStartedAt?: string | undefined,
   ): RetryContext {
     if (current.state.type !== "researching") throw new ResearchLoopError();
     const latest = current.state.retryAttempts.at(-1);
@@ -2842,13 +3024,22 @@ export class ResearchAgentRuntime {
           : { latestSteering: first.latestSteering }),
       };
     }
-    const identity = this.#ids.nextEventId();
-    if (current.retryPolicy === undefined) throw new ResearchLoopError();
+    const defaultAttempt = current.retryPolicy === undefined;
+    const identity = defaultAttempt
+      ? `${current.runId}-${retrySequenceKind}-${current.lastEventSequence + 1}`
+      : this.#ids.nextEventId();
+    const startedAt = defaultStartedAt ?? this.#clock.now();
     return {
       retrySequenceId: `retry-sequence-${identity}`,
       attemptNumber: 1,
-      retrySequenceStartedAt: this.#clock.now(),
-      retryPolicy: current.retryPolicy,
+      retrySequenceStartedAt: startedAt,
+      retryPolicy: current.retryPolicy ?? noAutomaticRetryPolicy,
+      ...(defaultAttempt
+        ? {
+            attemptEventId: `event-${identity}`,
+            attemptStartedAt: startedAt,
+          }
+        : {}),
     };
   }
 
@@ -2861,9 +3052,11 @@ export class ResearchAgentRuntime {
     toolCallId: string | undefined,
     intentId: string | undefined,
     latestSteering: string | undefined,
+    prescribedEventId?: string | undefined,
+    prescribedStartedAt?: string | undefined,
   ): Promise<StartedAttemptResult> {
-    const startedAt = this.#clock.now();
-    const eventId = this.#ids.nextEventId();
+    const startedAt = prescribedStartedAt ?? this.#clock.now();
+    const eventId = prescribedEventId ?? this.#ids.nextEventId();
     const attempt = {
       attemptId: `attempt-${eventId}`,
       retrySequenceId,
@@ -2889,7 +3082,11 @@ export class ResearchAgentRuntime {
       }],
     );
     await this.#runResearchLoopHook(
-      this.#researchLoopHooks.afterRetryAttemptStarted,
+      retrySequenceKind === "plan_generation"
+        ? this.#researchLoopHooks.afterPlanRetryAttemptStarted
+        : retrySequenceKind === "artifact_proposal"
+          ? this.#researchLoopHooks.afterArtifactRetryAttemptStarted
+          : this.#researchLoopHooks.afterRetryAttemptStarted,
     );
     return { projection, attempt };
   }
@@ -2897,7 +3094,11 @@ export class ResearchAgentRuntime {
   #recoverInterruptedAttempt(
     current: RunProjection,
   ): CompletedRetryAttempt | undefined {
-    if (current.state.type !== "researching") return undefined;
+    if (
+      current.state.type !== "planning" &&
+      current.state.type !== "researching" &&
+      current.state.type !== "research_complete"
+    ) return undefined;
     const pending = current.state.retryAttempts.find(
       (attempt): attempt is InProgressRetryAttempt =>
         attempt.outcome === "in_progress",
@@ -2905,9 +3106,13 @@ export class ResearchAgentRuntime {
     if (pending === undefined) return undefined;
     const failure: NormalizedFailure = {
       category: "infrastructure_transient",
-      code: pending.retrySequenceKind === "model_turn"
-        ? "model_turn_interrupted"
-        : "search_interrupted",
+      code: pending.retrySequenceKind === "plan_generation"
+        ? "plan_generation_interrupted"
+        : pending.retrySequenceKind === "model_turn"
+          ? "model_turn_interrupted"
+          : pending.retrySequenceKind === "search_sources"
+            ? "search_interrupted"
+            : "artifact_proposal_interrupted",
     };
     return this.#completeFailedAttempt(pending, failure);
   }
@@ -2930,9 +3135,9 @@ export class ResearchAgentRuntime {
     completedAt = this.#clock.now(),
   ): CompletedRetryAttempt {
     const retryable = failure.category === "infrastructure_transient";
-    const maxAttempts = attempt.retrySequenceKind === "model_turn"
-      ? attempt.retryPolicy.modelMaxAttempts
-      : attempt.retryPolicy.toolMaxAttempts;
+    const maxAttempts = attempt.retrySequenceKind === "search_sources"
+      ? attempt.retryPolicy.toolMaxAttempts
+      : attempt.retryPolicy.modelMaxAttempts;
     const canRetry = retryable && attempt.attemptNumber < maxAttempts;
     return {
       ...attempt,
@@ -2964,7 +3169,7 @@ export class ResearchAgentRuntime {
       payload: { attempt },
     };
     const events: ResearchRunEvent[] = [failureEvent];
-    const hasOtherInProgressAttempt = current.state.type === "researching" &&
+    const hasOtherInProgressAttempt = "retryAttempts" in current.state &&
       current.state.retryAttempts.some((candidate) =>
         candidate.outcome === "in_progress" &&
         candidate.attemptId !== attempt.attemptId
@@ -3097,6 +3302,16 @@ export class ResearchAgentRuntime {
       return { category: "model_contract", code: "invalid_model_turn" };
     }
     return { category: "model_permanent", code: "model_generation_failed" };
+  }
+
+  #normalizeOuterModelFailure(
+    error: unknown,
+    kind: "plan_generation" | "artifact_proposal",
+  ): NormalizedFailure {
+    if (error instanceof z.ZodError && kind === "plan_generation") {
+      return { category: "model_contract", code: "invalid_research_plan" };
+    }
+    return this.#normalizeModelFailure(error);
   }
 
   #normalizeInfrastructureFailure(
@@ -3713,19 +3928,45 @@ export class ResearchAgentRuntime {
       throw new EvidenceGateBlockedError();
     }
 
+    let publicationTarget: PublicationTarget;
+    try {
+      // target containment 与 parent identity 都不依赖模型输出。把这一步放在
+      // Artifact proposal generation 前，非法 target 就不会先消耗一个已完成
+      // provider result、再遗留只能被误判为 interrupted 的 pending attempt。
+      publicationTarget = await this.#publisher.prepareTarget(targetPath);
+    } catch (error) {
+      if (error instanceof PublicationTargetPreparationError) {
+        throw new LearningArtifactDraftError();
+      }
+      throw error;
+    }
+
     let proposal: LearningArtifactProposal;
     let gate: ReturnType<typeof evaluateEvidenceGate>;
     let proposalCompletedAt: string;
+    let proposalAttempt: OuterModelRetryAttempt | undefined;
     try {
-      proposal = parseLearningArtifactProposal(
-        await this.#model.proposeLearningArtifact({
+      const recoveredAttempt = this.#recoverInterruptedAttempt(current);
+      if (recoveredAttempt !== undefined) {
+        current = this.#commitFailedAttempt(current, recoveredAttempt);
+        if (current.state.type === "retry_exhausted") {
+          throw new LearningArtifactDraftError();
+        }
+      }
+      const generated = await this.#retryOuterModelGeneration(
+        current,
+        "artifact_proposal",
+        () => this.#model.proposeLearningArtifact({
           runId,
           question: current.question,
           claims: researching.claims,
           evidenceRecords: researching.evidenceRecords,
         }, { abortSignal: modelAbortSignal }),
       );
-      proposalCompletedAt = this.#clock.now();
+      current = generated.projection;
+      proposalAttempt = generated.attempt;
+      proposal = parseLearningArtifactProposal(generated.value);
+      proposalCompletedAt = generated.attempt.completedAt;
       assertEvidenceGateBudget({
         modelTurnsUsed:
           2 +
@@ -3759,15 +4000,26 @@ export class ResearchAgentRuntime {
       });
     } catch (error) {
       if (error instanceof ModelGenerationAbortedError) throw error;
+      if (error instanceof LearningArtifactDraftError) throw error;
       if (error instanceof EvidenceGateError) {
-        this.#appendEvidenceGateRepair(current, error.code, true);
+        this.#appendEvidenceGateRepair(
+          current,
+          error.code,
+          true,
+          proposalAttempt,
+        );
         throw new EvidenceGateBlockedError();
       }
       if (error instanceof z.ZodError) {
         // Model Port 已返回 completed result 后，proposal schema 失败也是真实的模型
         // 消耗。必须先把这次 turn 作为 repair 事实计账，再让 Research Loop 修复；
         // 否则调用方可无限重采样无效提案而绕过 canonical Run Budget。
-        this.#appendEvidenceGateRepair(current, "proposal_invalid", true);
+        this.#appendEvidenceGateRepair(
+          current,
+          "proposal_invalid",
+          true,
+          proposalAttempt,
+        );
         throw new EvidenceGateBlockedError();
       }
       // Model adapter、Zod 与 renderer 的诊断可能回显 scripts 或 provider payload；
@@ -3775,15 +4027,6 @@ export class ResearchAgentRuntime {
       throw new LearningArtifactDraftError();
     }
 
-    let publicationTarget: PublicationTarget;
-    try {
-      publicationTarget = await this.#publisher.prepareTarget(targetPath);
-    } catch (error) {
-      if (error instanceof PublicationTargetPreparationError) {
-        throw new LearningArtifactDraftError();
-      }
-      throw error;
-    }
     const reviewRequest = buildEvaluatorReviewRequest({
       question: current.question,
       claims: gate.claims,
@@ -3815,7 +4058,23 @@ export class ResearchAgentRuntime {
         inputHash,
       });
     } catch (error) {
-      if (error instanceof ModelGenerationAbortedError) throw error;
+      if (error instanceof ModelGenerationAbortedError) {
+        // proposal 已完整生成并通过 Gate 后，取消只属于 isolated Evaluator。
+        // 先冻结 exact proposal/input/target 并闭合 proposal attempt，重启后只重试 review。
+        this.#appendEvaluatorReviewFailure(
+          current,
+          proposal,
+          publicationTarget,
+          inputHash,
+          evaluator?.identity ?? {
+            provider: "unavailable",
+            model: "unavailable",
+            promptVersion: "unavailable",
+          },
+          proposalAttempt,
+        );
+        throw error;
+      }
       this.#appendEvaluatorReviewFailure(
         current,
         proposal,
@@ -3826,6 +4085,7 @@ export class ResearchAgentRuntime {
           model: "unavailable",
           promptVersion: "unavailable",
         },
+        proposalAttempt,
       );
       throw new EvaluatorReviewPendingError();
     }
@@ -3843,7 +4103,15 @@ export class ResearchAgentRuntime {
     let draftArtifact: PersistedArtifact;
     try {
       draftArtifact = await this.#artifacts.putMarkdown(markdown, proposedAt);
-    } catch {
+    } catch (error) {
+      if (proposalAttempt !== undefined) {
+        this.#appendArtifactProposalFailure(
+          current,
+          proposalAttempt,
+          "artifact_draft_persistence_failed",
+        );
+      }
+      if (error instanceof LearningArtifactDraftConflictError) throw error;
       throw new LearningArtifactDraftError();
     }
     const publicationBinding = createPublicationApprovalBinding({
@@ -3868,6 +4136,7 @@ export class ResearchAgentRuntime {
         publicationTarget,
         publicationBinding,
         publicationApprovalSummary,
+        ...(proposalAttempt === undefined ? {} : { attempt: proposalAttempt }),
       },
     };
 
@@ -3888,6 +4157,49 @@ export class ResearchAgentRuntime {
     }
   }
 
+  /** provider 已成功返回但后处理永久失败时，闭合 attempt 并终止而不重采样。 */
+  #appendArtifactProposalFailure(
+    current: RunProjection,
+    proposalAttempt: OuterModelRetryAttempt,
+    code: string,
+  ): void {
+    try {
+      this.#appendOuterModelPostprocessingFailure(
+        current,
+        proposalAttempt,
+        code,
+      );
+    } catch (error) {
+      if (error instanceof ConcurrentRunWriteError) {
+        throw new LearningArtifactDraftConflictError();
+      }
+      throw error;
+    }
+  }
+
+  /** 外层 Model generation 已完成、但 CAS/Journal 后处理失败时原子闭合 attempt。 */
+  #appendOuterModelPostprocessingFailure(
+    current: RunProjection,
+    attempt: OuterModelRetryAttempt,
+    code: string,
+  ): void {
+    const occurredAt = this.#clock.now();
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId: current.runId,
+      sequence: current.lastEventSequence + 1,
+      type: "run_failed",
+      occurredAt,
+      payload: {
+        retrySequenceId: attempt.retrySequenceId,
+        retrySequenceKind: attempt.retrySequenceKind,
+        failure: { category: "invariant_violation", code },
+        attempt,
+      },
+    };
+    this.#appendEvents(current.runId, current.lastEventSequence, [event]);
+  }
+
   /** Evaluator failure 冻结 exact proposal/input/target，后续 retry 不会重采样 proposal。 */
   #appendEvaluatorReviewFailure(
     current: RunProjection,
@@ -3895,6 +4207,7 @@ export class ResearchAgentRuntime {
     publicationTarget: PublicationTarget,
     inputHash: string,
     evaluatorIdentity: import("../domain/types.js").EvaluatorIdentity,
+    proposalAttempt?: OuterModelRetryAttempt | undefined,
   ): void {
     const failedAt = this.#clock.now();
     const event: ResearchRunEvent = {
@@ -3913,6 +4226,7 @@ export class ResearchAgentRuntime {
           code: "evaluation_failed",
           failedAt,
         },
+        ...(proposalAttempt === undefined ? {} : { attempt: proposalAttempt }),
       },
     };
     try {
@@ -4151,15 +4465,20 @@ export class ResearchAgentRuntime {
   }
 
   /**
-   * 只有 completed Research Loop 才能回到 repair：legacy 显式路径没有下一轮模型，
-   * 因而保持原状态并只返回 blocked error，避免凭空制造一个无法消费的反馈循环。
+   * completed Research Loop 会回到 repair；legacy 显式路径只有在 proposal provider
+   * 已成功时才追加同一事实，用它原子闭合 durable attempt，后续由下一条显式命令修复。
+   * provider I/O 前的 cheap gate 仍不制造 legacy repair，以免改变未采样路径的 Journal。
    */
   #appendEvidenceGateRepair(
     current: RunProjection,
     code: import("../domain/types.js").EvidenceGateRepairCode,
     artifactProposalTurnConsumed: boolean,
+    attempt?: OuterModelRetryAttempt | undefined,
   ): void {
-    if (current.state.type !== "research_complete") return;
+    if (
+      current.state.type !== "research_complete" &&
+      (current.state.type !== "researching" || attempt === undefined)
+    ) return;
     const occurredAt = this.#clock.now();
     const eventId = this.#ids.nextEventId();
     const event: ResearchRunEvent = {
@@ -4175,6 +4494,7 @@ export class ResearchAgentRuntime {
           artifactProposalTurnConsumed,
           requestedAt: occurredAt,
         }),
+        ...(attempt === undefined ? {} : { attempt }),
       },
     };
     try {
@@ -4745,11 +5065,33 @@ export class ResearchAgentRuntime {
 
   public async resumeRun(command: ResumeRunCommand): Promise<RunProjection> {
     const { runId } = runIdentityCommandSchema.parse(command);
-    return this.#withRunOperation(runId, "resume_run", () => this.#resumeRun(runId));
+    return this.#withRunOperation(
+      runId,
+      "resume_run",
+      (_lease, operationSignal) => this.#resumeRun(runId, operationSignal),
+    );
   }
 
-  #resumeRun(runId: string): RunProjection {
+  async #resumeRun(
+    runId: string,
+    operationSignal: AbortSignal,
+  ): Promise<RunProjection> {
     const current = this.#store.readProjection(runId);
+    if (current.state.type === "planning") {
+      if (!sameExperimentIdentity(
+        current.experimentIdentity,
+        this.#model.experimentIdentity,
+      )) {
+        throw new ResearchLoopError();
+      }
+      return this.#completeRunCreation({
+        runId,
+        question: current.question,
+        sourceScope: current.sourceScope,
+        runBudget: current.runBudget,
+        operationSignal,
+      });
+    }
     const occurredAt = this.#clock.now();
     return this.#appendEvents(runId, current.lastEventSequence, [{
       eventId: this.#ids.nextEventId(),

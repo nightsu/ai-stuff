@@ -124,8 +124,12 @@ export interface NormalizedFailure {
   readonly retryAfterMs?: number | undefined;
 }
 
-/** Harness 当前支持自动 retry 的两类 Retry Sequence。 */
-export type RetrySequenceKind = "model_turn" | "search_sources";
+/** Harness 当前支持自动 retry 的外部模型与只读工具 Retry Sequence。 */
+export type RetrySequenceKind =
+  | "plan_generation"
+  | "model_turn"
+  | "search_sources"
+  | "artifact_proposal";
 
 /** 一个物理外部调用开始后、尚未得到 canonical 结果的 attempt。 */
 export interface InProgressRetryAttempt {
@@ -174,6 +178,18 @@ export interface CompletedRetryAttempt
 export type RetryAttempt =
   | InProgressRetryAttempt
   | CompletedRetryAttempt;
+
+/** planning/publication 外层 generation 的完整物理 attempt。 */
+export type OuterModelRetryAttempt = CompletedRetryAttempt & {
+  /** 只允许计划生成或 Learning Artifact 提案 generation。 */
+  readonly retrySequenceKind: "plan_generation" | "artifact_proposal";
+  /** 外层 generation 不属于 Research Tool，因此不得携带 tool identity。 */
+  readonly toolCallId?: undefined;
+  /** 外层 generation 不消费 model-visible intent。 */
+  readonly intentId?: undefined;
+  /** 外层 generation 不使用 Research Loop steering。 */
+  readonly latestSteering?: undefined;
+};
 
 /** 用户批准计划时必须逐字段匹配的内容寻址边界。 */
 export interface PlanApprovalBinding {
@@ -489,6 +505,8 @@ export interface PlanningRunState {
   readonly type: "planning";
   /** 规划开始时间，ISO 8601 UTC 字符串。 */
   readonly startedAt: string;
+  /** plan generation 在 provider I/O 前开始并按 Journal 顺序闭合的 attempts。 */
+  readonly retryAttempts: readonly RetryAttempt[];
 }
 
 /** 计划已生成且必须等待精确版本批准的暂停状态。 */
@@ -594,31 +612,98 @@ export type BudgetExhaustedRunState =
   | IncompleteBudgetExhaustedRunState
   | CompletedResearchBudgetExhaustedRunState;
 
-/** 自动 retry 已达到冻结策略边界后的 Suspended Run。 */
-export interface RetryExhaustedRunState extends EvidenceBackedRunStateData {
+/** plan generation 在形成可审批计划前达到 retry 上限的 Suspended Run。 */
+export interface PlanningRetryExhaustedRunState {
+  /** 判别字段；该状态不会自动开启新的计划 generation。 */
+  readonly type: "retry_exhausted";
+  /** 原 `planning_started` 的 ISO 8601 UTC 时间。 */
+  readonly planningStartedAt: string;
+  /** 达到 retry 边界的 Retry Sequence identity。 */
+  readonly retrySequenceId: string;
+  /** planning exhaustion 只能来自计划 generation。 */
+  readonly retrySequenceKind: "plan_generation";
+  /** 已经开始并保留在 Journal 中的物理 attempts 数。 */
+  readonly attemptsUsed: number;
+  /** 最后一次失败或未完成 attempt 的安全规范原因。 */
+  readonly failure: NormalizedFailure;
+  /** plan generation 在 provider I/O 前开始并按 Journal 顺序闭合的 attempts。 */
+  readonly retryAttempts: readonly RetryAttempt[];
+}
+
+/** 计划审批后的外部调用达到冻结 retry 上限时保留的研究事实。 */
+export interface EvidenceBackedRetryExhaustedRunState
+  extends EvidenceBackedRunStateData {
   /** 判别字段；该状态不会自动继续采样或执行工具。 */
   readonly type: "retry_exhausted";
   /** 达到 retry 边界的 Retry Sequence identity。 */
   readonly retrySequenceId: string;
   /** 被暂停的模型 generation 或只读 search 类型。 */
-  readonly retrySequenceKind: RetrySequenceKind;
+  readonly retrySequenceKind:
+    | "model_turn"
+    | "search_sources"
+    | "artifact_proposal";
   /** 已经开始并保留在 Journal 中的物理 attempts 数。 */
   readonly attemptsUsed: number;
   /** 最后一次失败或未完成 attempt 的安全规范原因。 */
   readonly failure: NormalizedFailure;
 }
 
-/** 不应自动修复的模型契约或永久失败形成的 terminal Run。 */
-export interface FailedRunState extends EvidenceBackedRunStateData {
+/** 自动 retry 已达到冻结策略边界后的完整 Suspended Run 联合。 */
+export type RetryExhaustedRunState =
+  | PlanningRetryExhaustedRunState
+  | EvidenceBackedRetryExhaustedRunState;
+
+/** planning 阶段不可自动修复的模型契约或永久失败形成的 terminal Run。 */
+export interface PlanningFailedRunState {
+  /** 判别字段；terminal failed Run 不得继续规划或进入审批。 */
+  readonly type: "failed";
+  /** 原 `planning_started` 的 ISO 8601 UTC 时间。 */
+  readonly planningStartedAt: string;
+  /** plan generation 在 provider I/O 前开始并按 Journal 顺序闭合的 attempts。 */
+  readonly retryAttempts: readonly RetryAttempt[];
+  /** planning failure 只能来自计划 generation。 */
+  readonly retrySequenceKind: "plan_generation";
+  /** 导致 planning 终止的 Retry Sequence identity。 */
+  readonly retrySequenceId: string;
+  /** 不含原始异常或秘密的终止原因。 */
+  readonly failure: NormalizedFailure;
+}
+
+/** 研究尚未显式完成时形成的 evidence-backed terminal failure。 */
+export interface IncompleteResearchFailedRunState
+  extends EvidenceBackedRunStateData {
   /** 判别字段；terminal failed Run 不得继续研究或发布。 */
   readonly type: "failed";
   /** 导致 Run 终止的 Retry Sequence identity。 */
   readonly retrySequenceId: string;
-  /** 失败发生在模型 generation 或只读 search。 */
-  readonly retrySequenceKind: RetrySequenceKind;
+  /** 失败发生在 Research Loop generation、Search 或 Artifact proposal。 */
+  readonly retrySequenceKind: "model_turn" | "search_sources" | "artifact_proposal";
   /** 不含原始异常或秘密的终止原因。 */
   readonly failure: NormalizedFailure;
+  /** 未显式完成研究的 failure 不得伪造 completion。 */
+  readonly completion?: undefined;
 }
+
+/** 已显式完成研究后，Artifact proposal 永久失败形成的 terminal Run。 */
+export interface CompletedResearchFailedRunState
+  extends EvidenceBackedRunStateData {
+  /** 判别字段；terminal failed Run 不得继续生成或发布。 */
+  readonly type: "failed";
+  /** 导致 Run 终止的 Artifact proposal Retry Sequence identity。 */
+  readonly retrySequenceId: string;
+  /** 已完成研究后的 failure 只能来自 Artifact proposal。 */
+  readonly retrySequenceKind: "artifact_proposal";
+  /** 不含原始异常或秘密的终止原因。 */
+  readonly failure: NormalizedFailure;
+  /** failure 前已 durable 记录、必须继续保留的 Research Completion。 */
+  readonly completion: ResearchCompletion;
+}
+
+/** 不应自动修复的 planning 或 evidence-backed terminal failure 联合。 */
+export type FailedRunState =
+  | PlanningFailedRunState
+  | IncompleteResearchFailedRunState
+  | CompletedResearchFailedRunState;
 
 /** 用户显式暂停时可被完整嵌入、随后精确恢复的工作状态。 */
 export type PausableRunState =
@@ -789,8 +874,14 @@ export interface RunCreatedPayload {
   readonly runBudget: RunBudget;
   /** Model Port 提供的非秘密实验身份；不得包含 base URL、header 或 API key。 */
   readonly experimentIdentity?: ExperimentIdentity | undefined;
-  /** 创建时显式启用并冻结的自动 retry 策略；省略即保持 legacy 单 attempt。 */
+  /** 创建时显式启用并冻结的自动 retry 策略；省略时外层 generation 仍使用 durable 单次协议。 */
   readonly retryPolicy?: RetryPolicy | undefined;
+}
+
+/** `planning_started` 在默认单次协议下同时持久化 provider I/O 前的 attempt。 */
+export interface PlanningStartedPayload {
+  /** 默认 CLI 路径的 durable plan attempt；显式 Retry Policy 使用独立 start 事件。 */
+  readonly attempt?: InProgressRetryAttempt | undefined;
 }
 
 /** `plan_proposed` 事件携带的计划事实。 */
@@ -799,6 +890,8 @@ export interface PlanProposedPayload {
   readonly planArtifact: ArtifactReference;
   /** 该计划进入等待审批状态时计算并持久化的精确边界。 */
   readonly approvalBinding: PlanApprovalBinding;
+  /** 成功 generation 的 durable attempt；旧版无 attempt Journal 为兼容回放可省略。 */
+  readonly attempt?: OuterModelRetryAttempt | undefined;
 }
 
 /** `plan_approved` 事件携带且足以独立审计的用户审批事实。 */
@@ -851,6 +944,8 @@ export interface RunFailedPayload {
   readonly retrySequenceKind: RetrySequenceKind;
   /** 规范化且不得携带秘密的永久失败原因。 */
   readonly failure: NormalizedFailure;
+  /** plan 或 Artifact proposal 成功、但后处理失败时与 terminal outcome 原子闭合的 attempt。 */
+  readonly attempt?: OuterModelRetryAttempt | undefined;
 }
 
 /** `research_tool_observed` 事件携带的 Harness 工具反馈。 */
@@ -995,6 +1090,8 @@ export interface EvidenceGateRepair {
 export interface EvidenceGateRepairRequestedPayload {
   /** reducer 必须按 event identity、code 与时间重新验证的 repair。 */
   readonly repair: EvidenceGateRepair;
+  /** proposal generation 已完成时，与 repair 同事务闭合的成功 attempt。 */
+  readonly attempt?: OuterModelRetryAttempt | undefined;
 }
 
 /** 模型只能选择既有 Claim、不能自造 citation identity 的有界 Markdown 提案。 */
@@ -1515,6 +1612,8 @@ export interface LearningArtifactDraftProposedPayload {
   readonly publicationBinding: PublicationApprovalBinding;
   /** 用户签发 approval 前同时核验的 Gate 与 Evaluator 摘要。 */
   readonly publicationApprovalSummary: PublicationApprovalSummary;
+  /** 成功 proposal generation 的 durable attempt；旧版无 attempt Journal 为兼容回放可省略。 */
+  readonly attempt?: OuterModelRetryAttempt | undefined;
 }
 
 /** `evaluator_review_failed` 事件冻结 exact input 与可恢复失败等待。 */
@@ -1529,6 +1628,8 @@ export interface EvaluatorReviewFailedPayload {
   readonly evaluatorIdentity: EvaluatorIdentity;
   /** 当前 attempt 的安全失败事实。 */
   readonly failure: EvaluatorReviewFailure;
+  /** 首次 review 前成功完成的 Artifact proposal attempt；review retry 时省略。 */
+  readonly attempt?: OuterModelRetryAttempt | undefined;
 }
 
 /** `publication_approved` 事件携带的用户审批事实。 */
@@ -1594,7 +1695,7 @@ export interface RunEvent<Type extends string, Payload> {
 /** 当前 planning slice 的完整 Run Journal 事件联合。 */
 export type ResearchRunEvent =
   | RunEvent<"run_created", RunCreatedPayload>
-  | RunEvent<"planning_started", Record<never, never>>
+  | RunEvent<"planning_started", PlanningStartedPayload>
   | RunEvent<"plan_proposed", PlanProposedPayload>
   | RunEvent<"plan_approved", PlanApprovedPayload>
   | RunEvent<"retry_attempt_started", RetryAttemptStartedPayload>

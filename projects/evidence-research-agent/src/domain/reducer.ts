@@ -193,9 +193,28 @@ function applyRunEvent(
       if (current.state.type !== "created") {
         throw new IllegalRunEventError("只有 created Run 可以开始规划");
       }
+      const attempt = event.payload.attempt;
+      if (
+        attempt !== undefined &&
+        (
+          attempt.retrySequenceKind !== "plan_generation" ||
+          attempt.attemptNumber !== 1 ||
+          !isNoAutomaticRetryPolicy(attempt.retryPolicy) ||
+          attempt.startedAt !== event.occurredAt ||
+          attempt.toolCallId !== undefined ||
+          attempt.intentId !== undefined ||
+          attempt.latestSteering !== undefined
+        )
+      ) {
+        throw new IllegalRunEventError("planning default attempt 无效");
+      }
       return {
         ...current,
-        state: { type: "planning", startedAt: event.occurredAt },
+        state: {
+          type: "planning",
+          startedAt: event.occurredAt,
+          retryAttempts: attempt === undefined ? [] : [attempt],
+        },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
@@ -214,6 +233,26 @@ function applyRunEvent(
         throw new IllegalRunEventError(
           "plan_proposed artifact identity 与内容摘要不一致",
         );
+      }
+      if (
+        event.payload.attempt !== undefined &&
+        (
+          event.payload.attempt.retrySequenceKind !== "plan_generation" ||
+          event.payload.attempt.outcome !== "succeeded" ||
+          event.payload.attempt.completedAt !== event.occurredAt
+        )
+      ) {
+        throw new IllegalRunEventError("plan_proposed retry attempt 无效");
+      }
+      const planAttempts = event.payload.attempt === undefined
+        ? current.state.retryAttempts
+        : completePendingAttempt(
+            current.state.retryAttempts,
+            event.payload.attempt,
+            event.occurredAt,
+          );
+      if (planAttempts.some((attempt) => attempt.outcome === "in_progress")) {
+        throw new IllegalRunEventError("plan_proposed 不得遗留未完成 Retry Attempt");
       }
       const expectedApprovalBinding = createPlanApprovalBinding({
         question: current.question,
@@ -310,10 +349,27 @@ function applyRunEvent(
       };
     }
     case "retry_attempt_started": {
-      if (current.state.type !== "researching") {
-        throw new IllegalRunEventError("只有 researching Run 可以开始 Retry Attempt");
-      }
       validateStartedAttempt(current, event.payload.attempt, event.occurredAt);
+      if (current.state.type === "planning") {
+        return {
+          ...current,
+          state: {
+            ...current.state,
+            retryAttempts: [
+              ...current.state.retryAttempts,
+              event.payload.attempt,
+            ],
+          },
+          lastEventSequence: event.sequence,
+          updatedAt: event.occurredAt,
+        };
+      }
+      if (
+        current.state.type !== "researching" &&
+        current.state.type !== "research_complete"
+      ) {
+        throw new IllegalRunEventError("当前 Run 状态不能开始 Retry Attempt");
+      }
       return {
         ...current,
         state: {
@@ -333,9 +389,24 @@ function applyRunEvent(
       };
     }
     case "retry_attempt_failed": {
-      const researching = researchingStateForLateResult(current);
+      if (current.state.type === "planning") {
+        return {
+          ...current,
+          state: {
+            ...current.state,
+            retryAttempts: completePendingAttempt(
+              current.state.retryAttempts,
+              event.payload.attempt,
+              event.occurredAt,
+            ),
+          },
+          lastEventSequence: event.sequence,
+          updatedAt: event.occurredAt,
+        };
+      }
+      const researching = evidenceBackedStateForAttemptResult(current);
       if (researching === undefined) {
-        throw new IllegalRunEventError("只有 researching Run 可以完成失败 attempt");
+        throw new IllegalRunEventError("只有 evidence-backed Run 可以完成失败 attempt");
       }
       const attempts = completePendingAttempt(
         researching.retryAttempts,
@@ -349,30 +420,167 @@ function applyRunEvent(
       );
     }
     case "run_retry_exhausted": {
-      if (current.state.type !== "researching") {
-        throw new IllegalRunEventError("只有 researching Run 可以因 retry exhaustion 暂停");
+      const attempts = current.state.type === "planning"
+        ? current.state.retryAttempts
+        : "retryAttempts" in current.state
+          ? current.state.retryAttempts
+          : undefined;
+      if (attempts === undefined) {
+        throw new IllegalRunEventError("当前 Run 状态不能因 retry exhaustion 暂停");
       }
       validateTerminalAttemptTransition(
-        current.state.retryAttempts,
+        attempts,
         event.payload.retrySequenceId,
         event.payload.retrySequenceKind,
         event.payload.attemptsUsed,
         event.payload.failure,
       );
+      if (
+        current.state.type !== "planning" &&
+        current.state.type !== "researching" &&
+        current.state.type !== "research_complete"
+      ) {
+        throw new IllegalRunEventError("retry exhaustion 状态不保留可恢复工作");
+      }
+      if (
+        current.state.type === "planning" &&
+        event.payload.retrySequenceKind !== "plan_generation"
+      ) {
+        throw new IllegalRunEventError("planning 只能耗尽 plan generation retry");
+      }
+      if (
+        current.state.type !== "planning" &&
+        event.payload.retrySequenceKind === "plan_generation"
+      ) {
+        throw new IllegalRunEventError("plan generation retry 不能耗尽研究状态");
+      }
+      const evidenceBackedRetrySequenceKind =
+        event.payload.retrySequenceKind as
+          | "model_turn"
+          | "search_sources"
+          | "artifact_proposal";
       return {
         ...current,
-        state: {
-          ...current.state,
-          type: "retry_exhausted",
-          ...event.payload,
-        },
+        state: current.state.type === "planning"
+          ? {
+              type: "retry_exhausted",
+              planningStartedAt: current.state.startedAt,
+              retryAttempts: current.state.retryAttempts,
+              ...event.payload,
+              retrySequenceKind: "plan_generation",
+            }
+          : {
+              ...current.state,
+              type: "retry_exhausted",
+              ...event.payload,
+              retrySequenceKind: evidenceBackedRetrySequenceKind,
+            },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
     }
     case "run_failed": {
-      if (current.state.type !== "researching") {
-        throw new IllegalRunEventError("只有 researching Run 可以进入 failed");
+      if (event.payload.attempt !== undefined) {
+        const planningFailure =
+          current.state.type === "planning" &&
+          event.payload.retrySequenceKind === "plan_generation" &&
+          event.payload.attempt.retrySequenceKind === "plan_generation";
+        const artifactFailure =
+          (current.state.type === "researching" ||
+            current.state.type === "research_complete") &&
+          event.payload.retrySequenceKind === "artifact_proposal" &&
+          event.payload.attempt.retrySequenceKind === "artifact_proposal";
+        if (
+          (!planningFailure && !artifactFailure) ||
+          event.payload.attempt.retrySequenceId !==
+            event.payload.retrySequenceId ||
+          event.payload.attempt.outcome !== "succeeded" ||
+          event.payload.failure.category !== "invariant_violation" ||
+          Date.parse(event.payload.attempt.completedAt) >
+            Date.parse(event.occurredAt)
+        ) {
+          throw new IllegalRunEventError(
+            "Artifact proposal 后处理 failure provenance 无效",
+          );
+        }
+        const retryAttempts = completePendingAttempt(
+          current.state.retryAttempts,
+          event.payload.attempt,
+          event.payload.attempt.completedAt,
+        );
+        if (current.state.type === "planning") {
+          return {
+            ...current,
+            state: {
+              type: "failed",
+              planningStartedAt: current.state.startedAt,
+              retryAttempts,
+              retrySequenceId: event.payload.retrySequenceId,
+              retrySequenceKind: "plan_generation",
+              failure: event.payload.failure,
+            },
+            lastEventSequence: event.sequence,
+            updatedAt: event.occurredAt,
+          };
+        }
+        return {
+          ...current,
+          state: current.state.type === "research_complete"
+            ? {
+                ...current.state,
+                type: "failed",
+                retryAttempts,
+                retrySequenceId: event.payload.retrySequenceId,
+                retrySequenceKind: "artifact_proposal",
+                failure: event.payload.failure,
+              }
+            : {
+                ...current.state,
+                type: "failed",
+                retryAttempts,
+                retrySequenceId: event.payload.retrySequenceId,
+                retrySequenceKind: "artifact_proposal",
+                failure: event.payload.failure,
+              },
+          lastEventSequence: event.sequence,
+          updatedAt: event.occurredAt,
+        };
+      }
+      if (current.state.type === "planning") {
+        if (event.payload.retrySequenceKind !== "plan_generation") {
+          throw new IllegalRunEventError("planning failure 只能来自 plan generation");
+        }
+        validateTerminalAttemptTransition(
+          current.state.retryAttempts,
+          event.payload.retrySequenceId,
+          event.payload.retrySequenceKind,
+          undefined,
+          event.payload.failure,
+        );
+        return {
+          ...current,
+          state: {
+            type: "failed",
+            planningStartedAt: current.state.startedAt,
+            retryAttempts: current.state.retryAttempts,
+            ...event.payload,
+            retrySequenceKind: "plan_generation",
+          },
+          lastEventSequence: event.sequence,
+          updatedAt: event.occurredAt,
+        };
+      }
+      if (
+        current.state.type !== "researching" &&
+        current.state.type !== "research_complete"
+      ) {
+        throw new IllegalRunEventError("只有 active evidence-backed Run 可以进入 failed");
+      }
+      if (
+        current.state.type === "research_complete" &&
+        event.payload.retrySequenceKind !== "artifact_proposal"
+      ) {
+        throw new IllegalRunEventError("完成研究后只能因 Artifact proposal 进入 failed");
       }
       validateTerminalAttemptTransition(
         current.state.retryAttempts,
@@ -383,7 +591,22 @@ function applyRunEvent(
       );
       return {
         ...current,
-        state: { ...current.state, type: "failed", ...event.payload },
+        state: current.state.type === "research_complete"
+          ? {
+              ...current.state,
+              type: "failed",
+              ...event.payload,
+              retrySequenceKind: "artifact_proposal",
+            }
+          : {
+              ...current.state,
+              type: "failed",
+              ...event.payload,
+              retrySequenceKind: event.payload.retrySequenceKind as
+                | "model_turn"
+                | "search_sources"
+                | "artifact_proposal",
+            },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
@@ -743,9 +966,12 @@ function applyRunEvent(
       );
     }
     case "evidence_gate_repair_requested": {
-      if (current.state.type !== "research_complete") {
+      if (
+        current.state.type !== "research_complete" &&
+        current.state.type !== "researching"
+      ) {
         throw new IllegalRunEventError(
-          "只有 research_complete Run 可以请求 Evidence Gate repair",
+          "当前 Run 状态不能请求 Evidence Gate repair",
         );
       }
       const expected = createEvidenceGateRepair({
@@ -757,6 +983,42 @@ function applyRunEvent(
       });
       if (!isDeepStrictEqual(event.payload.repair, expected)) {
         throw new IllegalRunEventError("Evidence Gate repair 公共字段无效");
+      }
+      const retryAttempts = event.payload.attempt === undefined
+        ? current.state.retryAttempts
+        : completePendingAttempt(
+            current.state.retryAttempts,
+            event.payload.attempt,
+            event.payload.attempt.completedAt,
+          );
+      if (
+        (current.state.type === "researching" &&
+          event.payload.attempt === undefined) ||
+        (event.payload.attempt !== undefined &&
+          (
+            event.payload.attempt.retrySequenceKind !== "artifact_proposal" ||
+            event.payload.attempt.outcome !== "succeeded" ||
+            !event.payload.repair.artifactProposalTurnConsumed ||
+            Date.parse(event.payload.attempt.completedAt) >
+              Date.parse(event.occurredAt)
+          ))
+      ) {
+        throw new IllegalRunEventError("Evidence Gate repair attempt 无效");
+      }
+      if (current.state.type === "researching") {
+        return {
+          ...current,
+          state: {
+            ...current.state,
+            evidenceGateRepairs: [
+              ...current.state.evidenceGateRepairs,
+              event.payload.repair,
+            ],
+            retryAttempts,
+          },
+          lastEventSequence: event.sequence,
+          updatedAt: event.occurredAt,
+        };
       }
       const { completion: _completion, ...evidenceBacked } = current.state;
       const gateWaitDurationMs = elapsedMilliseconds(
@@ -774,6 +1036,7 @@ function applyRunEvent(
             ...current.state.evidenceGateRepairs,
             event.payload.repair,
           ],
+          retryAttempts,
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -936,6 +1199,7 @@ function applyRunEvent(
             current.state.evaluatorIdentity,
             event.payload.evaluatorIdentity,
           ) ||
+          event.payload.attempt !== undefined ||
           event.payload.failure.attempt !==
             current.state.evaluatorFailures.length + 1
         ) {
@@ -960,6 +1224,22 @@ function applyRunEvent(
           current.state.type !== "research_complete")
       ) {
         throw new IllegalRunEventError("Evaluator 首次失败 provenance 无效");
+      }
+      if (
+        current.retryPolicy !== undefined &&
+        event.payload.attempt === undefined
+      ) {
+        throw new IllegalRunEventError("启用 retry 的 proposal 必须随首次 Evaluator failure 闭合");
+      }
+      if (
+        event.payload.attempt !== undefined &&
+        (
+          event.payload.attempt.retrySequenceKind !== "artifact_proposal" ||
+          event.payload.attempt.outcome !== "succeeded" ||
+          Date.parse(event.payload.attempt.completedAt) > Date.parse(event.occurredAt)
+        )
+      ) {
+        throw new IllegalRunEventError("Evaluator failure proposal attempt 无效");
       }
       try {
         const gate = evaluateEvidenceGate(
@@ -995,7 +1275,13 @@ function applyRunEvent(
         evaluatorIdentity: event.payload.evaluatorIdentity,
         evaluatorFailures: [event.payload.failure] as const,
         suspendedDurationMs: current.state.suspendedDurationMs,
-        retryAttempts: current.state.retryAttempts,
+        retryAttempts: event.payload.attempt === undefined
+          ? current.state.retryAttempts
+          : completePendingAttempt(
+              current.state.retryAttempts,
+              event.payload.attempt,
+              event.payload.attempt.completedAt,
+            ),
       };
       return {
         ...current,
@@ -1065,6 +1351,25 @@ function applyRunEvent(
       ) {
         throw new IllegalRunEventError("Research Loop publication provenance 不完整");
       }
+      if (
+        event.payload.attempt !== undefined &&
+        (
+          event.payload.attempt.retrySequenceKind !== "artifact_proposal" ||
+          event.payload.attempt.outcome !== "succeeded" ||
+          Date.parse(event.payload.attempt.completedAt) >
+            Date.parse(event.occurredAt)
+        )
+      ) {
+        throw new IllegalRunEventError("draft proposal retry attempt 无效");
+      }
+      const artifactRetryAttempts = event.payload.attempt === undefined ||
+          current.state.type === "waiting_evaluator_resolution"
+        ? current.state.retryAttempts
+        : completePendingAttempt(
+            current.state.retryAttempts,
+            event.payload.attempt,
+            event.payload.attempt.completedAt,
+          );
       validateLearningArtifactDraft(
         current,
         event.payload,
@@ -1085,7 +1390,7 @@ function applyRunEvent(
         publicationBinding: event.payload.publicationBinding,
         publicationApprovalSummary: event.payload.publicationApprovalSummary,
         suspendedDurationMs: current.state.suspendedDurationMs,
-        retryAttempts: current.state.retryAttempts,
+        retryAttempts: artifactRetryAttempts,
       } as const;
       const fromResearchLoop =
         current.state.type === "research_complete" ||
@@ -1386,6 +1691,30 @@ function researchingStateForLateResult(
   return undefined;
 }
 
+function evidenceBackedStateForAttemptResult(
+  projection: RunProjection,
+):
+  | import("./types.js").ResearchingRunState
+  | import("./types.js").ResearchCompleteRunState
+  | undefined {
+  if (
+    projection.state.type === "researching" ||
+    projection.state.type === "research_complete"
+  ) {
+    return projection.state;
+  }
+  if (
+    projection.state.type === "cancelled" &&
+    (
+      projection.state.cancelledState.type === "researching" ||
+      projection.state.cancelledState.type === "research_complete"
+    )
+  ) {
+    return projection.state.cancelledState;
+  }
+  return undefined;
+}
+
 function commitResearchResultState(
   projection: RunProjection,
   resultState:
@@ -1473,8 +1802,12 @@ function validateStartedAttempt(
   attempt: InProgressRetryAttempt,
   occurredAt: string,
 ): void {
-  if (projection.state.type !== "researching") {
-    throw new IllegalRunEventError("只有 researching Run 可以开始 Retry Attempt");
+  if (
+    projection.state.type !== "planning" &&
+    projection.state.type !== "researching" &&
+    projection.state.type !== "research_complete"
+  ) {
+    throw new IllegalRunEventError("当前 Run 状态不能开始 Retry Attempt");
   }
   const state = projection.state;
   const sameSequence = state.retryAttempts.filter(
@@ -1482,8 +1815,11 @@ function validateStartedAttempt(
   );
   const previousAttempt = sameSequence.at(-1);
   const newSequence = previousAttempt === undefined;
-  const safeBatchPrefix = leadingSafeIntentCount(state.pendingToolIntents);
-  const searchIntentIndex = state.pendingToolIntents.findIndex(
+  const pendingToolIntents = state.type === "planning"
+    ? []
+    : state.pendingToolIntents;
+  const safeBatchPrefix = leadingSafeIntentCount(pendingToolIntents);
+  const searchIntentIndex = pendingToolIntents.findIndex(
     (intent) => intent.intentId === attempt.intentId,
   );
   const openSiblingSearchAttempts = state.retryAttempts.filter((candidate) =>
@@ -1493,13 +1829,21 @@ function validateStartedAttempt(
   const latestAttempt = state.retryAttempts.at(-1);
   const latestSequenceClosed = latestAttempt === undefined ||
     latestAttempt.outcome === "succeeded" ||
+    (latestAttempt.retrySequenceKind === "plan_generation" &&
+      latestAttempt.outcome === "permanent_failure" &&
+      latestAttempt.failure?.category === "model_permanent" &&
+      latestAttempt.failure.code === "model_generation_aborted") ||
     (latestAttempt.retrySequenceKind === "model_turn" &&
+      latestAttempt.outcome === "permanent_failure" &&
+      latestAttempt.failure?.category === "model_permanent" &&
+      latestAttempt.failure.code === "model_generation_aborted") ||
+    (latestAttempt.retrySequenceKind === "artifact_proposal" &&
       latestAttempt.outcome === "permanent_failure" &&
       latestAttempt.failure?.category === "model_permanent" &&
       latestAttempt.failure.code === "model_generation_aborted") ||
     (latestAttempt.retrySequenceKind === "search_sources" &&
       latestAttempt.outcome === "permanent_failure" &&
-      state.researchToolObservations.some(
+      state.type !== "planning" && state.researchToolObservations.some(
         (observation) => observation.toolCallId === latestAttempt.toolCallId,
       ));
   const startsSiblingSearch =
@@ -1507,7 +1851,7 @@ function validateStartedAttempt(
     searchIntentIndex >= 0 &&
     searchIntentIndex < safeBatchPrefix &&
     openSiblingSearchAttempts.every((candidate) => {
-      const candidateIndex = state.pendingToolIntents.findIndex(
+      const candidateIndex = pendingToolIntents.findIndex(
         (intent) => intent.intentId === candidate.intentId,
       );
       return candidateIndex >= 0 && candidateIndex < searchIntentIndex;
@@ -1523,15 +1867,32 @@ function validateStartedAttempt(
       attempt.latestSteering === previousAttempt.latestSteering;
   const modelShape =
     attempt.retrySequenceKind === "model_turn" &&
+    state.type === "researching" &&
     attempt.toolCallId === undefined &&
     attempt.intentId === undefined &&
-    state.pendingToolIntents.length === 0;
-  const searchIntent = state.pendingToolIntents[searchIntentIndex];
+    pendingToolIntents.length === 0;
+  const planShape =
+    attempt.retrySequenceKind === "plan_generation" &&
+    state.type === "planning" &&
+    attempt.toolCallId === undefined &&
+    attempt.intentId === undefined &&
+    attempt.latestSteering === undefined;
+  const artifactShape =
+    attempt.retrySequenceKind === "artifact_proposal" &&
+    (state.type === "researching" || state.type === "research_complete") &&
+    attempt.toolCallId === undefined &&
+    attempt.intentId === undefined &&
+    attempt.latestSteering === undefined;
+  const searchIntent = pendingToolIntents[searchIntentIndex];
   const searchShape =
     attempt.retrySequenceKind === "search_sources" &&
     attempt.toolCallId !== undefined &&
     attempt.intentId === searchIntent?.intentId &&
     searchIntent?.name === "search_sources";
+  const validRetryPolicy = projection.retryPolicy === undefined
+    ? (planShape || modelShape || searchShape || artifactShape) &&
+      isNoAutomaticRetryPolicy(attempt.retryPolicy)
+    : retryPoliciesEqual(attempt.retryPolicy, projection.retryPolicy);
   if (
     attempt.attemptId.trim() === "" ||
     attempt.retrySequenceId.trim() === "" ||
@@ -1541,9 +1902,8 @@ function validateStartedAttempt(
     state.retryAttempts.some(
       (candidate) => candidate.attemptId === attempt.attemptId,
     ) ||
-    projection.retryPolicy === undefined ||
-    !retryPoliciesEqual(attempt.retryPolicy, projection.retryPolicy) ||
-    (!modelShape && !searchShape)
+    !validRetryPolicy ||
+    (!planShape && !modelShape && !searchShape && !artifactShape)
   ) {
     throw new IllegalRunEventError("Retry Attempt start 与当前 Retry Sequence 不一致");
   }
@@ -1564,9 +1924,9 @@ function completePendingAttempt(
     throw new IllegalRunEventError("Retry Attempt completion 与 pending attempt 不一致");
   }
   const hasFailure = completed.outcome !== "succeeded";
-  const maxAttempts = completed.retrySequenceKind === "model_turn"
-    ? completed.retryPolicy.modelMaxAttempts
-    : completed.retryPolicy.toolMaxAttempts;
+  const maxAttempts = completed.retrySequenceKind === "search_sources"
+    ? completed.retryPolicy.toolMaxAttempts
+    : completed.retryPolicy.modelMaxAttempts;
   const infrastructureTransient =
     completed.failure?.category === "infrastructure_transient";
   const canRetry = infrastructureTransient &&
@@ -1626,6 +1986,16 @@ function retryPoliciesEqual(
     left.toolMaxAttempts === right.toolMaxAttempts &&
     left.baseDelayMs === right.baseDelayMs &&
     left.maxDelayMs === right.maxDelayMs;
+}
+
+function isNoAutomaticRetryPolicy(
+  policy: import("./types.js").RetryPolicy,
+): boolean {
+  return policy.version === "retry-disabled-v1" &&
+    policy.modelMaxAttempts === 1 &&
+    policy.toolMaxAttempts === 1 &&
+    policy.baseDelayMs === 0 &&
+    policy.maxDelayMs === 0;
 }
 
 function failuresEqual(
@@ -1708,14 +2078,48 @@ function traceLineage(
   | "retryDelayMs"
 > {
   const attempt =
-    event.type === "retry_attempt_started" ||
+    event.type === "planning_started" ||
+      event.type === "retry_attempt_started" ||
       event.type === "retry_attempt_failed"
       ? event.payload.attempt
+      : event.type === "plan_proposed" ||
+          event.type === "evidence_gate_repair_requested" ||
+          event.type === "learning_artifact_draft_proposed" ||
+          event.type === "evaluator_review_failed" ||
+          event.type === "run_failed"
+        ? event.payload.attempt
       : event.type === "model_turn_completed" ||
           event.type === "research_tool_observed"
         ? event.payload.attempt
         : undefined;
   if (attempt !== undefined) {
+    const attemptEventLineage = event.type === "research_tool_observed"
+      ? {
+          toolCallId: event.payload.observation.toolCallId,
+          observationId: event.payload.observation.observationId,
+          observationStatus: event.payload.observation.status === "succeeded"
+            ? "succeeded" as const
+            : "failed" as const,
+        }
+      : event.type === "evaluator_review_failed"
+      ? {
+          evaluatorInputHash: event.payload.evaluatorInputHash,
+          evaluatorProvider: event.payload.evaluatorIdentity.provider,
+          evaluatorModel: event.payload.evaluatorIdentity.model,
+          evaluatorPromptVersion: event.payload.evaluatorIdentity.promptVersion,
+          evaluatorAttempt: event.payload.failure.attempt,
+          evaluatorFailureCode: event.payload.failure.code,
+        }
+      : event.type === "evidence_gate_repair_requested"
+        ? { evidenceGateRepairCode: event.payload.repair.code }
+          : event.type === "learning_artifact_draft_proposed"
+            ? draftTraceLineage(event.payload)
+            : event.type === "run_failed"
+              ? {
+                  failureCategory: event.payload.failure.category,
+                  failureCode: event.payload.failure.code,
+                }
+          : {};
     return {
       retrySequenceId: attempt.retrySequenceId,
       retrySequenceKind: attempt.retrySequenceKind,
@@ -1734,7 +2138,10 @@ function traceLineage(
       ...(attempt.outcome === "in_progress" || attempt.retryDelayMs === undefined
         ? {}
         : { retryDelayMs: attempt.retryDelayMs }),
-      ...(attempt.toolCallId === undefined ? {} : { toolCallId: attempt.toolCallId }),
+      ...("toolCallId" in attempt && attempt.toolCallId !== undefined
+        ? { toolCallId: attempt.toolCallId }
+        : {}),
+      ...attemptEventLineage,
     };
   }
   if (event.type === "run_retry_exhausted" || event.type === "run_failed") {
@@ -1813,21 +2220,7 @@ function traceLineage(
     };
   }
   if (event.type === "learning_artifact_draft_proposed") {
-    const { evaluation } = event.payload;
-    return {
-      draftArtifactId: event.payload.draftArtifact.artifactId,
-      evaluationKind: evaluation.kind,
-      evaluationHash: event.payload.publicationBinding.evaluationHash,
-      ...(evaluation.kind === "reviewed"
-        ? {
-            evaluatorInputHash: evaluation.identity.inputHash,
-            evaluatorProvider: evaluation.identity.provider,
-            evaluatorModel: evaluation.identity.model,
-            evaluatorPromptVersion: evaluation.identity.promptVersion,
-            evaluatorReviewArtifactId: evaluation.reviewArtifact.artifactId,
-          }
-        : { evaluatorSkipId: evaluation.identity.skipId }),
-    };
+    return draftTraceLineage(event.payload);
   }
   if (event.type === "publication_approved") {
     return { publicationApprovalId: event.payload.publicationReceipt.approvalId };
@@ -1852,6 +2245,26 @@ function traceLineage(
     };
   }
   return {};
+}
+
+function draftTraceLineage(
+  payload: import("./types.js").LearningArtifactDraftProposedPayload,
+) {
+  const { evaluation } = payload;
+  return {
+    draftArtifactId: payload.draftArtifact.artifactId,
+    evaluationKind: evaluation.kind,
+    evaluationHash: payload.publicationBinding.evaluationHash,
+    ...(evaluation.kind === "reviewed"
+      ? {
+          evaluatorInputHash: evaluation.identity.inputHash,
+          evaluatorProvider: evaluation.identity.provider,
+          evaluatorModel: evaluation.identity.model,
+          evaluatorPromptVersion: evaluation.identity.promptVersion,
+          evaluatorReviewArtifactId: evaluation.reviewArtifact.artifactId,
+        }
+      : { evaluatorSkipId: evaluation.identity.skipId }),
+  } as const;
 }
 
 function consumeEmbeddedResearchObservation(

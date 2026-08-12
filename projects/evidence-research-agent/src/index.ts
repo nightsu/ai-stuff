@@ -56,6 +56,7 @@ export {
 export { formatRunTrace } from "./application/trace-format.js";
 export { runCli } from "./cli.js";
 export { PrivateRuntimeHomeError } from "./infrastructure/private-runtime-home.js";
+export type { ArtifactStoreLifecycleHooks } from "./infrastructure/content-addressed-artifact-store.js";
 export {
   LearningArtifactPublishError,
   PublicationTargetConflictError,

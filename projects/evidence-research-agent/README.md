@@ -85,6 +85,8 @@ node dist/src/cli.js publish \
 
 `inspect`、`trace` 与 `operation` 是只读命令。`pause`、`resume`、`cancel`、`extend-budget` 仍作为独立 control commands 使用；若 publish 在 external effect 与 success settlement 之间中断，则改用本文后面的 `reconcile`，不能直接重放 `publish`。
 
+`inspect` 的 JSON envelope 在 durable Projection 之外增加 `requiredNextAction`，人类输出显示 `Next action`；等待审批、继续研究、Evaluator resolution、发布与 reconcile 都不再需要调用方从状态名猜测。`trace` 可增加 `--tool-call-id <id>`，只返回与该 Research Tool call 直接绑定的 lineage events；省略时仍返回完整 Run Trace。
+
 ## OpenAI-compatible live Model Port
 
 `OpenAiCompatibleModelPort` 对 `proposePlan`、`generateResearchTurn`、`proposeLearningArtifact` 与 `reviewClaims` 都使用 `streamText` 的一次 generation，并把 completed tool calls 与 provider failure 归一化到项目类型。Evaluator 使用独立 `submit_evaluator_review` schema，verdict 只能是 `supported`、`partially_supported`、`unsupported`、`contradicted` 或 `uncertain`。AI SDK 自带 retry 固定为 0；`AbortSignal` 会中止未完成 stream，partial delta 不会成为 Model Turn 或 Evaluator Review。
@@ -128,7 +130,7 @@ EVIDENCE_MODEL_NAME=qwen3-coder:30b \
 pnpm eval:live
 ```
 
-固定输入位于 `evals/fixtures/local-journal-plan-v1.json`，结果写入 `evals/results/local-journal-plan-v1.json`。已记录的真实运行使用 `ollama` / `qwen3-coder:30b`、`openai-compatible-adapter-v1`、`evidence-research-prompts-v1`、`research-tools-v2`，2/2 trials 通过 `deterministic-plan-contract-v1`；latency 为 16,717 ms 与 4,913 ms。API charge 为 USD 0，但未计量本地硬件与电力；plan usage 当前由 adapter 记录为 `unavailable`。该结果不使用 LLM judge，也不声称两次成功证明 Runtime 的恢复、并发或安全可靠性——这些结论只来自 fault-injected deterministic suite。
+固定输入位于 `evals/fixtures/local-journal-plan-v1.json`，结果写入 `evals/results/local-journal-plan-v1.json`。每个 trial 先生成计划，再用固定 Evidence 构造最小 Model View，要求真实模型提出 evidence-bound `source_fact` Claim；deterministic contract 记录 Claim support、boundary violations、unnecessary tool count 与跨 repetitions 的 pass rate，同时记录 identity、budget、cost 与总 latency。该结果不使用 LLM judge，也不声称少量成功证明 Runtime 的恢复、并发或安全可靠性——这些结论只来自 fault-injected deterministic suite。
 
 ## 独立 Evaluator Review 与 publish-ready report
 
@@ -269,7 +271,7 @@ const runtime = ResearchAgentRuntime.open({
 });
 ```
 
-一个 sibling 的普通失败只消费自己的 intent，其他已批准成功 observation 仍会提交。取消会阻止 worker 启动尚在队列中的调用；已经完整形成的结果仍可进入 cancelled snapshot 供审计，但不会触发后续 `record_evidence`、`propose_claim`、`complete_research`、Gate 或 publication。启用 Retry Policy 时，每个 sibling search 在外部 I/O 前分别提交 durable attempt，transient failure 只重试自己的 Retry Sequence，并继续复用同一个逻辑 `toolCallId`。
+一个 sibling 的普通失败只消费自己的 intent，其他已批准成功 observation 仍会提交。取消会阻止 worker 启动尚在队列中的调用；已经完整形成的结果仍可进入 cancelled snapshot 供审计，但不会触发后续 `record_evidence`、`propose_claim`、`complete_research`、Gate 或 publication。每个 sibling search 都在外部 I/O 前分别提交 durable attempt；默认 `retry-disabled-v1` 只允许一次物理调用，显式 Retry Policy 才会让 transient failure 重试自己的 Retry Sequence，并继续复用同一个逻辑 `toolCallId`。
 
 ## 配置并观察有界 retry
 
@@ -297,7 +299,7 @@ const runtime = ResearchAgentRuntime.open({
 throw new InfrastructureFailureError("rate_limited", { retryAfterMs: 2_000 });
 ```
 
-每个外部调用前先追加 `retry_attempt_started`；失败后追加带 duration、规范 failure、实际 retry delay 的 `retry_attempt_failed`。成功 Model Turn 或 Search observation 与成功 attempt 在同一 SQLite transaction 提交。attempt 上限耗尽进入 suspended `retry_exhausted`；Model contract、未知永久错误或可持久化 invariant violation 进入 terminal `failed`。Search 普通执行失败则形成 `tool_execution` observation，保留给下一轮模型，不会不加区分地终止整个 Run。
+每个外部调用前先持久化 attempt；默认 plan 的单次 attempt 与 `planning_started` 原子提交，显式 Retry Policy 和其他 retryable 路径使用独立 `retry_attempt_started`。失败后追加带 duration、规范 failure、实际 retry delay 的 `retry_attempt_failed`。成功 Model Turn、Search observation 与 plan 分别和成功 attempt 在同一 SQLite transaction 提交；成功 Artifact proposal 则与 Gate repair、首次 Evaluator failure、最终 draft，或后处理 permanent failure 中最先发生的 durable outcome 原子闭合。publication target containment 会在 proposal I/O 前完成；draft CAS 失败会保留 succeeded attempt 并进入 terminal `failed`，重启不会重采样。attempt 上限耗尽进入 suspended `retry_exhausted`；Model contract、未知永久错误或可持久化 invariant violation 进入 terminal `failed`。Artifact proposal retry backoff 若已耗尽批准 wall-time，会在下一次 provider I/O 前进入 `budget_exhausted`。Search 普通执行失败则形成 `tool_execution` observation，保留给下一轮模型，不会不加区分地终止整个 Run。
 
 ## 从来源到 Learning Artifact 的显式 TypeScript API
 
@@ -426,7 +428,7 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 
 ## Journal、Trace 与恢复边界
 
-Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 Retry Attempts、completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim kind/Evidence IDs、Evidence Gate repair code、research completion/budget/retry suspension、terminal failure、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。`ResearchLoopLifecycleHooks` 在 attempt started、Model Turn 以及五个 Research Tool 的命名 durable seam 注入中断：attempt started 后的中断证明未完成 I/O 可以跨重启分类并按 policy 恢复；search/read 还覆盖 CAS Artifact/Snapshot 写入后与 Journal 事务提交后；Evidence/Claim/completion 覆盖 Journal commit 前后。成功事实若 SQLite commit 失败，命令只返回稳定错误，Journal 中仍只有 `in_progress` attempt；它不会声称 Model Turn 已持久化。`complete_research` 若在同一时刻暴露预算耗尽，会把 `research_completed` 与 `run_budget_exhausted` 放进一个 SQLite event batch，崩溃无法留下 exhausted 但可发布的单独 `research_complete`。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文、provider payload 或 OS 错误。
+Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 Retry Attempts、completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim kind/Evidence IDs、Evidence Gate repair code、research completion/budget/retry suspension、terminal failure、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。Research Loop Model/Search、planning 与 Artifact proposal 都在外部 I/O 前 durable 写入 attempt：默认 plan 嵌入 `planning_started`，其他路径使用 `retry_attempt_started`；默认 Research Loop attempt 使用派生 identity，避免改变既有业务 event/Tool Call ID。瞬时失败追加 `retry_attempt_failed`。最终成功 attempt 分别与 `model_turn_completed`、Search observation、`plan_proposed`，或 Artifact proposal 后第一个 Gate repair / Evaluator failure / draft / 后处理 failure outcome 原子提交。publication target 在 proposal 前预检；draft CAS failure 以 `run_failed` 同时记录 succeeded proposal attempt 与安全 failure code。默认 `retry-disabled-v1` 在 commit-window 中断后进入 `retry_exhausted`，不会盲目重放 Model/Search；显式 policy 才能沿原 Retry Sequence 继续。planning 中断后可用普通 `resume` 沿同一 Retry Sequence 恢复；Artifact proposal 中断后再次执行原命令会先闭合 interrupted attempt，再按冻结 policy 继续；耗尽不会隐式开启新序列。`ResearchLoopLifecycleHooks` 在 planning/Artifact/Research Loop attempt started、Model Turn 以及五个 Research Tool 的命名 durable seam 注入中断：attempt started 后的中断证明未完成 I/O 可以跨重启分类并按 policy 恢复；search/read 还覆盖 CAS Artifact/Snapshot 写入后与 Journal 事务提交后；Evidence/Claim/completion 覆盖 Journal commit 前后；`ArtifactStoreLifecycleHooks` 覆盖 draft CAS failure。成功事实若 SQLite commit 失败，命令只返回稳定错误，Journal 中仍只有 `in_progress` attempt；它不会声称 Model Turn 已持久化。`complete_research` 若在同一时刻暴露预算耗尽，会把 `research_completed` 与 `run_budget_exhausted` 放进一个 SQLite event batch，崩溃无法留下 exhausted 但可发布的单独 `research_complete`。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文、provider payload 或 OS 错误。
 
 `publication_approved` 只表示用户授权了精确 draft/target，状态为 `ready_to_publish`。重启不会自动写文件；显式 publish 依次进入 PENDING 和 EXECUTING，只有 direct settlement 或显式 reconcile 的 matching settlement 才追加 `learning_artifact_published` 并进入 `completed`。命名 fault points 覆盖 prepare、temporary write、atomic publication、success settlement 与 reconciliation 的前后边界。
 
@@ -459,5 +461,5 @@ Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE
 - provider 侧日志、传输策略与数据保留不受本项目控制；source 摘录会进入已配置的模型 provider。不要把未获授权的私密来源纳入 Source Scope。
 - Node.js 24 缺少可移植 `openat2` 与 `renameat2(RENAME_NOREPLACE)`；实现能拒绝 symlink、复核 handle/parent identity 并对稳定可观测替换 fail closed，但不能原子隔离 hostile same-user concurrent rename。
 - SQLite/CAS 不包含跨机器 replication、backup protocol 或灾难恢复；Publication Effect reconcile 只对单一已批准 target 的可观测状态分类。
-- live plan eval 当前没有 token usage 与本地能耗计量，只验证计划结构和 forbidden terms；它不衡量答案质量，也不替代 deterministic Evidence Gate。
+- live research eval 的 plan usage 与本地能耗仍未计量；Claim support 只是固定 Evidence 上的 deterministic lexical/lineage contract，不是开放域答案质量或语义真值，也不替代 deterministic Evidence Gate。
 - Evaluator Review 是 advisory model evidence。即使 verdict 全部 supported，publication 仍依赖 deterministic Gate 与 exact user approval；显式 skip 会在 report/Trace 中保留 warning。

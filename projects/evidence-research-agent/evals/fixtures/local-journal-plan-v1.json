@@ -16,7 +16,7 @@
   },
   "budget": {
     "version": "eval-budget-v1",
-    "maxModelTurns": 1,
+    "maxModelTurns": 2,
     "maxToolCalls": 1,
     "maxDistinctSources": 1,
     "maxSourceBytes": 4096,
@@ -30,6 +30,17 @@
       "EVIDENCE_MODEL_API_KEY",
       "ollama-local",
       "Runtime Home"
-    ]
+    ],
+    "claimSupport": {
+      "evidenceId": "evidence-local-journal-1",
+      "requiredTerms": ["Journal"]
+    },
+    "allowedToolNames": ["propose_claim"],
+    "maxToolIntents": 1,
+    "evidence": {
+      "evidenceId": "evidence-local-journal-1",
+      "relativePath": "journal.md",
+      "excerpt": "Run Journal 是 canonical history；Run Projection 由 Journal 确定性重建，因此进程崩溃后可从已提交事实恢复。"
+    }
   }
 }

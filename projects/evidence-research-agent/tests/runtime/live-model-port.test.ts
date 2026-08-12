@@ -9,6 +9,7 @@ import {
   ModelGenerationAbortedError,
   ResearchAgentRuntime,
   ResearchLoopError,
+  ScriptedEvaluator,
 } from "../../src/index.js";
 import type {
   AiSdkStreamPart,
@@ -92,6 +93,8 @@ describe("ResearchAgentRuntime live Model Port seam", () => {
     );
     const controller = new AbortController();
     let generation = 0;
+    let artifactGenerations = 0;
+    let proposalClaimId = "";
     const model = new OpenAiCompatibleModelPort(liveConfig("draft-secret"), {
       streamText: (options) => ({
         stream: generation++ === 0
@@ -112,18 +115,37 @@ describe("ResearchAgentRuntime live Model Port seam", () => {
                 totalUsage: usage(10, 5),
               },
             ])
-          : (async function* () {
-              yield { type: "text-delta", id: "text-1", text: "partial draft" };
-              controller.abort();
-              expect(options.abortSignal).toBe(controller.signal);
-              yield { type: "abort", reason: "cancelled" };
-            })(),
+          : artifactGenerations++ === 0
+            ? (async function* () {
+                yield { type: "text-delta", id: "text-1", text: "partial draft" };
+                controller.abort();
+                expect(options.abortSignal).toBe(controller.signal);
+                yield { type: "abort", reason: "cancelled" };
+              })()
+            : stream([
+                {
+                  type: "tool-call",
+                  toolCallId: "artifact-call",
+                  toolName: "submit_learning_artifact",
+                  input: {
+                    title: "取消后重试",
+                    summary: "显式取消只闭合当前 attempt，后续命令仍可继续。",
+                    claimIds: [proposalClaimId],
+                  },
+                },
+                {
+                  type: "finish",
+                  finishReason: "tool-calls",
+                  totalUsage: usage(10, 5),
+                },
+              ]),
       }),
     });
     const runtime = ResearchAgentRuntime.open({
       runtimeHome,
       outputRoot,
       model,
+      evaluator: new ScriptedEvaluator(),
       clock: fixedClock(),
       ids: sequentialIds(),
     });
@@ -168,6 +190,11 @@ describe("ResearchAgentRuntime live Model Port seam", () => {
         text: "Run Journal 是 canonical history。",
         evidenceIds: [evidence.evidenceId],
       });
+      if (claimed.state.type !== "researching") {
+        throw new Error("测试夹具没有保持 researching");
+      }
+      proposalClaimId = claimed.state.claims[0]?.claimId ?? "";
+      if (proposalClaimId === "") throw new Error("测试夹具没有形成 Claim");
 
       await expect(
         runtime.proposeLearningArtifact({
@@ -179,9 +206,25 @@ describe("ResearchAgentRuntime live Model Port seam", () => {
 
       const projection = await runtime.inspectRun({ runId: waiting.runId });
       expect(projection.state.type).toBe("researching");
-      expect(projection.lastEventSequence).toBe(claimed.lastEventSequence);
+      expect(projection.lastEventSequence).toBe(claimed.lastEventSequence + 2);
+      expect(projection.state).toMatchObject({
+        retryAttempts: [expect.objectContaining({
+          retrySequenceKind: "artifact_proposal",
+          outcome: "permanent_failure",
+          failure: {
+            category: "model_permanent",
+            code: "model_generation_aborted",
+          },
+        })],
+      });
       expect(JSON.stringify(await runtime.traceRun({ runId: waiting.runId })))
         .not.toContain("partial draft");
+      await expect(
+        runtime.proposeLearningArtifact({
+          runId: waiting.runId,
+          targetPath: join(outputRoot, "retried.md"),
+        }),
+      ).resolves.toMatchObject({ state: { type: "waiting_publication_approval" } });
     } finally {
       runtime.close();
     }
