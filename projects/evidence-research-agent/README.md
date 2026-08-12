@@ -108,7 +108,7 @@ const runtime = ResearchAgentRuntime.open({
 throw new InfrastructureFailureError("rate_limited", { retryAfterMs: 2_000 });
 ```
 
-每个外部调用前先追加 `operation_attempt_started`；失败后追加带 duration、规范 failure、实际 retry delay 的 `operation_attempt_failed`。成功 Model Turn 或 Search observation 与成功 attempt 在同一 SQLite transaction 提交。attempt 上限耗尽进入 suspended `retry_exhausted`；Model contract、未知永久错误或可持久化 invariant violation 进入 terminal `failed`。Search 普通执行失败则形成 `tool_execution` observation，保留给下一轮模型，不会不加区分地终止整个 Run。
+每个外部调用前先追加 `retry_attempt_started`；失败后追加带 duration、规范 failure、实际 retry delay 的 `retry_attempt_failed`。成功 Model Turn 或 Search observation 与成功 attempt 在同一 SQLite transaction 提交。attempt 上限耗尽进入 suspended `retry_exhausted`；Model contract、未知永久错误或可持久化 invariant violation 进入 terminal `failed`。Search 普通执行失败则形成 `tool_execution` observation，保留给下一轮模型，不会不加区分地终止整个 Run。
 
 ## 从来源到 Learning Artifact 的显式 TypeScript API
 
@@ -201,7 +201,7 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 - `advanceResearch` 每次都从 Run Journal、Projection 与批准 plan artifact 重建 Model View；Model View 不是 Journal，也不是完整 `messages[]`。完整 Model Turn 先 durable append，pending intents 再由 Harness 顺序消费，重启后不会要求模型猜测未决动作。
 - Model/search 外部 I/O 前必须先 durable 提交 `in_progress` attempt。重启看到未完成 attempt 时，会先持久化 `model_turn_interrupted` 或 `search_interrupted`，然后只在冻结 policy 允许时重试；已原子提交的成功 attempt/Model Turn/observation 不重新执行。Search 的多个物理 attempts 共享一个 `toolCallId`，因此 retry 不伪造成额外逻辑 Tool Call。
 - provider retry hint 是最短等待，不会被 Harness backoff cap 截短；等待和 attempt 都消耗 Research Loop wall time。等待若已经耗尽已批准 wall-time，Runtime 会在下一次外部 I/O 前进入 `budget_exhausted`。
-- Run Trace 对 Model contract、Model permanent、permission denial、stale state、ordinary tool execution、infrastructure transient 与 invariant violation 使用稳定、无秘密的 failure category/code；attempt 还暴露 operation kind、序号、结果、duration、policy version 和 retry delay。
+- Run Trace 对 Model contract、Model permanent、permission denial、stale state、ordinary tool execution、infrastructure transient 与 invariant violation 使用稳定、无秘密的 failure category/code；attempt 还暴露 Retry Sequence kind/identity、序号、结果、duration、policy version 和 retry delay。
 - 五个模型可见工具之外的 approval、budget change、publication、shell 与任意写入都不进入 `ResearchToolIntent` 联合。参数 schema 错误、Source Scope denial、stale observation 和普通工具失败都会形成安全 observation，进入下一轮视图。
 - Run Budget 由 Harness 与 reducer 共用一个 domain calculator 从 canonical facts 计算：计划 generation、Research Loop turns、Research Tool calls、不同 Source Snapshot、完整 source bytes 与 Research Loop wall time 分别记账。完成工具会在自己的 durable `completedAt` 再检查 Model Turn/wall time，并把该时间冻结为 Research Loop 计费终点；之后的用户空闲或重复 inspect/advance 不会追溯耗尽预算。任何硬维度耗尽都会 durable 进入带 `incomplete` 或 `research_complete` provenance 的 `budget_exhausted`，该状态不能生成 draft 或伪装为可发布完成。
 - `search_sources` 通过可注入 `SourceSearchPort` 使用默认固定参数 `rg` adapter；它在启动搜索前复核批准 root identity，并把 extensions、exclusions、共享 secret discovery globs 与 file-size bound 下推到 discovery，每个返回命中还会再走共享 realpath preflight。完整命中列表进入私有 JSON Artifact，Journal/Trace 只保留引用和数量，下一轮 Model View 再按需校验展开；搜索不会创建 Source Snapshot。
@@ -214,7 +214,7 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 
 ## Journal、Trace 与恢复边界
 
-Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 operation attempts、completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim、research completion/budget/retry suspension、terminal failure、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。`ResearchLoopLifecycleHooks` 在 attempt started、Model Turn 以及五个 Research Tool 的命名 durable seam 注入中断：attempt started 后的中断证明未完成 I/O 可以跨重启分类并按 policy 恢复；search/read 还覆盖 CAS Artifact/Snapshot 写入后与 Journal 事务提交后；Evidence/Claim/completion 覆盖 Journal commit 前后。成功事实若 SQLite commit 失败，命令只返回稳定错误，Journal 中仍只有 `in_progress` attempt；它不会声称 Model Turn 已持久化。`complete_research` 若在同一时刻暴露预算耗尽，会把 `research_completed` 与 `run_budget_exhausted` 放进一个 SQLite event batch，崩溃无法留下 exhausted 但可发布的单独 `research_complete`。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文、provider payload 或 OS 错误。
+Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 Retry Attempts、completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim、research completion/budget/retry suspension、terminal failure、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。`ResearchLoopLifecycleHooks` 在 attempt started、Model Turn 以及五个 Research Tool 的命名 durable seam 注入中断：attempt started 后的中断证明未完成 I/O 可以跨重启分类并按 policy 恢复；search/read 还覆盖 CAS Artifact/Snapshot 写入后与 Journal 事务提交后；Evidence/Claim/completion 覆盖 Journal commit 前后。成功事实若 SQLite commit 失败，命令只返回稳定错误，Journal 中仍只有 `in_progress` attempt；它不会声称 Model Turn 已持久化。`complete_research` 若在同一时刻暴露预算耗尽，会把 `research_completed` 与 `run_budget_exhausted` 放进一个 SQLite event batch，崩溃无法留下 exhausted 但可发布的单独 `research_complete`。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文、provider payload 或 OS 错误。
 
 `publication_approved` 只表示用户授权了精确 draft/target，状态为 `ready_to_publish`。重启不会自动写文件；只有显式 `publishLearningArtifact` 成功返回后才追加 `learning_artifact_published` 并进入 `completed`。如果进程在外部写入尝试和该 Journal 事件之间崩溃，当前实现不会把“文件可能存在”猜成完成；完整 effect crash reconciliation 留给 Issue #14。
 

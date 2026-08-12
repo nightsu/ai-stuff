@@ -12,7 +12,7 @@ import type {
   EvidenceRecord,
   LearningArtifactProposal,
   ModelTurn,
-  OperationAttempt,
+  RetryAttempt,
   PlanApprovalBinding,
   PlanApprovalReceipt,
   PublicationApprovalBinding,
@@ -474,10 +474,10 @@ const researchToolObservationSchema = z
   .strict()
   .transform((observation): ResearchToolObservation => observation);
 
-const operationAttemptCommonFields = {
+const retryAttemptCommonFields = {
   attemptId: z.string().trim().min(1),
-  operationId: z.string().trim().min(1),
-  operationKind: z.enum(["model_turn", "search_sources"]),
+  retrySequenceId: z.string().trim().min(1),
+  retrySequenceKind: z.enum(["model_turn", "search_sources"]),
   attemptNumber: z.number().int().positive(),
   retryPolicy: retryPolicySchema,
   startedAt: z.iso.datetime(),
@@ -486,13 +486,13 @@ const operationAttemptCommonFields = {
   latestSteering: z.string().trim().min(1).optional(),
 };
 
-const inProgressOperationAttemptSchema = z.object({
-  ...operationAttemptCommonFields,
+const inProgressRetryAttemptSchema = z.object({
+  ...retryAttemptCommonFields,
   outcome: z.literal("in_progress"),
 }).strict();
 
-const completedOperationAttemptSchema = z.object({
-  ...operationAttemptCommonFields,
+const completedRetryAttemptSchema = z.object({
+  ...retryAttemptCommonFields,
   outcome: z.enum([
     "succeeded",
     "retryable_failure",
@@ -505,10 +505,10 @@ const completedOperationAttemptSchema = z.object({
   retryDelayMs: z.number().int().nonnegative().optional(),
 }).strict();
 
-const operationAttemptSchema = z.union([
-  inProgressOperationAttemptSchema,
-  completedOperationAttemptSchema,
-]).transform((attempt): OperationAttempt => attempt);
+const retryAttemptSchema = z.union([
+  inProgressRetryAttemptSchema,
+  completedRetryAttemptSchema,
+]).transform((attempt): RetryAttempt => attempt);
 
 const remainingRunBudgetSchema = z.object({
   modelTurns: z.number().int().nonnegative(),
@@ -531,7 +531,7 @@ const evidenceBackedStateFields = {
   pendingToolIntents: z.array(researchToolIntentSchema),
   latestSteering: z.string().trim().min(1).optional(),
   researchStartedAt: z.iso.datetime().optional(),
-  operationAttempts: z.array(operationAttemptSchema),
+  retryAttempts: z.array(retryAttemptSchema),
 };
 
 const researchCompletionSchema = z.object({
@@ -559,7 +559,7 @@ const legacyExplicitPublicationFields = {
   researchToolObservations: z.tuple([]),
   evidenceGaps: z.tuple([]),
   pendingToolIntents: z.tuple([]),
-  operationAttempts: z.array(operationAttemptSchema),
+  retryAttempts: z.array(retryAttemptSchema),
 };
 
 const researchLoopPublicationFields = {
@@ -575,7 +575,7 @@ const researchLoopPublicationFields = {
   latestSteering: z.string().trim().min(1).optional(),
   researchStartedAt: z.iso.datetime(),
   completion: researchCompletionSchema,
-  operationAttempts: z.array(operationAttemptSchema),
+  retryAttempts: z.array(retryAttemptSchema),
 };
 
 const runStateSchema = z.union([
@@ -615,16 +615,16 @@ const runStateSchema = z.union([
   z.object({
     type: z.literal("retry_exhausted"),
     ...evidenceBackedStateFields,
-    operationId: z.string().trim().min(1),
-    operationKind: z.enum(["model_turn", "search_sources"]),
+    retrySequenceId: z.string().trim().min(1),
+    retrySequenceKind: z.enum(["model_turn", "search_sources"]),
     attemptsUsed: z.number().int().positive(),
     failure: normalizedFailureSchema,
   }),
   z.object({
     type: z.literal("failed"),
     ...evidenceBackedStateFields,
-    operationId: z.string().trim().min(1),
-    operationKind: z.enum(["model_turn", "search_sources"]),
+    retrySequenceId: z.string().trim().min(1),
+    retrySequenceKind: z.enum(["model_turn", "search_sources"]),
     failure: normalizedFailureSchema,
   }),
   z.object({
@@ -763,20 +763,20 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     .strict(),
   z.object({
     ...eventEnvelopeSchema,
-    type: z.literal("operation_attempt_started"),
-    payload: z.object({ attempt: inProgressOperationAttemptSchema }).strict(),
+    type: z.literal("retry_attempt_started"),
+    payload: z.object({ attempt: inProgressRetryAttemptSchema }).strict(),
   }).strict(),
   z.object({
     ...eventEnvelopeSchema,
-    type: z.literal("operation_attempt_failed"),
-    payload: z.object({ attempt: completedOperationAttemptSchema }).strict(),
+    type: z.literal("retry_attempt_failed"),
+    payload: z.object({ attempt: completedRetryAttemptSchema }).strict(),
   }).strict(),
   z.object({
     ...eventEnvelopeSchema,
     type: z.literal("run_retry_exhausted"),
     payload: z.object({
-      operationId: z.string().trim().min(1),
-      operationKind: z.enum(["model_turn", "search_sources"]),
+      retrySequenceId: z.string().trim().min(1),
+      retrySequenceKind: z.enum(["model_turn", "search_sources"]),
       attemptsUsed: z.number().int().positive(),
       failure: normalizedFailureSchema,
     }).strict(),
@@ -785,8 +785,8 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     ...eventEnvelopeSchema,
     type: z.literal("run_failed"),
     payload: z.object({
-      operationId: z.string().trim().min(1),
-      operationKind: z.enum(["model_turn", "search_sources"]),
+      retrySequenceId: z.string().trim().min(1),
+      retrySequenceKind: z.enum(["model_turn", "search_sources"]),
       failure: normalizedFailureSchema,
     }).strict(),
   }).strict(),
@@ -797,7 +797,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
       turn: modelTurnSchema,
       generationStartedAt: z.iso.datetime(),
       latestSteering: z.string().trim().min(1).optional(),
-      attempt: completedOperationAttemptSchema.optional(),
+      attempt: completedRetryAttemptSchema.optional(),
     }).strict(),
   }).strict(),
   z.object({
@@ -805,7 +805,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     type: z.literal("research_tool_observed"),
     payload: z.object({
       observation: researchToolObservationSchema,
-      attempt: completedOperationAttemptSchema.optional(),
+      attempt: completedRetryAttemptSchema.optional(),
     }).strict(),
   }).strict(),
   z.object({

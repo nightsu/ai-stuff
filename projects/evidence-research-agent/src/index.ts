@@ -115,7 +115,7 @@ export type {
   SourceSearchMatch,
   BudgetExhaustedRunState,
   RetryPolicy,
-  OperationAttempt,
+  RetryAttempt,
   NormalizedFailure,
   ResearchCompleteRunState,
   PublicationApprovalBinding,

@@ -20,6 +20,14 @@ _Avoid_: Chat, conversation, session
 One command-owned attempt to advance or mutate a Research Run, protected by a per-run durable lease while asynchronous model or tool work occurs. The lease establishes operation ownership but never replaces Run Journal facts.
 _Avoid_: Research Run, tool call, database transaction
 
+**Retry Sequence**:
+One logical Model generation or Search invocation whose bounded physical Retry Attempts share a stable identity and frozen Retry Policy. It is an external-call retry concept, never a command-owned Run Operation.
+_Avoid_: Operation, Run Operation, tool call
+
+**Retry Attempt**:
+One physical Model or Search invocation inside a Retry Sequence, durably started before external I/O and completed with a normalized outcome.
+_Avoid_: Run Operation, logical tool call
+
 **Suspended Run**:
 A non-terminal Research Run that is durably waiting for approval, user continuation, or another recoverable condition. It may resume from its existing Run Journal.
 _Avoid_: Cancelled Run, failed run

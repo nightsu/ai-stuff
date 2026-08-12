@@ -42,9 +42,9 @@ import type {
   PublicationTarget,
   PublishedLearningArtifact,
   ResearchRunEvent,
-  CompletedOperationAttempt,
-  InProgressOperationAttempt,
-  OperationAttempt,
+  CompletedRetryAttempt,
+  InProgressRetryAttempt,
+  RetryAttempt,
   ResearchToolIntent,
   ResearchToolObservation,
   ResearchingRunState,
@@ -272,23 +272,23 @@ function applyRunEvent(
           researchToolObservations: [],
           evidenceGaps: [],
           pendingToolIntents: [],
-          operationAttempts: [],
+          retryAttempts: [],
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
     }
-    case "operation_attempt_started": {
+    case "retry_attempt_started": {
       if (current.state.type !== "researching") {
-        throw new IllegalRunEventError("只有 researching Run 可以开始 operation attempt");
+        throw new IllegalRunEventError("只有 researching Run 可以开始 Retry Attempt");
       }
       validateStartedAttempt(current, event.payload.attempt, event.occurredAt);
       return {
         ...current,
         state: {
           ...current.state,
-          operationAttempts: [
-            ...current.state.operationAttempts,
+          retryAttempts: [
+            ...current.state.retryAttempts,
             event.payload.attempt,
           ],
           researchStartedAt:
@@ -301,18 +301,18 @@ function applyRunEvent(
         updatedAt: event.occurredAt,
       };
     }
-    case "operation_attempt_failed": {
+    case "retry_attempt_failed": {
       if (current.state.type !== "researching") {
         throw new IllegalRunEventError("只有 researching Run 可以完成失败 attempt");
       }
       const attempts = completePendingAttempt(
-        current.state.operationAttempts,
+        current.state.retryAttempts,
         event.payload.attempt,
         event.occurredAt,
       );
       return {
         ...current,
-        state: { ...current.state, operationAttempts: attempts },
+        state: { ...current.state, retryAttempts: attempts },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
@@ -322,9 +322,9 @@ function applyRunEvent(
         throw new IllegalRunEventError("只有 researching Run 可以因 retry exhaustion 暂停");
       }
       validateTerminalAttemptTransition(
-        current.state.operationAttempts,
-        event.payload.operationId,
-        event.payload.operationKind,
+        current.state.retryAttempts,
+        event.payload.retrySequenceId,
+        event.payload.retrySequenceKind,
         event.payload.attemptsUsed,
         event.payload.failure,
       );
@@ -344,9 +344,9 @@ function applyRunEvent(
         throw new IllegalRunEventError("只有 researching Run 可以进入 failed");
       }
       validateTerminalAttemptTransition(
-        current.state.operationAttempts,
-        event.payload.operationId,
-        event.payload.operationKind,
+        current.state.retryAttempts,
+        event.payload.retrySequenceId,
+        event.payload.retrySequenceKind,
         undefined,
         event.payload.failure,
       );
@@ -371,10 +371,10 @@ function applyRunEvent(
         throw new IllegalRunEventError("启用 retry 的 Model Turn 必须原子完成 pending attempt");
       }
       const { turn } = event.payload;
-      const operationAttempts = event.payload.attempt === undefined
-        ? current.state.operationAttempts
+      const retryAttempts = event.payload.attempt === undefined
+        ? current.state.retryAttempts
         : completePendingAttempt(
-            current.state.operationAttempts,
+            current.state.retryAttempts,
             event.payload.attempt,
             event.occurredAt,
           );
@@ -418,7 +418,7 @@ function applyRunEvent(
             : { latestSteering: event.payload.latestSteering }),
           researchStartedAt:
             current.state.researchStartedAt ?? event.payload.generationStartedAt,
-          operationAttempts,
+          retryAttempts,
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -432,14 +432,14 @@ function applyRunEvent(
         current.retryPolicy !== undefined &&
         event.payload.attempt === undefined &&
         (event.payload.observation.status === "succeeded" ||
-          current.state.operationAttempts.at(-1)?.outcome === "in_progress")
+          current.state.retryAttempts.at(-1)?.outcome === "in_progress")
       ) {
         throw new IllegalRunEventError("启用 retry 的 Search observation 不能遗留 pending attempt");
       }
-      const pendingFailedSearchAttempt = current.state.operationAttempts.at(-1);
+      const pendingFailedSearchAttempt = current.state.retryAttempts.at(-1);
       if (
         event.payload.attempt === undefined &&
-        pendingFailedSearchAttempt?.operationKind === "search_sources" &&
+        pendingFailedSearchAttempt?.retrySequenceKind === "search_sources" &&
         pendingFailedSearchAttempt.outcome === "permanent_failure" &&
         !current.state.researchToolObservations.some(
           (observation) =>
@@ -447,7 +447,11 @@ function applyRunEvent(
         ) &&
         (event.payload.observation.toolCallId !== pendingFailedSearchAttempt.toolCallId ||
           event.payload.observation.intentId !== pendingFailedSearchAttempt.intentId ||
-          event.payload.observation.status !== "failed")
+          event.payload.observation.status !== "failed" ||
+          !failuresEqual(
+            event.payload.observation.failure,
+            pendingFailedSearchAttempt.failure,
+          ))
       ) {
         throw new IllegalRunEventError("Search failure observation 与 pending attempt 不一致");
       }
@@ -458,16 +462,16 @@ function applyRunEvent(
         event.occurredAt,
       );
       const output = event.payload.observation.output;
-      const operationAttempts = event.payload.attempt === undefined
-        ? current.state.operationAttempts
+      const retryAttempts = event.payload.attempt === undefined
+        ? current.state.retryAttempts
         : completePendingAttempt(
-            current.state.operationAttempts,
+            current.state.retryAttempts,
             event.payload.attempt,
             event.occurredAt,
           );
       if (
         event.payload.attempt !== undefined &&
-        (event.payload.attempt.operationKind !== "search_sources" ||
+        (event.payload.attempt.retrySequenceKind !== "search_sources" ||
           event.payload.attempt.toolCallId !== event.payload.observation.toolCallId ||
           event.payload.attempt.intentId !== event.payload.observation.intentId)
       ) {
@@ -500,7 +504,7 @@ function applyRunEvent(
             event.payload.observation,
           ],
           pendingToolIntents: pending,
-          operationAttempts,
+          retryAttempts,
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -784,7 +788,7 @@ function applyRunEvent(
         proposal: event.payload.proposal,
         publicationTarget: event.payload.publicationTarget,
         publicationBinding: event.payload.publicationBinding,
-        operationAttempts: current.state.operationAttempts,
+        retryAttempts: current.state.retryAttempts,
       } as const;
       return {
         ...current,
@@ -916,75 +920,76 @@ function remainingBudgetsEqual(
 
 function validateStartedAttempt(
   projection: RunProjection,
-  attempt: InProgressOperationAttempt,
+  attempt: InProgressRetryAttempt,
   occurredAt: string,
 ): void {
   if (projection.state.type !== "researching") {
-    throw new IllegalRunEventError("只有 researching Run 可以开始 operation attempt");
+    throw new IllegalRunEventError("只有 researching Run 可以开始 Retry Attempt");
   }
   const state = projection.state;
-  const sameOperation = state.operationAttempts.filter(
-    (candidate) => candidate.operationId === attempt.operationId,
+  const sameSequence = state.retryAttempts.filter(
+    (candidate) => candidate.retrySequenceId === attempt.retrySequenceId,
   );
-  const previousAttempt = sameOperation.at(-1);
-  const latestAttempt = state.operationAttempts.at(-1);
-  const newOperation = previousAttempt === undefined;
-  const latestOperationClosed = latestAttempt === undefined ||
+  const previousAttempt = sameSequence.at(-1);
+  const latestAttempt = state.retryAttempts.at(-1);
+  const newSequence = previousAttempt === undefined;
+  const latestSequenceClosed = latestAttempt === undefined ||
     latestAttempt.outcome === "succeeded" ||
-    (latestAttempt.operationKind === "search_sources" &&
+    (latestAttempt.retrySequenceKind === "search_sources" &&
       latestAttempt.outcome === "permanent_failure" &&
       state.researchToolObservations.some(
         (observation) => observation.toolCallId === latestAttempt.toolCallId,
       ));
-  const validOperationIdentity = newOperation
-    ? attempt.attemptNumber === 1 && latestOperationClosed
+  const validSequenceIdentity = newSequence
+    ? attempt.attemptNumber === 1 && latestSequenceClosed
     : previousAttempt === latestAttempt &&
       previousAttempt.outcome === "retryable_failure" &&
       attempt.attemptNumber === previousAttempt.attemptNumber + 1 &&
-      attempt.operationKind === previousAttempt.operationKind &&
+      attempt.retrySequenceKind === previousAttempt.retrySequenceKind &&
       retryPoliciesEqual(attempt.retryPolicy, previousAttempt.retryPolicy) &&
       attempt.toolCallId === previousAttempt.toolCallId &&
-      attempt.intentId === previousAttempt.intentId;
+      attempt.intentId === previousAttempt.intentId &&
+      attempt.latestSteering === previousAttempt.latestSteering;
   const modelShape =
-    attempt.operationKind === "model_turn" &&
+    attempt.retrySequenceKind === "model_turn" &&
     attempt.toolCallId === undefined &&
     attempt.intentId === undefined &&
     state.pendingToolIntents.length === 0;
   const searchIntent = state.pendingToolIntents[0];
   const searchShape =
-    attempt.operationKind === "search_sources" &&
+    attempt.retrySequenceKind === "search_sources" &&
     attempt.toolCallId !== undefined &&
     attempt.intentId === searchIntent?.intentId &&
     searchIntent?.name === "search_sources";
   if (
     attempt.attemptId.trim() === "" ||
-    attempt.operationId.trim() === "" ||
-    !validOperationIdentity ||
+    attempt.retrySequenceId.trim() === "" ||
+    !validSequenceIdentity ||
     attempt.startedAt !== occurredAt ||
     !isIsoUtc(attempt.startedAt) ||
-    state.operationAttempts.some(
+    state.retryAttempts.some(
       (candidate) => candidate.attemptId === attempt.attemptId,
     ) ||
     projection.retryPolicy === undefined ||
     !retryPoliciesEqual(attempt.retryPolicy, projection.retryPolicy) ||
     (!modelShape && !searchShape)
   ) {
-    throw new IllegalRunEventError("operation attempt start 与当前逻辑操作不一致");
+    throw new IllegalRunEventError("Retry Attempt start 与当前 Retry Sequence 不一致");
   }
 }
 
 function completePendingAttempt(
-  attempts: readonly OperationAttempt[],
-  completed: CompletedOperationAttempt,
+  attempts: readonly RetryAttempt[],
+  completed: CompletedRetryAttempt,
   occurredAt: string,
-): readonly OperationAttempt[] {
+): readonly RetryAttempt[] {
   const latestIndex = attempts.length - 1;
   const started = attempts[latestIndex];
   if (started?.outcome !== "in_progress") {
-    throw new IllegalRunEventError("operation attempt completion 与 pending attempt 不一致");
+    throw new IllegalRunEventError("Retry Attempt completion 与 pending attempt 不一致");
   }
   const hasFailure = completed.outcome !== "succeeded";
-  const maxAttempts = completed.operationKind === "model_turn"
+  const maxAttempts = completed.retrySequenceKind === "model_turn"
     ? completed.retryPolicy.modelMaxAttempts
     : completed.retryPolicy.toolMaxAttempts;
   const infrastructureTransient =
@@ -1003,8 +1008,8 @@ function completePendingAttempt(
     : undefined;
   if (
     completed.attemptId !== started.attemptId ||
-    completed.operationId !== started.operationId ||
-    completed.operationKind !== started.operationKind ||
+    completed.retrySequenceId !== started.retrySequenceId ||
+    completed.retrySequenceKind !== started.retrySequenceKind ||
     completed.attemptNumber !== started.attemptNumber ||
     completed.startedAt !== started.startedAt ||
     !retryPoliciesEqual(completed.retryPolicy, started.retryPolicy) ||
@@ -1018,13 +1023,13 @@ function completePendingAttempt(
     (hasFailure !== (completed.failure !== undefined)) ||
     completed.retryDelayMs !== expectedRetryDelayMs
   ) {
-    throw new IllegalRunEventError("operation attempt completion 与 pending attempt 不一致");
+    throw new IllegalRunEventError("Retry Attempt completion 与 pending attempt 不一致");
   }
   return [...attempts.slice(0, latestIndex), completed];
 }
 
 function retryDelayFromPolicy(
-  attempt: InProgressOperationAttempt,
+  attempt: InProgressRetryAttempt,
   failure: import("./types.js").NormalizedFailure,
 ): number {
   const exponential = attempt.retryPolicy.baseDelayMs *
@@ -1046,28 +1051,37 @@ function retryPoliciesEqual(
     left.maxDelayMs === right.maxDelayMs;
 }
 
+function failuresEqual(
+  left: import("./types.js").NormalizedFailure | undefined,
+  right: import("./types.js").NormalizedFailure | undefined,
+): boolean {
+  return left?.category === right?.category &&
+    left?.code === right?.code &&
+    left?.retryAfterMs === right?.retryAfterMs;
+}
+
 function validateTerminalAttemptTransition(
-  attempts: readonly OperationAttempt[],
-  operationId: string,
-  operationKind: OperationAttempt["operationKind"],
+  attempts: readonly RetryAttempt[],
+  retrySequenceId: string,
+  retrySequenceKind: RetryAttempt["retrySequenceKind"],
   attemptsUsed: number | undefined,
   failure: import("./types.js").NormalizedFailure,
 ): void {
   const latest = attempts.at(-1);
-  const operationAttempts = attempts.filter(
-    (attempt) => attempt.operationId === operationId,
+  const retryAttempts = attempts.filter(
+    (attempt) => attempt.retrySequenceId === retrySequenceId,
   );
   if (
     latest === undefined ||
     latest.outcome === "in_progress" ||
-    latest.operationId !== operationId ||
-    latest.operationKind !== operationKind ||
+    latest.retrySequenceId !== retrySequenceId ||
+    latest.retrySequenceKind !== retrySequenceKind ||
     latest.failure?.category !== failure.category ||
     latest.failure.code !== failure.code ||
     latest.failure.retryAfterMs !== failure.retryAfterMs ||
     (attemptsUsed !== undefined && latest.outcome !== "retry_exhausted") ||
     (attemptsUsed === undefined && latest.outcome !== "permanent_failure") ||
-    (attemptsUsed !== undefined && operationAttempts.length !== attemptsUsed)
+    (attemptsUsed !== undefined && retryAttempts.length !== attemptsUsed)
   ) {
     throw new IllegalRunEventError("terminal attempt transition 与 canonical attempts 不一致");
   }
@@ -1086,8 +1100,8 @@ function traceLineage(
   | "draftArtifactId"
   | "publicationApprovalId"
   | "learningArtifactSha256"
-  | "operationId"
-  | "operationKind"
+  | "retrySequenceId"
+  | "retrySequenceKind"
   | "attemptNumber"
   | "attemptOutcome"
   | "attemptDurationMs"
@@ -1097,8 +1111,8 @@ function traceLineage(
   | "retryDelayMs"
 > {
   const attempt =
-    event.type === "operation_attempt_started" ||
-      event.type === "operation_attempt_failed"
+    event.type === "retry_attempt_started" ||
+      event.type === "retry_attempt_failed"
       ? event.payload.attempt
       : event.type === "model_turn_completed" ||
           event.type === "research_tool_observed"
@@ -1106,8 +1120,8 @@ function traceLineage(
         : undefined;
   if (attempt !== undefined) {
     return {
-      operationId: attempt.operationId,
-      operationKind: attempt.operationKind,
+      retrySequenceId: attempt.retrySequenceId,
+      retrySequenceKind: attempt.retrySequenceKind,
       attemptNumber: attempt.attemptNumber,
       attemptOutcome: attempt.outcome,
       ...(attempt.outcome === "in_progress"
@@ -1128,8 +1142,8 @@ function traceLineage(
   }
   if (event.type === "run_retry_exhausted" || event.type === "run_failed") {
     return {
-      operationId: event.payload.operationId,
-      operationKind: event.payload.operationKind,
+      retrySequenceId: event.payload.retrySequenceId,
+      retrySequenceKind: event.payload.retrySequenceKind,
       failureCategory: event.payload.failure.category,
       failureCode: event.payload.failure.code,
     };

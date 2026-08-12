@@ -124,20 +124,20 @@ export interface NormalizedFailure {
   readonly retryAfterMs?: number | undefined;
 }
 
-/** Harness 当前支持自动 retry 的两类外部操作。 */
-export type RetryableOperationKind = "model_turn" | "search_sources";
+/** Harness 当前支持自动 retry 的两类 Retry Sequence。 */
+export type RetrySequenceKind = "model_turn" | "search_sources";
 
 /** 一个物理外部调用开始后、尚未得到 canonical 结果的 attempt。 */
-export interface InProgressOperationAttempt {
+export interface InProgressRetryAttempt {
   /** 物理 attempt 的跨进程稳定 identity。 */
   readonly attemptId: string;
-  /** 多次物理 attempts 共享的逻辑操作 identity。 */
-  readonly operationId: string;
+  /** 多次物理 Retry Attempts 共享的 Retry Sequence identity。 */
+  readonly retrySequenceId: string;
   /** attempt 对应 Model Turn generation 或只读 search。 */
-  readonly operationKind: RetryableOperationKind;
-  /** 同一逻辑操作内从 1 开始严格递增的 attempt 序号。 */
+  readonly retrySequenceKind: RetrySequenceKind;
+  /** 同一 Retry Sequence 内从 1 开始严格递增的 attempt 序号。 */
   readonly attemptNumber: number;
-  /** 本次逻辑操作首次开始时冻结的完整 Retry Policy。 */
+  /** 本次 Retry Sequence 首次开始时冻结的完整 Retry Policy。 */
   readonly retryPolicy: RetryPolicy;
   /** 外部调用开始前已提交 Journal 的 ISO 8601 UTC 时间。 */
   readonly startedAt: string;
@@ -152,8 +152,8 @@ export interface InProgressOperationAttempt {
 }
 
 /** 一个已完成且结果可由 Journal 精确解释的物理 attempt。 */
-export interface CompletedOperationAttempt
-  extends Omit<InProgressOperationAttempt, "outcome"> {
+export interface CompletedRetryAttempt
+  extends Omit<InProgressRetryAttempt, "outcome"> {
   /** attempt 成功、仍可重试、已耗尽重试或永久失败的规范结果。 */
   readonly outcome:
     | "succeeded"
@@ -171,9 +171,9 @@ export interface CompletedOperationAttempt
 }
 
 /** Projection 按 Journal 顺序保留的完整 attempt 联合。 */
-export type OperationAttempt =
-  | InProgressOperationAttempt
-  | CompletedOperationAttempt;
+export type RetryAttempt =
+  | InProgressRetryAttempt
+  | CompletedRetryAttempt;
 
 /** 用户批准计划时必须逐字段匹配的内容寻址边界。 */
 export interface PlanApprovalBinding {
@@ -474,7 +474,7 @@ export interface EvidenceBackedRunStateData {
   /** 第一个 Research Loop Model Turn 的 ISO 8601 UTC 时间；审批等待不计入 wall time。 */
   readonly researchStartedAt?: string | undefined;
   /** 物理 Model/search attempts 的 canonical 历史；不计作额外逻辑 tool calls。 */
-  readonly operationAttempts: readonly OperationAttempt[];
+  readonly retryAttempts: readonly RetryAttempt[];
 }
 
 /** 精确计划已获用户批准、可以继续显式收集 Evidence 与 Claim 的 Run 状态。 */
@@ -538,10 +538,10 @@ export type BudgetExhaustedRunState =
 export interface RetryExhaustedRunState extends EvidenceBackedRunStateData {
   /** 判别字段；该状态不会自动继续采样或执行工具。 */
   readonly type: "retry_exhausted";
-  /** 达到 retry 边界的逻辑操作 identity。 */
-  readonly operationId: string;
+  /** 达到 retry 边界的 Retry Sequence identity。 */
+  readonly retrySequenceId: string;
   /** 被暂停的模型 generation 或只读 search 类型。 */
-  readonly operationKind: RetryableOperationKind;
+  readonly retrySequenceKind: RetrySequenceKind;
   /** 已经开始并保留在 Journal 中的物理 attempts 数。 */
   readonly attemptsUsed: number;
   /** 最后一次失败或未完成 attempt 的安全规范原因。 */
@@ -552,10 +552,10 @@ export interface RetryExhaustedRunState extends EvidenceBackedRunStateData {
 export interface FailedRunState extends EvidenceBackedRunStateData {
   /** 判别字段；terminal failed Run 不得继续研究或发布。 */
   readonly type: "failed";
-  /** 导致 Run 终止的逻辑操作 identity。 */
-  readonly operationId: string;
+  /** 导致 Run 终止的 Retry Sequence identity。 */
+  readonly retrySequenceId: string;
   /** 失败发生在模型 generation 或只读 search。 */
-  readonly operationKind: RetryableOperationKind;
+  readonly retrySequenceKind: RetrySequenceKind;
   /** 不含原始异常或秘密的终止原因。 */
   readonly failure: NormalizedFailure;
 }
@@ -631,27 +631,27 @@ export interface ModelTurnCompletedPayload {
   /** 本轮构建 Model View 时采用的最新非空 steering。 */
   readonly latestSteering?: string | undefined;
   /** 启用 Retry Policy 时必填并与 Model Turn 同事务提交；legacy Run 可省略。 */
-  readonly attempt?: CompletedOperationAttempt | undefined;
+  readonly attempt?: CompletedRetryAttempt | undefined;
 }
 
-/** `operation_attempt_started` 在外部 I/O 前提交的恢复事实。 */
-export interface OperationAttemptStartedPayload {
+/** `retry_attempt_started` 在外部 I/O 前提交的恢复事实。 */
+export interface RetryAttemptStartedPayload {
   /** outcome 固定为 `in_progress` 的完整 attempt。 */
-  readonly attempt: InProgressOperationAttempt;
+  readonly attempt: InProgressRetryAttempt;
 }
 
-/** `operation_attempt_failed` 为未完成逻辑操作保存的安全失败事实。 */
-export interface OperationAttemptFailedPayload {
+/** `retry_attempt_failed` 为未完成 Retry Sequence 保存的安全失败事实。 */
+export interface RetryAttemptFailedPayload {
   /** 与先前 started attempt 精确匹配的失败完成结果。 */
-  readonly attempt: CompletedOperationAttempt;
+  readonly attempt: CompletedRetryAttempt;
 }
 
-/** `run_retry_exhausted` 将 retryable operation 转为显式 Suspended Run。 */
+/** `run_retry_exhausted` 将耗尽的 Retry Sequence 转为显式 Suspended Run。 */
 export interface RunRetryExhaustedPayload {
-  /** 达到 retry 边界的逻辑操作 identity。 */
-  readonly operationId: string;
+  /** 达到 retry 边界的 Retry Sequence identity。 */
+  readonly retrySequenceId: string;
   /** 被暂停的模型 generation 或只读 search 类型。 */
-  readonly operationKind: RetryableOperationKind;
+  readonly retrySequenceKind: RetrySequenceKind;
   /** 已持久化的 attempt 数量。 */
   readonly attemptsUsed: number;
   /** 最后一次 retryable 或 interrupted failure。 */
@@ -660,10 +660,10 @@ export interface RunRetryExhaustedPayload {
 
 /** `run_failed` 保存不可自动修复的 terminal failure。 */
 export interface RunFailedPayload {
-  /** 导致失败的逻辑操作 identity。 */
-  readonly operationId: string;
+  /** 导致失败的 Retry Sequence identity。 */
+  readonly retrySequenceId: string;
   /** 失败发生在模型 generation 或只读 search。 */
-  readonly operationKind: RetryableOperationKind;
+  readonly retrySequenceKind: RetrySequenceKind;
   /** 规范化且不得携带秘密的永久失败原因。 */
   readonly failure: NormalizedFailure;
 }
@@ -673,7 +673,7 @@ export interface ResearchToolObservedPayload {
   /** 对一个 durable pending intent 的成功、无效、拒绝或失败 observation。 */
   readonly observation: ResearchToolObservation;
   /** 启用 retry 的 search success 时必填并同事务提交；其他 observation 可省略。 */
-  readonly attempt?: CompletedOperationAttempt | undefined;
+  readonly attempt?: CompletedRetryAttempt | undefined;
 }
 
 /** 模型显式声明研究完成时提交的结构化不确定性。 */
@@ -979,8 +979,8 @@ export type ResearchRunEvent =
   | RunEvent<"planning_started", Record<never, never>>
   | RunEvent<"plan_proposed", PlanProposedPayload>
   | RunEvent<"plan_approved", PlanApprovedPayload>
-  | RunEvent<"operation_attempt_started", OperationAttemptStartedPayload>
-  | RunEvent<"operation_attempt_failed", OperationAttemptFailedPayload>
+  | RunEvent<"retry_attempt_started", RetryAttemptStartedPayload>
+  | RunEvent<"retry_attempt_failed", RetryAttemptFailedPayload>
   | RunEvent<"run_retry_exhausted", RunRetryExhaustedPayload>
   | RunEvent<"run_failed", RunFailedPayload>
   | RunEvent<"model_turn_completed", ModelTurnCompletedPayload>
@@ -1117,17 +1117,17 @@ export interface RunTraceEvent {
   readonly publicationApprovalId?: string;
   /** 仅完成发布事件暴露的已写入 Markdown 内容 SHA-256。 */
   readonly learningArtifactSha256?: string;
-  /** operation attempt 事件或原子成功事件对应的逻辑操作 identity。 */
-  readonly operationId?: string;
-  /** attempt 或 terminal failure 对应的 Model Turn/search operation 类型。 */
-  readonly operationKind?: RetryableOperationKind;
+  /** Retry Attempt 事件或原子成功事件对应的 Retry Sequence identity。 */
+  readonly retrySequenceId?: string;
+  /** attempt 或 terminal failure 对应的 Retry Sequence 类型。 */
+  readonly retrySequenceKind?: RetrySequenceKind;
   /** Trace 中物理外部调用从 1 开始的 attempt 序号。 */
   readonly attemptNumber?: number;
   /** attempt 的规范化最终结果；started 事件使用 `in_progress`。 */
-  readonly attemptOutcome?: OperationAttempt["outcome"];
+  readonly attemptOutcome?: RetryAttempt["outcome"];
   /** completed attempt 的实际墙钟耗时，单位为毫秒。 */
   readonly attemptDurationMs?: number;
-  /** 本逻辑 operation 首次开始时冻结的 Retry Policy 版本。 */
+  /** 本 Retry Sequence 首次开始时冻结的 Retry Policy 版本。 */
   readonly retryPolicyVersion?: string;
   /** 失败 attempt 或失败 observation 的稳定类别。 */
   readonly failureCategory?: FailureCategory;

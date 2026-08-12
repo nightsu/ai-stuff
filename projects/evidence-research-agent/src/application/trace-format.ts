@@ -39,12 +39,12 @@ export function formatRunTrace(
         event.learningArtifactSha256 === undefined
           ? undefined
           : `published-sha256=${event.learningArtifactSha256}`,
-        event.operationId === undefined
+        event.retrySequenceId === undefined
           ? undefined
-          : `operation=${event.operationId}`,
-        event.operationKind === undefined
+          : `retry-sequence=${event.retrySequenceId}`,
+        event.retrySequenceKind === undefined
           ? undefined
-          : `operation-kind=${event.operationKind}`,
+          : `retry-sequence-kind=${event.retrySequenceKind}`,
         event.attemptNumber === undefined
           ? undefined
           : `attempt=${event.attemptNumber}`,

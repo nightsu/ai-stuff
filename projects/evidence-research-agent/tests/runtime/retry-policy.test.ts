@@ -118,9 +118,9 @@ describe("ResearchAgentRuntime retry policy", () => {
       expect(completed.state).toMatchObject({
         type: "research_complete",
         modelTurns: [expect.objectContaining({ text: "重试后显式完成。" })],
-        operationAttempts: [
+        retryAttempts: [
           expect.objectContaining({
-            operationKind: "model_turn",
+            retrySequenceKind: "model_turn",
             attemptNumber: 1,
             outcome: "retryable_failure",
             failure: {
@@ -131,7 +131,7 @@ describe("ResearchAgentRuntime retry policy", () => {
             retryDelayMs: 250,
           }),
           expect.objectContaining({
-            operationKind: "model_turn",
+            retrySequenceKind: "model_turn",
             attemptNumber: 2,
             outcome: "succeeded",
           }),
@@ -146,8 +146,8 @@ describe("ResearchAgentRuntime retry policy", () => {
         .toHaveLength(1);
       expect(trace.events).toEqual(expect.arrayContaining([
         expect.objectContaining({
-          type: "operation_attempt_failed",
-          operationKind: "model_turn",
+          type: "retry_attempt_failed",
+          retrySequenceKind: "model_turn",
           attemptNumber: 1,
           attemptOutcome: "retryable_failure",
           attemptDurationMs: 5,
@@ -163,7 +163,7 @@ describe("ResearchAgentRuntime retry policy", () => {
         }),
       ]));
       expect(formatRunTrace(trace, "human")).toContain(
-        "operation-kind=model_turn attempt=1 outcome=retryable_failure duration-ms=5 retry-policy=retry-v1 failure=infrastructure_transient/rate_limited retry-delay-ms=250",
+        "retry-sequence-kind=model_turn attempt=1 outcome=retryable_failure duration-ms=5 retry-policy=retry-v1 failure=infrastructure_transient/rate_limited retry-delay-ms=250",
       );
     } finally {
       runtime.close();
@@ -211,13 +211,13 @@ describe("ResearchAgentRuntime retry policy", () => {
       const suspended = await runtime.advanceResearch({ runId: waiting.runId });
       expect(suspended.state).toMatchObject({
         type: "retry_exhausted",
-        operationKind: "model_turn",
+        retrySequenceKind: "model_turn",
         attemptsUsed: 2,
         failure: {
           category: "infrastructure_transient",
           code: "service_unavailable",
         },
-        operationAttempts: [
+        retryAttempts: [
           expect.objectContaining({
             attemptNumber: 1,
             outcome: "retryable_failure",
@@ -232,7 +232,7 @@ describe("ResearchAgentRuntime retry policy", () => {
       if (suspended.state.type !== "retry_exhausted") {
         throw new Error("测试要求 retry_exhausted 状态");
       }
-      expect(suspended.state.operationAttempts[1]).not.toHaveProperty(
+      expect(suspended.state.retryAttempts[1]).not.toHaveProperty(
         "retryDelayMs",
       );
     } finally {
@@ -267,7 +267,7 @@ describe("ResearchAgentRuntime retry policy", () => {
       retryPolicy: policy,
       retryScheduler: { wait: async () => undefined },
       researchLoopHooks: {
-        afterOperationAttemptStarted: () => {
+        afterRetryAttemptStarted: () => {
           if (!interrupt) return;
           interrupt = false;
           throw new Error("模拟 started fact 后进程中断");
@@ -290,7 +290,7 @@ describe("ResearchAgentRuntime retry policy", () => {
     expect(interrupted.state).toMatchObject({
       type: "researching",
       latestSteering: "只验证 durable steering",
-      operationAttempts: [expect.objectContaining({
+      retryAttempts: [expect.objectContaining({
         attemptNumber: 1,
         outcome: "in_progress",
         latestSteering: "只验证 durable steering",
@@ -320,10 +320,13 @@ describe("ResearchAgentRuntime retry policy", () => {
       },
     });
     try {
-      const completed = await restarted.advanceResearch({ runId: waiting.runId });
+      const completed = await restarted.advanceResearch({
+        runId: waiting.runId,
+        steering: "不能改写正在恢复的 generation",
+      });
       expect(completed.state).toMatchObject({
         type: "research_complete",
-        operationAttempts: [
+        retryAttempts: [
           expect.objectContaining({
             attemptNumber: 1,
             outcome: "retryable_failure",
@@ -436,29 +439,29 @@ describe("ResearchAgentRuntime retry policy", () => {
       const completed = await runtime.advanceResearch({ runId: waiting.runId });
       expect(completed.state).toMatchObject({
         type: "research_complete",
-        operationAttempts: [
-          expect.objectContaining({ operationKind: "model_turn", outcome: "succeeded" }),
+        retryAttempts: [
+          expect.objectContaining({ retrySequenceKind: "model_turn", outcome: "succeeded" }),
           expect.objectContaining({
-            operationKind: "search_sources",
+            retrySequenceKind: "search_sources",
             attemptNumber: 1,
             outcome: "retryable_failure",
             retryDelayMs: 30,
           }),
           expect.objectContaining({
-            operationKind: "search_sources",
+            retrySequenceKind: "search_sources",
             attemptNumber: 2,
             outcome: "succeeded",
           }),
-          expect.objectContaining({ operationKind: "model_turn", outcome: "succeeded" }),
+          expect.objectContaining({ retrySequenceKind: "model_turn", outcome: "succeeded" }),
         ],
       });
       if (completed.state.type !== "research_complete") {
         throw new Error("测试要求 research_complete 状态");
       }
-      const searchAttempts = completed.state.operationAttempts.filter(
-        (attempt) => attempt.operationKind === "search_sources",
+      const searchAttempts = completed.state.retryAttempts.filter(
+        (attempt) => attempt.retrySequenceKind === "search_sources",
       );
-      expect(new Set(searchAttempts.map((attempt) => attempt.operationId)).size).toBe(1);
+      expect(new Set(searchAttempts.map((attempt) => attempt.retrySequenceId)).size).toBe(1);
       expect(new Set(searchAttempts.map((attempt) => attempt.toolCallId)).size).toBe(1);
       expect(completed.state.researchToolObservations).toEqual([
         expect.objectContaining({
@@ -553,9 +556,9 @@ describe("ResearchAgentRuntime retry policy", () => {
             },
           }),
         ]),
-        operationAttempts: expect.arrayContaining([
+        retryAttempts: expect.arrayContaining([
           expect.objectContaining({
-            operationKind: "search_sources",
+            retrySequenceKind: "search_sources",
             outcome: "permanent_failure",
             failure: {
               category: "tool_execution",
@@ -622,9 +625,9 @@ describe("ResearchAgentRuntime retry policy", () => {
       const failed = await runtime.advanceResearch({ runId: waiting.runId });
       expect(failed.state).toMatchObject({
         type: "failed",
-        operationKind: "model_turn",
+        retrySequenceKind: "model_turn",
         failure: { category: "model_contract", code: "invalid_model_turn" },
-        operationAttempts: [expect.objectContaining({
+        retryAttempts: [expect.objectContaining({
           attemptNumber: 1,
           outcome: "permanent_failure",
         })],
@@ -681,7 +684,7 @@ describe("ResearchAgentRuntime retry policy", () => {
     expect(committed.state).toMatchObject({
       type: "researching",
       modelTurns: [expect.objectContaining({ text: "重启后完成。" })],
-      operationAttempts: [expect.objectContaining({ outcome: "succeeded" })],
+      retryAttempts: [expect.objectContaining({ outcome: "succeeded" })],
       pendingToolIntents: [expect.objectContaining({ intentId: "complete" })],
     });
     first.close();
@@ -746,7 +749,7 @@ describe("ResearchAgentRuntime retry policy", () => {
       expect(projection.state).toMatchObject({
         type: "researching",
         modelTurns: [],
-        operationAttempts: [expect.objectContaining({ outcome: "in_progress" })],
+        retryAttempts: [expect.objectContaining({ outcome: "in_progress" })],
       });
       const trace = await runtime.traceRun({ runId: waiting.runId });
       expect(trace.events.some((event) => event.type === "model_turn_completed"))
@@ -763,7 +766,7 @@ describe("ResearchAgentRuntime retry policy", () => {
 
     const mismatchedPolicy = structuredClone(events);
     const failedAttempt = mismatchedPolicy[5];
-    if (failedAttempt?.type !== "operation_attempt_failed") {
+    if (failedAttempt?.type !== "retry_attempt_failed") {
       throw new Error("测试夹具缺少 failed attempt");
     }
     mismatchedPolicy[5] = {
@@ -801,7 +804,7 @@ describe("ResearchAgentRuntime retry policy", () => {
 
     const retryable = retryReducerEvents(2).slice(0, 6);
     const retryableFailure = retryable[5];
-    if (retryableFailure?.type !== "operation_attempt_failed") {
+    if (retryableFailure?.type !== "retry_attempt_failed") {
       throw new Error("测试夹具缺少 retryable failure");
     }
     retryable[5] = {
@@ -817,7 +820,7 @@ describe("ResearchAgentRuntime retry policy", () => {
     expect(() => reduceRunEvents(retryable)).not.toThrow();
     const tamperedDelay = structuredClone(retryable);
     const tamperedFailure = tamperedDelay[5];
-    if (tamperedFailure?.type !== "operation_attempt_failed") {
+    if (tamperedFailure?.type !== "retry_attempt_failed") {
       throw new Error("测试夹具缺少 retryable failure");
     }
     tamperedDelay[5] = {
@@ -850,11 +853,11 @@ describe("ResearchAgentRuntime retry policy", () => {
     );
   });
 
-  it("rejects reuse of a succeeded Model or Search operation identity", () => {
-    expect(() => reduceRunEvents(modelOperationIdReuseEvents())).toThrow(
+  it("rejects reuse of a succeeded Model or Search Retry Sequence identity", () => {
+    expect(() => reduceRunEvents(modelRetrySequenceIdReuseEvents())).toThrow(
       IllegalRunEventError,
     );
-    expect(() => reduceRunEvents(searchOperationIdReuseEvents())).toThrow(
+    expect(() => reduceRunEvents(searchRetrySequenceIdReuseEvents())).toThrow(
       IllegalRunEventError,
     );
   });
@@ -866,7 +869,7 @@ describe("ResearchAgentRuntime retry policy", () => {
     for (const replacement of [
       { toolCallId: "tool-call-replaced" },
       { intentId: "intent-replaced" },
-      { operationKind: "model_turn" as const, toolCallId: undefined, intentId: undefined },
+      { retrySequenceKind: "model_turn" as const, toolCallId: undefined, intentId: undefined },
       {
         retryPolicy: {
           version: "retry-replaced",
@@ -879,7 +882,7 @@ describe("ResearchAgentRuntime retry policy", () => {
     ]) {
       const tampered = structuredClone(validRetry);
       const retryStart = tampered.at(-1);
-      if (retryStart?.type !== "operation_attempt_started") {
+      if (retryStart?.type !== "retry_attempt_started") {
         throw new Error("测试夹具缺少 retry started attempt");
       }
       tampered[tampered.length - 1] = {
@@ -897,8 +900,57 @@ describe("ResearchAgentRuntime retry policy", () => {
     }
   });
 
+  it("keeps Model retry steering frozen for one logical generation", () => {
+    const events = retryReducerEvents(2).slice(0, 6);
+    const started = events[4];
+    const failed = events[5];
+    if (
+      started?.type !== "retry_attempt_started" ||
+      failed?.type !== "retry_attempt_failed"
+    ) {
+      throw new Error("测试夹具缺少 Model retry facts");
+    }
+    events[4] = {
+      ...started,
+      payload: {
+        attempt: {
+          ...started.payload.attempt,
+          latestSteering: "冻结 steering",
+        },
+      },
+    };
+    events[5] = {
+      ...failed,
+      payload: {
+        attempt: {
+          ...failed.payload.attempt,
+          latestSteering: "冻结 steering",
+          outcome: "retryable_failure",
+          retryDelayMs: 10,
+        },
+      },
+    };
+    events.push({
+      eventId: "event-model-retry-steering",
+      runId: started.runId,
+      sequence: 7,
+      type: "retry_attempt_started",
+      occurredAt: "2026-08-12T08:00:01.006Z",
+      payload: {
+        attempt: {
+          ...started.payload.attempt,
+          attemptId: "attempt-model-retry-steering",
+          attemptNumber: 2,
+          startedAt: "2026-08-12T08:00:01.006Z",
+          latestSteering: "被篡改的 steering",
+        },
+      },
+    });
+    expect(() => reduceRunEvents(events)).toThrow(IllegalRunEventError);
+  });
+
   it("rejects retry-enabled success facts that leave a pending attempt open", () => {
-    const modelEvents = modelOperationIdReuseEvents().slice(0, 6);
+    const modelEvents = modelRetrySequenceIdReuseEvents().slice(0, 6);
     const modelCompleted = modelEvents.at(-1);
     if (modelCompleted?.type !== "model_turn_completed") {
       throw new Error("测试夹具缺少 Model completion");
@@ -914,7 +966,7 @@ describe("ResearchAgentRuntime retry policy", () => {
 
     const searchEvents = retryableSearchAttemptEvents();
     const searchStarted = searchEvents.at(-1);
-    if (searchStarted?.type !== "operation_attempt_started") {
+    if (searchStarted?.type !== "retry_attempt_started") {
       throw new Error("测试夹具缺少 Search retry attempt");
     }
     const observedAt = "2026-08-12T08:00:04.000Z";
@@ -951,7 +1003,7 @@ describe("ResearchAgentRuntime retry policy", () => {
   });
 
   it("binds atomic Search success to the pending attempt Tool Call", () => {
-    const events = searchOperationIdReuseEvents().slice(0, 8);
+    const events = searchRetrySequenceIdReuseEvents().slice(0, 8);
     expect(() => reduceRunEvents(events)).not.toThrow();
     const succeeded = events.at(-1);
     if (succeeded?.type !== "research_tool_observed") {
@@ -973,7 +1025,7 @@ describe("ResearchAgentRuntime retry policy", () => {
   it("binds an ordinary Search failure observation to its failed attempt", () => {
     const events = retryableSearchAttemptEvents().slice(0, 8);
     const failed = events.at(-1);
-    if (failed?.type !== "operation_attempt_failed") {
+    if (failed?.type !== "retry_attempt_failed") {
       throw new Error("测试夹具缺少 Search failed attempt");
     }
     events[events.length - 1] = {
@@ -1015,25 +1067,48 @@ describe("ResearchAgentRuntime retry policy", () => {
       },
     });
     expect(() => reduceRunEvents(events)).toThrow(IllegalRunEventError);
+
+    const mismatchedFailure = structuredClone(events);
+    const observationEvent = mismatchedFailure.at(-1);
+    if (observationEvent?.type !== "research_tool_observed") {
+      throw new Error("测试夹具缺少 Search failure observation");
+    }
+    mismatchedFailure[mismatchedFailure.length - 1] = {
+      ...observationEvent,
+      payload: {
+        observation: {
+          ...observationEvent.payload.observation,
+          toolCallId: failed.payload.attempt.toolCallId ?? "",
+          failure: {
+            category: "tool_execution",
+            code: "different_failure",
+          },
+          code: "different_failure",
+        },
+      },
+    };
+    expect(() => reduceRunEvents(mismatchedFailure)).toThrow(
+      IllegalRunEventError,
+    );
   });
 
-  it("rejects a new operation while the latest attempt still requires recovery", () => {
+  it("rejects a new Retry Sequence while the latest attempt still requires recovery", () => {
     const inProgress = retryReducerEvents(2).slice(0, 5);
     const firstStart = inProgress.at(-1);
-    if (firstStart?.type !== "operation_attempt_started") {
+    if (firstStart?.type !== "retry_attempt_started") {
       throw new Error("测试夹具缺少 first started attempt");
     }
     inProgress.push({
-      eventId: "event-new-operation",
+      eventId: "event-new-sequence",
       runId: firstStart.runId,
       sequence: 6,
-      type: "operation_attempt_started",
+      type: "retry_attempt_started",
       occurredAt: "2026-08-12T08:00:01.001Z",
       payload: {
         attempt: {
           ...firstStart.payload.attempt,
-          attemptId: "attempt-new-operation",
-          operationId: "operation-new",
+          attemptId: "attempt-new-sequence",
+          retrySequenceId: "retry-sequence-new",
           startedAt: "2026-08-12T08:00:01.001Z",
         },
       },
@@ -1042,7 +1117,7 @@ describe("ResearchAgentRuntime retry policy", () => {
 
     const retryable = retryReducerEvents(2).slice(0, 6);
     const failed = retryable.at(-1);
-    if (failed?.type !== "operation_attempt_failed") {
+    if (failed?.type !== "retry_attempt_failed") {
       throw new Error("测试夹具缺少 retryable failure");
     }
     retryable[retryable.length - 1] = {
@@ -1056,16 +1131,16 @@ describe("ResearchAgentRuntime retry policy", () => {
       },
     };
     retryable.push({
-      eventId: "event-replaced-operation",
+      eventId: "event-replaced-sequence",
       runId: failed.runId,
       sequence: 7,
-      type: "operation_attempt_started",
+      type: "retry_attempt_started",
       occurredAt: "2026-08-12T08:00:01.006Z",
       payload: {
         attempt: {
           ...firstStart.payload.attempt,
-          attemptId: "attempt-replaced-operation",
-          operationId: "operation-replaced",
+          attemptId: "attempt-replaced-sequence",
+          retrySequenceId: "retry-sequence-replaced",
           startedAt: "2026-08-12T08:00:01.006Z",
         },
       },
@@ -1075,7 +1150,7 @@ describe("ResearchAgentRuntime retry policy", () => {
 
   it("rejects malformed attempt facts at the Journal schema boundary", () => {
     const started = structuredClone(retryReducerEvents()[4]);
-    if (started?.type !== "operation_attempt_started") {
+    if (started?.type !== "retry_attempt_started") {
       throw new Error("测试夹具缺少 started attempt");
     }
     const malformed = {
@@ -1161,7 +1236,7 @@ describe("ResearchAgentRuntime retry policy", () => {
         retryPolicy: policy,
         state: {
           type: "research_complete",
-          operationAttempts: [
+          retryAttempts: [
             expect.objectContaining({ retryPolicy: policy, outcome: "retryable_failure" }),
             expect.objectContaining({ retryPolicy: policy, outcome: "succeeded" }),
           ],
@@ -1235,7 +1310,7 @@ describe("ResearchAgentRuntime retry policy", () => {
         type: "budget_exhausted",
         exhaustedDimension: "wall_time",
         remainingBudget: { wallTimeMs: 0 },
-        operationAttempts: [expect.objectContaining({
+        retryAttempts: [expect.objectContaining({
           attemptNumber: 1,
           outcome: "retryable_failure",
         })],
@@ -1270,7 +1345,7 @@ describe("ResearchAgentRuntime retry policy", () => {
       },
       retryScheduler: { wait: async () => undefined },
       researchLoopHooks: {
-        afterOperationAttemptStarted: () => {
+        afterRetryAttemptStarted: () => {
           if (!interrupt) return;
           interrupt = false;
           throw new Error("模拟 started fact 后进程中断");
@@ -1304,7 +1379,7 @@ describe("ResearchAgentRuntime retry policy", () => {
       expect(suspended.state).toMatchObject({
         type: "budget_exhausted",
         exhaustedDimension: "wall_time",
-        operationAttempts: [expect.objectContaining({
+        retryAttempts: [expect.objectContaining({
           outcome: "retryable_failure",
           failure: {
             category: "infrastructure_transient",
@@ -1363,7 +1438,7 @@ describe("ResearchAgentRuntime retry policy", () => {
       const failed = await runtime.advanceResearch({ runId: waiting.runId });
       expect(failed.state).toMatchObject({
         type: "failed",
-        operationKind: "search_sources",
+        retrySequenceKind: "search_sources",
         failure: {
           category: "invariant_violation",
           code: "invalid_search_result",
@@ -1372,7 +1447,7 @@ describe("ResearchAgentRuntime retry policy", () => {
       const trace = await runtime.traceRun({ runId: waiting.runId });
       expect(trace.events.at(-1)).toMatchObject({
         type: "run_failed",
-        operationKind: "search_sources",
+        retrySequenceKind: "search_sources",
         failureCategory: "invariant_violation",
         failureCode: "invalid_search_result",
       });
@@ -1436,7 +1511,7 @@ describe("ResearchAgentRuntime retry policy", () => {
       ids,
       retryPolicy: policy,
       researchLoopHooks: {
-        afterOperationAttemptStarted: () => {
+        afterRetryAttemptStarted: () => {
           hookCalls += 1;
           if (hookCalls === 2) throw new Error("模拟 search I/O 前中断");
         },
@@ -1452,9 +1527,9 @@ describe("ResearchAgentRuntime retry policy", () => {
     const interrupted = await first.inspectRun({ runId: waiting.runId });
     expect(interrupted.state).toMatchObject({
       type: "researching",
-      operationAttempts: [
-        expect.objectContaining({ operationKind: "model_turn", outcome: "succeeded" }),
-        expect.objectContaining({ operationKind: "search_sources", outcome: "in_progress" }),
+      retryAttempts: [
+        expect.objectContaining({ retrySequenceKind: "model_turn", outcome: "succeeded" }),
+        expect.objectContaining({ retrySequenceKind: "search_sources", outcome: "in_progress" }),
       ],
     });
     expect(modelCalls).toBe(1);
@@ -1479,8 +1554,8 @@ describe("ResearchAgentRuntime retry policy", () => {
       if (completed.state.type !== "research_complete") {
         throw new Error("测试要求 research_complete 状态");
       }
-      const attempts = completed.state.operationAttempts.filter(
-        (attempt) => attempt.operationKind === "search_sources",
+      const attempts = completed.state.retryAttempts.filter(
+        (attempt) => attempt.retrySequenceKind === "search_sources",
       );
       expect(attempts).toMatchObject([
         { attemptNumber: 1, outcome: "retryable_failure" },
@@ -1628,13 +1703,13 @@ function retryReducerEvents(modelMaxAttempts = 1): ResearchRunEvent[] {
       eventId: "event-005",
       runId: "run-reducer-retry",
       sequence: 5,
-      type: "operation_attempt_started",
+      type: "retry_attempt_started",
       occurredAt: startedAt,
       payload: {
         attempt: {
           attemptId: "attempt-001",
-          operationId: "operation-001",
-          operationKind: "model_turn",
+          retrySequenceId: "retry-sequence-001",
+          retrySequenceKind: "model_turn",
           attemptNumber: 1,
           retryPolicy: policy,
           startedAt,
@@ -1646,13 +1721,13 @@ function retryReducerEvents(modelMaxAttempts = 1): ResearchRunEvent[] {
       eventId: "event-006",
       runId: "run-reducer-retry",
       sequence: 6,
-      type: "operation_attempt_failed",
+      type: "retry_attempt_failed",
       occurredAt: completedAt,
       payload: {
         attempt: {
           attemptId: "attempt-001",
-          operationId: "operation-001",
-          operationKind: "model_turn",
+          retrySequenceId: "retry-sequence-001",
+          retrySequenceKind: "model_turn",
           attemptNumber: 1,
           retryPolicy: policy,
           startedAt,
@@ -1673,8 +1748,8 @@ function retryReducerEvents(modelMaxAttempts = 1): ResearchRunEvent[] {
       type: "run_retry_exhausted",
       occurredAt: completedAt,
       payload: {
-        operationId: "operation-001",
-        operationKind: "model_turn",
+        retrySequenceId: "retry-sequence-001",
+        retrySequenceKind: "model_turn",
         attemptsUsed: 1,
         failure: {
           category: "infrastructure_transient",
@@ -1685,10 +1760,10 @@ function retryReducerEvents(modelMaxAttempts = 1): ResearchRunEvent[] {
   ];
 }
 
-function modelOperationIdReuseEvents(): ResearchRunEvent[] {
+function modelRetrySequenceIdReuseEvents(): ResearchRunEvent[] {
   const events = retryReducerEvents(2).slice(0, 5);
   const started = events[4];
-  if (started?.type !== "operation_attempt_started") {
+  if (started?.type !== "retry_attempt_started") {
     throw new Error("测试夹具缺少 Model started attempt");
   }
   const completedAt = "2026-08-12T08:00:01.005Z";
@@ -1702,7 +1777,7 @@ function modelOperationIdReuseEvents(): ResearchRunEvent[] {
       generationStartedAt: started.occurredAt,
       turn: {
         turnId: "turn-event-006",
-        text: "先完成一个 Model operation。",
+        text: "先完成一个 Model Retry Sequence。",
         evidenceGaps: [],
         finishReason: "tool_calls",
         toolIntents: [{
@@ -1747,7 +1822,7 @@ function modelOperationIdReuseEvents(): ResearchRunEvent[] {
     eventId: "event-008",
     runId: started.runId,
     sequence: 8,
-    type: "operation_attempt_started",
+    type: "retry_attempt_started",
     occurredAt: "2026-08-12T08:00:01.007Z",
     payload: {
       attempt: {
@@ -1761,7 +1836,7 @@ function modelOperationIdReuseEvents(): ResearchRunEvent[] {
   return events;
 }
 
-function searchOperationIdReuseEvents(): ResearchRunEvent[] {
+function searchRetrySequenceIdReuseEvents(): ResearchRunEvent[] {
   const events = retryReducerEvents(2).slice(0, 4);
   const runId = events[0]?.runId;
   const retryPolicy = events[0]?.type === "run_created"
@@ -1776,7 +1851,7 @@ function searchOperationIdReuseEvents(): ResearchRunEvent[] {
     sequence: 7,
     retryPolicy,
     attemptId: "search-attempt-001",
-    operationId: "search-operation-001",
+    retrySequenceId: "search-retry-sequence-001",
     attemptNumber: 1,
     toolCallId: "tool-call-001",
     intentId: "search-001",
@@ -1786,7 +1861,7 @@ function searchOperationIdReuseEvents(): ResearchRunEvent[] {
     sequence: 8,
     retryPolicy,
     attemptId: "search-attempt-001",
-    operationId: "search-operation-001",
+    retrySequenceId: "search-retry-sequence-001",
     attemptNumber: 1,
     toolCallId: "tool-call-001",
     intentId: "search-001",
@@ -1797,7 +1872,7 @@ function searchOperationIdReuseEvents(): ResearchRunEvent[] {
     sequence: 11,
     retryPolicy,
     attemptId: "search-attempt-002",
-    operationId: "search-operation-001",
+    retrySequenceId: "search-retry-sequence-001",
     attemptNumber: 2,
     toolCallId: "tool-call-002",
     intentId: "search-002",
@@ -1820,7 +1895,7 @@ function retryableSearchAttemptEvents(): ResearchRunEvent[] {
     sequence: 7,
     retryPolicy,
     attemptId: "search-attempt-001",
-    operationId: "search-operation-001",
+    retrySequenceId: "search-retry-sequence-001",
     attemptNumber: 1,
     toolCallId: "tool-call-001",
     intentId: "search-001",
@@ -1830,7 +1905,7 @@ function retryableSearchAttemptEvents(): ResearchRunEvent[] {
     eventId: "event-search-failed-007",
     runId,
     sequence: 8,
-    type: "operation_attempt_failed",
+    type: "retry_attempt_failed",
     occurredAt: "2026-08-12T08:00:03.005Z",
     payload: {
       attempt: {
@@ -1851,7 +1926,7 @@ function retryableSearchAttemptEvents(): ResearchRunEvent[] {
     sequence: 9,
     retryPolicy,
     attemptId: "search-attempt-002",
-    operationId: "search-operation-001",
+    retrySequenceId: "search-retry-sequence-001",
     attemptNumber: 2,
     toolCallId: "tool-call-001",
     intentId: "search-001",
@@ -1869,8 +1944,8 @@ function modelSearchIntentEvents(
   const completedAt = `2026-08-12T08:00:0${sequence - 4}.005Z`;
   const attempt = {
     attemptId: `attempt-model-${sequence}`,
-    operationId: `operation-model-${sequence}`,
-    operationKind: "model_turn",
+    retrySequenceId: `retry-sequence-model-${sequence}`,
+    retrySequenceKind: "model_turn",
     attemptNumber: 1,
     retryPolicy,
     startedAt,
@@ -1882,7 +1957,7 @@ function modelSearchIntentEvents(
       eventId: `event-model-started-${sequence}`,
       runId,
       sequence,
-      type: "operation_attempt_started",
+      type: "retry_attempt_started",
       occurredAt: startedAt,
       payload: { attempt },
     },
@@ -1923,13 +1998,13 @@ interface SearchAttemptFixtureInput {
   readonly runId: string;
   /** 夹具事件在 Run Journal 中的连续序号。 */
   readonly sequence: number;
-  /** Search 逻辑操作首次 attempt 冻结的 Retry Policy。 */
+  /** Search Retry Sequence 首次 attempt 冻结的 Retry Policy。 */
   readonly retryPolicy: RetryPolicy;
   /** 当前物理 Search attempt identity。 */
   readonly attemptId: string;
-  /** 所有 Search retries 共享的逻辑 operation identity。 */
-  readonly operationId: string;
-  /** 当前物理 attempt 在逻辑 operation 内的 1-based 序号。 */
+  /** 所有 Search retries 共享的 Retry Sequence identity。 */
+  readonly retrySequenceId: string;
+  /** 当前物理 attempt 在 Retry Sequence 内的 1-based 序号。 */
   readonly attemptNumber: number;
   /** 所有 Search retries 必须共享的逻辑 Research Tool call identity。 */
   readonly toolCallId: string;
@@ -1943,13 +2018,13 @@ function searchAttemptStartedEvent(input: SearchAttemptFixtureInput) {
     eventId: `event-search-started-${input.sequence}`,
     runId: input.runId,
     sequence: input.sequence,
-    type: "operation_attempt_started",
+    type: "retry_attempt_started",
     occurredAt: startedAt,
     payload: {
       attempt: {
         attemptId: input.attemptId,
-        operationId: input.operationId,
-        operationKind: "search_sources",
+        retrySequenceId: input.retrySequenceId,
+        retrySequenceKind: "search_sources",
         attemptNumber: input.attemptNumber,
         retryPolicy: input.retryPolicy,
         startedAt,
@@ -1992,8 +2067,8 @@ function searchSucceededEvent(input: SearchAttemptFixtureInput) {
       },
       attempt: {
         attemptId: input.attemptId,
-        operationId: input.operationId,
-        operationKind: "search_sources",
+        retrySequenceId: input.retrySequenceId,
+        retrySequenceKind: "search_sources",
         attemptNumber: input.attemptNumber,
         retryPolicy: input.retryPolicy,
         startedAt: `2026-08-12T08:00:0${input.sequence - 5}.000Z`,
