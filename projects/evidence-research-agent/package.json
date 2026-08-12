@@ -20,6 +20,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@ai-sdk/openai-compatible": "3.0.29",
+    "ai": "7.0.59",
     "better-sqlite3": "13.0.3",
     "zod": "4.4.3"
   },

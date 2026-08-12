@@ -1,6 +1,7 @@
 import type {
   Claim,
   EvidenceRecord,
+  ExperimentIdentity,
   LearningArtifactProposal,
   ModelTurn,
   ModelView,
@@ -37,6 +38,14 @@ export class InfrastructureFailureError extends Error {
     this.name = "InfrastructureFailureError";
     this.code = code;
     this.retryAfterMs = options.retryAfterMs;
+  }
+}
+
+/** Model Port 在 completed result 形成前观察到调用方取消时抛出的安全错误。 */
+export class ModelGenerationAbortedError extends Error {
+  public constructor() {
+    super("模型 generation 已取消");
+    this.name = "ModelGenerationAbortedError";
   }
 }
 
@@ -88,16 +97,31 @@ export interface LearningArtifactProposalRequest {
   readonly evidenceRecords: readonly EvidenceRecord[];
 }
 
+/** 一次 Model Port generation 的非持久化调用控制。 */
+export interface ModelCallOptions {
+  /** 调用方用于取消仍在流式传输、尚未形成 completed result 的信号。 */
+  readonly abortSignal?: AbortSignal | undefined;
+}
+
 /** 隔离模型 SDK 与运行时控制流的最小端口。 */
 export interface ModelPort {
+  /** live adapter 声明的非秘密实验身份；legacy/test adapter 可以省略。 */
+  readonly experimentIdentity?: ExperimentIdentity | undefined;
   /** 为一个新 Run 返回完整计划；部分流式 delta 不进入该契约。 */
-  proposePlan(request: PlanRequest): Promise<ResearchPlan>;
+  proposePlan(
+    request: PlanRequest,
+    options?: ModelCallOptions,
+  ): Promise<ResearchPlan>;
   /** 为已通过 Evidence Gate 前置条件的 Run 选择既有 Claims 并提供 Markdown 文案。 */
   proposeLearningArtifact(
     request: LearningArtifactProposalRequest,
+    options?: ModelCallOptions,
   ): Promise<LearningArtifactProposal>;
   /** 从 Harness 构建的 Model View 完成一个 Research Loop generation。 */
-  generateResearchTurn?(view: ModelView): Promise<Omit<ModelTurn, "turnId" | "completedAt">>;
+  generateResearchTurn?(
+    view: ModelView,
+    options?: ModelCallOptions,
+  ): Promise<Omit<ModelTurn, "turnId" | "completedAt">>;
 }
 
 /** Harness 调度 `search_sources` 时依赖的可注入本地 discovery 边界。 */

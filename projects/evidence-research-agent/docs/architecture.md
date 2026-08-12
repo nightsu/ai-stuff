@@ -1,8 +1,8 @@
-# Evidence Research Agent 架构（Issue #7）
+# Evidence Research Agent 架构（Issue #8）
 
-当前 slice 在 #6 的有界多轮 Research Loop 上加入了可审批 Retry Policy、durable Retry Attempts 和稳定 failure taxonomy。Model generation 与 `search_sources` 的每次物理 I/O 都由 Journal 中的 started/completed attempt 包围；完整 Model Turn 或 Search observation 与成功 attempt 原子提交。研究只有在 `complete_research` 成功后才成为 `research_complete`；硬预算、retry exhaustion 与不可恢复 failure 分别进入明确状态，不会被当作完成或进入 publication。
+当前 slice 在 #7 的 retry/recovery 协议上接入 Vercel AI SDK Core `streamText` 与 `@ai-sdk/openai-compatible`。live adapter 负责 provider transport、stream consumption、schema-only tool definitions、usage 与安全错误归一化；Harness 继续拥有单步 Research Loop、Research Tool 调度、retry、Journal、审批和 publication。partial provider delta 永远不是 canonical Model Turn。
 
-外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。当前仍没有 live model、并行 tool batch、预算扩展恢复或 publication crash reconciliation；这些分别属于后续 tickets。
+外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。当前仍没有并行 tool batch、预算扩展恢复或 publication crash reconciliation；这些分别属于后续 tickets。
 
 ## 组件、端口与单向能力流
 
@@ -14,7 +14,11 @@ flowchart LR
   Harness <--> Journal["Run Journal"]
   Journal --> Projection["Run Projection"]
   Projection --> View["Model View Builder<br/>pinned facts + deterministic trimming"]
-  View --> Model["Model Port<br/>Scripted Model"]
+  View --> Model["Model Port<br/>Scripted Model / OpenAI-compatible adapter"]
+  Model --> AiSdk["Vercel AI SDK Core<br/>streamText, one generation"]
+  AiSdk --> Provider["OpenAI-compatible provider<br/>environment-injected transport"]
+  Provider -->|"text/tool-input deltas + finish + usage"| AiSdk
+  AiSdk -->|"completed provider-neutral result"| Model
   Model --> Loop["Bounded Research Loop"]
   Loop --> Attempts["Attempt controller<br/>approved policy + wall time"]
   Attempts -->|"retry_attempt_started"| Journal
@@ -86,6 +90,10 @@ flowchart LR
   Publisher --> Journal
   Journal --> Trace
 ```
+
+OpenAI-compatible adapter 的工具定义只有 description 与 Zod input schema，没有 AI SDK `execute`。它不设置 `stopWhen`，不使用 `ToolLoopAgent`、automatic multi-step execution、`useChat` 或 SDK message history；`maxRetries` 固定为 0，确保 AI SDK 不在 Harness 的 durable Retry Attempts 外另开隐藏 retry。`AbortSignal` 直接传给 `streamText`。adapter 只有在观察到 terminal `finish`、完整 tool calls 与 usage 后才返回；abort、stream error、缺少 finish 或 tool JSON 无法拼装时，局部 text/input deltas 被丢弃。
+
+真实 provider 的 base URL 与 API key 只存在于环境加载和 provider transport closure。Run Journal 只保存 Experiment Identity：provider、model、adapter version、prompt version 与 Research Tool schema version。该 identity 进入 Plan Approval binding，重启时必须与当前 Model Port 精确匹配；不同模型或版本不能在同一已批准 Run 中静默替换。Trace 显示 Experiment Identity，但不显示 URL、headers、provider message/body 或 API key。
 
 `advanceResearch` 是当前主 seam。每轮开始时，Runtime 只从 Run Journal、derived Projection 和 plan artifact 构造新的 Model View；它不会把 Journal 或完整 `messages[]` 直接传给模型。fixed rules、批准计划、approval binding、预算版本与余额、pending intents、evidence gaps 和最新 steering 是 pinned facts。超过 Model View 字节上限时，Builder 先删除最旧 observations，再从尾部删除 Evidence；pinned facts 仍放不下便抛出 `ModelViewTooLargeError`，不请求 LLM 摘要隐藏约束。
 
@@ -170,7 +178,7 @@ publication 状态以 `researchOrigin` 判别 provenance：Issue #5 的零 Resea
 
 `publication_approved` 也不是“文件已经写好”的断言。用户命令只批准等待状态中显示的 `draftHash`、canonical Output Root、`targetCanonicalPath`、父目录 `device` 和 `inode` 的精确聚合 hash。Runtime 在接受 receipt 前重新捕获 root 与 target parent identity；若目录被替换、target 逃出 root 或 canonical target 改变，旧 binding 失效。receipt 进入 `ready_to_publish` 后，只有显式 `publishLearningArtifact` 才会调用外部 publisher；正常 publisher 返回后才追加 `learning_artifact_published` 并进入 terminal `completed`。
 
-Trace 依次暴露不含秘密的 lineage：每个 attempt 的 Retry Sequence kind/identity、序号、outcome、duration、Retry Policy version、failure category/code 与 retry delay；`read_source` 的 observation/tool call/Snapshot；**每个 Evidence 的相同 observation/tool call/Snapshot**；再到 Claim ID、draft artifact ID、publication receipt ID 与最终 Markdown SHA-256。schema error、permission denial、stale state、ordinary tool execution、infrastructure transient、model permanent 与 invariant violation 均使用 stable category/code，不包含绝对来源路径、provider payload、摘录正文、私有 Runtime Home 或 OS 错误。
+Trace 先暴露非秘密 Experiment Identity，再依次暴露不含秘密的 lineage：每个 attempt 的 Retry Sequence kind/identity、序号、outcome、duration、Retry Policy version、failure category/code 与 retry delay；`read_source` 的 observation/tool call/Snapshot；**每个 Evidence 的相同 observation/tool call/Snapshot**；再到 Claim ID、draft artifact ID、publication receipt ID 与最终 Markdown SHA-256。schema error、permission denial、stale state、ordinary tool execution、infrastructure transient、model permanent 与 invariant violation均使用 stable category/code，不包含绝对来源路径、provider payload、摘录正文、私有 Runtime Home 或 OS 错误。
 
 ## 正常发布语义与未实现的 crash 边界
 
@@ -182,7 +190,6 @@ Trace 依次暴露不含秘密的 lineage：每个 attempt 的 Retry Sequence ki
 
 ## 当前边界与后续 ticket
 
-- Issue #8 才用 Vercel AI SDK `streamText` 接入 OpenAI-compatible live Model Port；SDK 类型仍隔离在 `ModelPort` 后。
 - Issue #9 才加入用户暂停、取消、预算版本扩展以及从 `budget_exhausted` 的恢复。
 - Issue #11 才加入 safe search/read sibling batch 的有界并发与模型原始顺序回填。
 - Issue #14 才把 publication 外部 effect 的 crash reconciliation 做成 durable protocol。

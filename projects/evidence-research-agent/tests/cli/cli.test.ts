@@ -126,6 +126,51 @@ it("creates, inspects, approves, and traces one Run through process-like CLI cal
   expect(errorOutput).toEqual([]);
 });
 
+it("fails safely when live-model environment is incomplete before opening Runtime Home", async () => {
+  const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
+  runtimeHomes.push(runtimeHome);
+  const output: string[] = [];
+  const errorOutput: string[] = [];
+  const io = {
+    stdout: (line: string) => output.push(line),
+    stderr: (line: string) => errorOutput.push(line),
+  };
+  const environmentKeys = [
+    "EVIDENCE_MODEL_PROVIDER",
+    "EVIDENCE_MODEL_BASE_URL",
+    "EVIDENCE_MODEL_API_KEY",
+    "EVIDENCE_MODEL_NAME",
+  ] as const;
+  const original = Object.fromEntries(
+    environmentKeys.map((key) => [key, process.env[key]]),
+  );
+  for (const key of environmentKeys) delete process.env[key];
+
+  try {
+    expect(await runCli([
+      "run",
+      "--live-model",
+      "--runtime-home",
+      runtimeHome,
+      "--question",
+      "真实模型如何生成计划？",
+      "--source-root",
+      runtimeHome,
+      "--json",
+    ], io)).toBe(1);
+  } finally {
+    for (const key of environmentKeys) {
+      const value = original[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+
+  expect(output).toEqual([]);
+  expectJsonError(errorOutput, "CLI_COMMAND_FAILED", "命令执行失败");
+  await expect(readdir(runtimeHome)).resolves.toEqual([]);
+});
+
 it("rejects missing, malformed, environment, and unknown approval authority safely", async () => {
   const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
   runtimeHomes.push(runtimeHome);

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import type {
   ArtifactReference,
+  ExperimentIdentity,
   PlanApprovalBinding,
   ReadSourceRequest,
   RetryPolicy,
@@ -20,6 +21,8 @@ export interface CreatePlanApprovalBindingInput {
   readonly sourceScope: SourceScope;
   /** 创建 Run 时经 schema 校验且不受模型控制的 Run Budget。 */
   readonly runBudget: RunBudget;
+  /** 创建 live Run 时冻结、且不包含 credential 的 Experiment Identity。 */
+  readonly experimentIdentity?: ExperimentIdentity | undefined;
   /** 创建 Run 时显式配置并必须随计划一同批准的 Retry Policy。 */
   readonly retryPolicy?: RetryPolicy | undefined;
 }
@@ -89,6 +92,9 @@ export function createPlanApprovalBinding(
     sourceScopeHash: hashCanonicalJson(input.sourceScope),
     budgetVersion: input.runBudget.version,
     budgetHash: hashCanonicalJson(input.runBudget),
+    ...(input.experimentIdentity === undefined
+      ? {}
+      : { experimentIdentityHash: hashCanonicalJson(input.experimentIdentity) }),
     ...(input.retryPolicy === undefined
       ? {}
       : {

@@ -68,6 +68,10 @@ _Avoid_: Canonical history, Run Projection, messages database
 One completed, provider-neutral model generation containing normalized text, tool intents, finish reason, and usage. Partial provider stream deltas are observable but do not become canonical model output until the turn completes.
 _Avoid_: Provider response, Research Loop, chat message
 
+**Experiment Identity**:
+The non-secret, versioned provider, model, adapter, prompt, and Research Tool schema identity frozen for a Research Run so live-model results can be reproduced and compared without persisting credentials.
+_Avoid_: Provider configuration, API key, environment snapshot
+
 **Scripted Model**:
 A deterministic Model Port implementation that returns a predefined sequence of Model Turns for runtime and recovery tests. It tests the Harness without introducing live-model variance.
 _Avoid_: Mock response, evaluator model, test prompt

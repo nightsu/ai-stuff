@@ -187,6 +187,8 @@ export interface PlanApprovalBinding {
   readonly budgetVersion: string;
   /** 规范 JSON 编码后的完整 Run Budget SHA-256 摘要。 */
   readonly budgetHash: string;
+  /** live Run 创建时完整 Experiment Identity 的规范 JSON SHA-256；legacy Run 省略。 */
+  readonly experimentIdentityHash?: string | undefined;
   /** 自动 retry 启用时所授权策略的稳定版本；legacy Run 省略。 */
   readonly retryPolicyVersion?: string | undefined;
   /** 自动 retry 启用时完整策略的规范 JSON SHA-256；legacy Run 省略。 */
@@ -217,6 +219,8 @@ export interface PlanApprovalReceipt {
   readonly budgetVersion: string;
   /** Receipt 所授权完整 Run Budget 的规范 JSON SHA-256 摘要。 */
   readonly budgetHash: string;
+  /** Receipt 所授权 Experiment Identity 的规范 JSON SHA-256；legacy Run 省略。 */
+  readonly experimentIdentityHash?: string | undefined;
   /** Receipt 所授权 Retry Policy 的稳定版本；legacy Run 省略。 */
   readonly retryPolicyVersion?: string | undefined;
   /** Receipt 所授权完整 Retry Policy 的规范 JSON SHA-256；legacy Run 省略。 */
@@ -239,6 +243,34 @@ export interface ResearchPlan {
   readonly objectives: readonly string[];
   /** 按执行意图排序的计划步骤。 */
   readonly steps: readonly PlanStep[];
+}
+
+/** 一组不含凭据、足以区分一次 live-model 实验配置的稳定身份。 */
+export interface ExperimentIdentity {
+  /** OpenAI-compatible endpoint 的逻辑 provider 名称，不包含 URL 或 credential。 */
+  readonly provider: string;
+  /** provider 接收的精确模型标识。 */
+  readonly model: string;
+  /** 项目自有 Model Port adapter 行为版本。 */
+  readonly adapterVersion: string;
+  /** 构建 provider request 的 prompt 模板版本。 */
+  readonly promptVersion: string;
+  /** 暴露给模型的 Research Tool schema 集合版本。 */
+  readonly toolSchemaVersion: string;
+}
+
+/** provider-neutral token usage；provider 未报告的细分项使用 `undefined`。 */
+export interface ModelUsage {
+  /** provider 计入 prompt/context 的 token 数。 */
+  readonly inputTokens?: number | undefined;
+  /** provider 计入生成结果的 token 数。 */
+  readonly outputTokens?: number | undefined;
+  /** provider 报告的 input 与 output token 总数。 */
+  readonly totalTokens?: number | undefined;
+  /** input token 中命中 provider cache 的数量。 */
+  readonly cachedInputTokens?: number | undefined;
+  /** output token 中由 provider 标为 reasoning 的数量。 */
+  readonly reasoningTokens?: number | undefined;
 }
 
 /** Model Port 返回、但仍须由 Harness 调度和校验的单个 Research Tool intent。 */
@@ -268,6 +300,8 @@ export interface ModelTurn {
   readonly finishReason: "tool_calls" | "stop";
   /** 由 Harness 逐项调度的有序 Research Tool intents。 */
   readonly toolIntents: readonly ResearchToolIntent[];
+  /** 完整 generation 的 provider-neutral token usage；legacy fixture 可省略。 */
+  readonly usage?: ModelUsage | undefined;
   /** 完整 Model Turn 被提交为 Journal 事实的 ISO 8601 UTC 时间。 */
   readonly completedAt: string;
 }
@@ -584,6 +618,8 @@ export interface RunProjection {
   readonly sourceScope: SourceScope;
   /** 创建 Run 时冻结且只能通过新批准版本改变的 Run Budget。 */
   readonly runBudget: RunBudget;
+  /** 创建 Run 时由 Model Port 声明的非秘密实验身份；legacy Run 可省略。 */
+  readonly experimentIdentity?: ExperimentIdentity | undefined;
   /** 创建 Run 时冻结并进入计划审批边界的自动 retry 策略；legacy Run 省略。 */
   readonly retryPolicy?: RetryPolicy | undefined;
   /** 当前合法状态；不得由独立布尔标记拼装。 */
@@ -604,6 +640,8 @@ export interface RunCreatedPayload {
   readonly sourceScope: SourceScope;
   /** 创建时冻结的多维预算；模型输出不得选择或提高这些限制。 */
   readonly runBudget: RunBudget;
+  /** Model Port 提供的非秘密实验身份；不得包含 base URL、header 或 API key。 */
+  readonly experimentIdentity?: ExperimentIdentity | undefined;
   /** 创建时显式启用并冻结的自动 retry 策略；省略即保持 legacy 单 attempt。 */
   readonly retryPolicy?: RetryPolicy | undefined;
 }
@@ -1141,6 +1179,8 @@ export interface RunTraceEvent {
 export interface RunTrace {
   /** Trace 对应的 Research Run identity。 */
   readonly runId: string;
+  /** live Run 的非秘密实验身份；legacy Run 可省略。 */
+  readonly experimentIdentity?: ExperimentIdentity | undefined;
   /** 回放全部事件后得到的当前状态。 */
   readonly finalState: ResearchRunState["type"];
   /** 按 Journal 顺序投影出的精简事件列表。 */

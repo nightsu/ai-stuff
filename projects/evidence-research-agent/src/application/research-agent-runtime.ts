@@ -82,6 +82,7 @@ import {
 import { RgSourceSearch } from "../infrastructure/private-source-search.js";
 import {
   InfrastructureFailureError,
+  ModelGenerationAbortedError,
 } from "./ports.js";
 import type {
   Clock,
@@ -215,6 +216,8 @@ export interface AdvanceResearchCommand {
   readonly runId: string;
   /** 本次推进要固定进 Model View 的最新用户 steering；空白值会被拒绝。 */
   readonly steering?: string;
+  /** 取消尚未形成 completed Model Turn 的 provider stream。 */
+  readonly abortSignal?: AbortSignal | undefined;
 }
 
 /** 让模型在既有 Evidence-backed Claims 中选择 Markdown draft 的应用命令。 */
@@ -550,6 +553,9 @@ const advanceResearchCommandSchema = z
   .object({
     runId: z.string().trim().min(1),
     steering: z.string().trim().min(1).optional(),
+    abortSignal: z.custom<AbortSignal>(
+      (value) => value === undefined || isAbortSignal(value),
+    ).optional(),
   })
   .strict();
 
@@ -558,6 +564,13 @@ const researchTurnOutputSchema = z
     text: z.string(),
     evidenceGaps: z.array(z.string().trim().min(1)),
     finishReason: z.enum(["tool_calls", "stop"]),
+    usage: z.object({
+      inputTokens: z.number().int().nonnegative().optional(),
+      outputTokens: z.number().int().nonnegative().optional(),
+      totalTokens: z.number().int().nonnegative().optional(),
+      cachedInputTokens: z.number().int().nonnegative().optional(),
+      reasoningTokens: z.number().int().nonnegative().optional(),
+    }).strict().optional(),
     toolIntents: z
       .array(
         z
@@ -747,6 +760,9 @@ export class ResearchAgentRuntime {
           question: parsed.question,
           sourceScope,
           runBudget,
+          ...(this.#model.experimentIdentity === undefined
+            ? {}
+            : { experimentIdentity: this.#model.experimentIdentity }),
           ...(this.#retryEnabled ? { retryPolicy: this.#retryPolicy } : {}),
         },
       },
@@ -781,6 +797,7 @@ export class ResearchAgentRuntime {
       planHash: artifact.sha256,
       sourceScope,
       runBudget,
+      experimentIdentity: this.#model.experimentIdentity,
       ...(this.#retryEnabled ? { retryPolicy: this.#retryPolicy } : {}),
     });
     const planProposed: ResearchRunEvent = {
@@ -885,7 +902,7 @@ export class ResearchAgentRuntime {
     if (!parsedCommand.success || this.#model.generateResearchTurn === undefined) {
       throw new ResearchLoopError();
     }
-    const { runId, steering } = parsedCommand.data;
+    const { runId, steering, abortSignal } = parsedCommand.data;
 
     // 每个迭代只做三件事：从 Journal 重建视图、提交一个完整 Model Turn、
     // 顺序消费其 intents。任何一步崩溃后，canonical Projection 都能指出是该
@@ -920,6 +937,11 @@ export class ResearchAgentRuntime {
             );
       }
       if (current.state.type !== "researching") {
+        throw new ResearchLoopError();
+      }
+      if (!sameExperimentIdentity(current.experimentIdentity, this.#model.experimentIdentity)) {
+        // Experiment Identity 是 Run 事实；重启时换 provider/model/prompt/tool schema
+        // 必须新建或显式迁移 Run，不能在已审批边界内静默改变实验条件。
         throw new ResearchLoopError();
       }
       const recovered = this.#recoverInterruptedAttempt(current);
@@ -965,9 +987,10 @@ export class ResearchAgentRuntime {
         let generated: z.infer<typeof researchTurnOutputSchema>;
         try {
           generated = researchTurnOutputSchema.parse(
-            await this.#model.generateResearchTurn(view),
+            await this.#model.generateResearchTurn(view, { abortSignal }),
           );
-        } catch {
+        } catch (error) {
+          if (error instanceof ModelGenerationAbortedError) throw error;
           throw new ResearchLoopError();
         }
         const occurredAt = this.#clock.now();
@@ -1031,9 +1054,12 @@ export class ResearchAgentRuntime {
       let generated: z.infer<typeof researchTurnOutputSchema>;
       try {
         generated = researchTurnOutputSchema.parse(
-          await this.#model.generateResearchTurn(view),
+          // AbortSignal 只控制当前物理 provider attempt；Harness 不会把已收到但
+          // 未完成的 delta 记作 Model Turn，重启仍从 durable attempt fact 恢复。
+          await this.#model.generateResearchTurn(view, { abortSignal }),
         );
       } catch (error) {
+        if (error instanceof ModelGenerationAbortedError) throw error;
         this.#commitFailedAttempt(
           started.projection,
           this.#completeFailedAttempt(
@@ -1806,6 +1832,9 @@ export class ResearchAgentRuntime {
     if (error instanceof InfrastructureFailureError) {
       return this.#normalizeInfrastructureFailure(error);
     }
+    if (error instanceof ModelGenerationAbortedError) {
+      return { category: "model_permanent", code: "model_generation_aborted" };
+    }
     if (error instanceof z.ZodError) {
       return { category: "model_contract", code: "invalid_model_turn" };
     }
@@ -2332,6 +2361,9 @@ export class ResearchAgentRuntime {
     ) {
       throw new IllegalLearningArtifactStateError();
     }
+    if (!sameExperimentIdentity(current.experimentIdentity, this.#model.experimentIdentity)) {
+      throw new LearningArtifactDraftError();
+    }
     const researching = current.state;
     if (
       researching.modelTurns.length > 0 &&
@@ -2631,4 +2663,29 @@ function parseSourceSearchMatches(value: unknown): SourceSearchMatch[] {
     lineNumber: z.number().int().positive(),
     lineText: z.string(),
   }).strict()).parse(value);
+}
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "aborted" in value &&
+    typeof value.aborted === "boolean" &&
+    "addEventListener" in value &&
+    typeof value.addEventListener === "function"
+  );
+}
+
+function sameExperimentIdentity(
+  expected: import("../domain/types.js").ExperimentIdentity | undefined,
+  actual: import("../domain/types.js").ExperimentIdentity | undefined,
+): boolean {
+  if (expected === undefined || actual === undefined) return expected === actual;
+  return (
+    expected.provider === actual.provider &&
+    expected.model === actual.model &&
+    expected.adapterVersion === actual.adapterVersion &&
+    expected.promptVersion === actual.promptVersion &&
+    expected.toolSchemaVersion === actual.toolSchemaVersion
+  );
 }

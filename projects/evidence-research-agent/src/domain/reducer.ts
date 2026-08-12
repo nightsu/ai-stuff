@@ -121,6 +121,9 @@ export function buildRunTrace(events: readonly ResearchRunEvent[]): RunTrace {
 
   return {
     runId: projection.runId,
+    ...(projection.experimentIdentity === undefined
+      ? {}
+      : { experimentIdentity: projection.experimentIdentity }),
     finalState: projection.state.type,
     events: traceEvents,
   };
@@ -142,6 +145,9 @@ function applyRunEvent(
       question: event.payload.question,
       sourceScope: event.payload.sourceScope,
       runBudget: event.payload.runBudget,
+      ...(event.payload.experimentIdentity === undefined
+        ? {}
+        : { experimentIdentity: event.payload.experimentIdentity }),
       ...(event.payload.retryPolicy === undefined
         ? {}
         : { retryPolicy: event.payload.retryPolicy }),
@@ -193,6 +199,7 @@ function applyRunEvent(
         planHash: event.payload.planArtifact.sha256,
         sourceScope: current.sourceScope,
         runBudget: current.runBudget,
+        experimentIdentity: current.experimentIdentity,
         retryPolicy: current.retryPolicy,
       });
       // approvalBinding 是方便审计的冗余摘要，不是新的事实源。回放必须从
@@ -233,6 +240,7 @@ function applyRunEvent(
         planHash: current.state.planArtifact.sha256,
         sourceScope: current.sourceScope,
         runBudget: current.runBudget,
+        experimentIdentity: current.experimentIdentity,
         retryPolicy: current.retryPolicy,
       });
       // Receipt 是回放时唯一持久化的用户授权事实，因此既要重新确认等待状态的
@@ -1781,6 +1789,7 @@ function approvalBindingsEqual(
     actual.sourceScopeHash === expected.sourceScopeHash &&
     actual.budgetVersion === expected.budgetVersion &&
     actual.budgetHash === expected.budgetHash &&
+    actual.experimentIdentityHash === expected.experimentIdentityHash &&
     actual.retryPolicyVersion === expected.retryPolicyVersion &&
     actual.retryPolicyHash === expected.retryPolicyHash &&
     actual.bindingHash === expected.bindingHash

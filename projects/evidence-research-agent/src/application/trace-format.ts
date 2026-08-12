@@ -13,6 +13,11 @@ export function formatRunTrace(
 
   return [
     `Run ${trace.runId}`,
+    ...(trace.experimentIdentity === undefined
+      ? []
+      : [
+          `Experiment: provider=${trace.experimentIdentity.provider} model=${trace.experimentIdentity.model} adapter=${trace.experimentIdentity.adapterVersion} prompt=${trace.experimentIdentity.promptVersion} tools=${trace.experimentIdentity.toolSchemaVersion}`,
+        ]),
     `Current state: ${trace.finalState}`,
     ...trace.events.map((event) => {
       const lineage = [

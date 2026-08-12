@@ -68,14 +68,18 @@ export async function runCli(
             question: { type: "string" },
             "runtime-home": { type: "string" },
             "source-root": { type: "string", multiple: true },
+            "live-model": { type: "boolean", default: false },
           },
         });
         const runtimeHome = resolve(values["runtime-home"] ?? ".runtime");
         const question = requireOption(values.question, "--question");
         const roots = requireMultipleOption(values["source-root"], "--source-root");
+        const model = values["live-model"]
+          ? await loadLiveModelPort()
+          : new ScriptedModel([createLearningPlan(question)]);
         const runtime = ResearchAgentRuntime.open({
           runtimeHome,
-          model: new ScriptedModel([createLearningPlan(question)]),
+          model,
         });
         try {
           const projection = await runtime.createRun({
@@ -280,6 +284,13 @@ function describeCliError(error: unknown): readonly [string, string] {
     return ["PLAN_APPROVAL_REJECTED", "计划审批未被接受"];
   }
   return ["CLI_COMMAND_FAILED", "命令执行失败"];
+}
+
+async function loadLiveModelPort() {
+  const { createOpenAiCompatibleModelPortFromEnv } = await import(
+    "./adapters/openai-compatible-model.js"
+  );
+  return createOpenAiCompatibleModelPortFromEnv();
 }
 
 function isParseArgsError(error: unknown): boolean {

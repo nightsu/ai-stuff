@@ -1,8 +1,8 @@
 # Evidence Research Agent
 
-这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #7：一条已经 durable Plan Approval 的 Run 可以由 Scripted Model 驱动真正有界的多轮 Research Loop，经 Harness 调度五个模型可见 Research Tools；Model 与 `search_sources` 的物理 attempts、失败分类和有界 retry 也进入 canonical Journal。研究显式完成后，Run 再通过 Evidence Gate、精确 publication approval 和 no-clobber publisher 产出 Learning Artifact。
+这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #8：除确定性的 Scripted Model 外，Run 也可通过 Vercel AI SDK Core `streamText` 与 `@ai-sdk/openai-compatible` 接入真实模型，同时继续由 Harness 拥有 Research Loop、工具调度、retry、Journal、审批与 publication。
 
-当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。它仍不包含 live model、并行 tool batch、预算扩展恢复、`read-source` CLI 或 publication CLI；这些属于后续 tickets。
+当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。live adapter 只做单次 generation：工具没有 AI SDK `execute`，也不使用 `ToolLoopAgent`、`stopWhen`、自动多步执行、`useChat` 或 SDK history。并行 tool batch、预算扩展恢复、`read-source` CLI 与 publication CLI 仍属于后续 tickets。
 
 ## 快速开始：创建并批准计划
 
@@ -23,6 +23,55 @@ node dist/src/cli.js run \
   --runtime-home .runtime \
   --json
 ```
+
+如需用真实 OpenAI-compatible provider 生成计划，先通过环境注入配置，再给 `run` 增加 `--live-model`：
+
+```bash
+export EVIDENCE_MODEL_PROVIDER="team-gateway"
+export EVIDENCE_MODEL_BASE_URL="https://models.example.com/v1"
+export EVIDENCE_MODEL_API_KEY="..."
+export EVIDENCE_MODEL_NAME="research-model"
+
+node dist/src/cli.js run \
+  --live-model \
+  --question "追加式 Run Journal 如何驱动派生状态投影？" \
+  --source-root "$PWD/../../docs" \
+  --runtime-home .runtime \
+  --json
+```
+
+adapter/prompt/tool schema versions 可分别由 `EVIDENCE_MODEL_ADAPTER_VERSION`、`EVIDENCE_MODEL_PROMPT_VERSION`、`EVIDENCE_MODEL_TOOL_SCHEMA_VERSION` 覆盖。provider、model 与这些版本作为非秘密 Experiment Identity 进入 `run_created`、Projection、Trace 和 Plan Approval binding；base URL、API key、headers 与 provider payload 不持久化。CLI 目前只把 live adapter 接到新 Run 的计划 generation；跨进程推进 Research Loop 仍使用 TypeScript `advanceResearch` seam，避免在 Issue #8 静默扩张 CLI 命令面。
+
+## OpenAI-compatible live Model Port
+
+`OpenAiCompatibleModelPort` 对 `proposePlan`、`generateResearchTurn` 与 `proposeLearningArtifact` 都使用 `streamText` 的一次 generation，并把 text delta、tool-input delta、completed tool calls、finish reason、usage 与 provider failure 归一化到项目类型。AI SDK 自带 retry 固定为 0，基础设施 retry 仍由已批准的 Harness Retry Policy 控制；`AbortSignal` 会中止未完成 stream，partial delta 只存在于 adapter 局部内存，不会成为 Model Turn。
+
+```ts
+import {
+  createOpenAiCompatibleModelPortFromEnv,
+  ResearchAgentRuntime,
+} from "./src/index.js";
+
+const controller = new AbortController();
+const runtime = ResearchAgentRuntime.open({
+  runtimeHome: ".runtime",
+  model: createOpenAiCompatibleModelPortFromEnv(),
+  retryPolicy: {
+    version: "retry-v1",
+    modelMaxAttempts: 3,
+    toolMaxAttempts: 2,
+    baseDelayMs: 250,
+    maxDelayMs: 5_000,
+  },
+});
+
+await runtime.advanceResearch({
+  runId: "<approved-run-id>",
+  abortSignal: controller.signal,
+});
+```
+
+provider 可能错误地把 request metadata 或 credential 回显到生成内容；adapter 在解析 plan、Model Turn 或 Learning Artifact proposal 前会按精确 API key 字符串拒绝整个 completed result。公开错误只使用稳定分类与代码，不包含 provider message、URL、body 或 credential。
 
 记下 `runId`，通过 `inspect` 读取 `state.approvalBinding.bindingHash`，再原样提交：
 
@@ -236,7 +285,6 @@ Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE
 
 ## 尚未实现
 
-- Issue #8：Vercel AI SDK `streamText` 驱动的 OpenAI-compatible live Model Port；SDK 类型仍必须隔离在 `ModelPort` 后。
 - Issue #9：用户暂停、取消、预算版本扩展与从 `budget_exhausted` 精确恢复。
 - Issue #11：安全 search/read sibling batch 的有界并发与模型原始顺序回填。
 - Issue #14：publication 外部 effect 的 durable operation、crash reconciliation 与精确恢复协议。

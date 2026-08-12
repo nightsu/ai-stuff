@@ -10,6 +10,7 @@ import { hasPreRenderedCitationToken } from "./citation-safety.js";
 import type {
   Claim,
   EvidenceRecord,
+  ExperimentIdentity,
   LearningArtifactProposal,
   ModelTurn,
   RetryAttempt,
@@ -371,6 +372,7 @@ const planApprovalBindingSchema = z
     sourceScopeHash: sha256Schema,
     budgetVersion: z.string().trim().min(1),
     budgetHash: sha256Schema,
+    experimentIdentityHash: sha256Schema.optional(),
     retryPolicyVersion: z.string().trim().min(1).optional(),
     retryPolicyHash: sha256Schema.optional(),
     bindingHash: sha256Schema,
@@ -395,6 +397,7 @@ const planApprovalReceiptSchema = z
     sourceScopeHash: sha256Schema,
     budgetVersion: z.string().trim().min(1),
     budgetHash: sha256Schema,
+    experimentIdentityHash: sha256Schema.optional(),
     retryPolicyVersion: z.string().trim().min(1).optional(),
     retryPolicyHash: sha256Schema.optional(),
   })
@@ -421,6 +424,27 @@ const researchToolIntentSchema = z
   })
   .strict();
 
+const modelUsageSchema = z
+  .object({
+    inputTokens: z.number().int().nonnegative().optional(),
+    outputTokens: z.number().int().nonnegative().optional(),
+    totalTokens: z.number().int().nonnegative().optional(),
+    cachedInputTokens: z.number().int().nonnegative().optional(),
+    reasoningTokens: z.number().int().nonnegative().optional(),
+  })
+  .strict();
+
+const experimentIdentitySchema = z
+  .object({
+    provider: z.string().trim().min(1),
+    model: z.string().trim().min(1),
+    adapterVersion: z.string().trim().min(1),
+    promptVersion: z.string().trim().min(1),
+    toolSchemaVersion: z.string().trim().min(1),
+  })
+  .strict()
+  .transform((identity): ExperimentIdentity => identity);
+
 const modelTurnSchema = z
   .object({
     turnId: z.string().trim().min(1),
@@ -428,6 +452,7 @@ const modelTurnSchema = z
     evidenceGaps: z.array(z.string().trim().min(1)),
     finishReason: z.enum(["tool_calls", "stop"]),
     toolIntents: z.array(researchToolIntentSchema).min(1),
+    usage: modelUsageSchema.optional(),
     completedAt: z.iso.datetime(),
   })
   .strict()
@@ -680,6 +705,7 @@ const runProjectionSchema = z.object({
   question: z.string().min(1),
   sourceScope: sourceScopeValueSchema,
   runBudget: runBudgetValueSchema,
+  experimentIdentity: experimentIdentitySchema.optional(),
   retryPolicy: retryPolicySchema.optional(),
   state: runStateSchema,
   lastEventSequence: z.number().int().positive(),
@@ -702,6 +728,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
         question: z.string().trim().min(1),
         sourceScope: sourceScopeValueSchema,
         runBudget: runBudgetValueSchema,
+        experimentIdentity: experimentIdentitySchema.optional(),
         retryPolicy: retryPolicySchema.optional(),
     }),
   }),

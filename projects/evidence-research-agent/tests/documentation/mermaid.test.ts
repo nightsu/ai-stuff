@@ -33,6 +33,8 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   expect(markdown).toContain("Journal --> Projection");
   expect(markdown).toContain("Projection --> View");
   expect(markdown).toContain("View --> Model");
+  expect(markdown).toContain("Model --> AiSdk");
+  expect(markdown).toContain("AiSdk --> Provider");
   expect(markdown).toContain("Model --> Loop");
   expect(markdown).toContain("Loop --> Scheduler");
   expect(markdown).toContain("Scheduler --> Search");

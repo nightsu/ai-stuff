@@ -1,5 +1,20 @@
 export { ScriptedModel, ScriptedModelExhaustedError } from "./adapters/scripted-model.js";
 export {
+  createOpenAiCompatibleModelPortFromEnv,
+  OpenAiCompatibleModelConfigurationError,
+  OpenAiCompatibleModelPort,
+  OpenAiCompatibleModelResponseError,
+} from "./adapters/openai-compatible-model.js";
+export type {
+  AiSdkStreamPart,
+  AiSdkStreamTextOptions,
+  AiSdkStreamTextResult,
+  AiSdkUsage,
+  OpenAiCompatibleModelConfig,
+  OpenAiCompatibleModelDependencies,
+  OpenAiCompatibleModelEnvironment,
+} from "./adapters/openai-compatible-model.js";
+export {
   IllegalPlanApprovalStateError,
   IllegalEvidenceStateError,
   IllegalSourceReadStateError,
@@ -52,6 +67,7 @@ export type {
   Clock,
   IdGenerator,
   LearningArtifactProposalRequest,
+  ModelCallOptions,
   ModelPort,
   PlanRequest,
   SourceSearchPort,
@@ -60,6 +76,7 @@ export type {
 } from "./application/ports.js";
 export {
   InfrastructureFailureError,
+  ModelGenerationAbortedError,
 } from "./application/ports.js";
 export type {
   AdvanceResearchCommand,
@@ -102,11 +119,13 @@ export type {
   SucceededSourceReadObservation,
   DeniedSourceReadObservation,
   EvidenceRecord,
+  ExperimentIdentity,
   FailedSourceReadObservation,
   SourceSnapshotReference,
   SourceScope,
   LearningArtifactProposal,
   ModelTurn,
+  ModelUsage,
   ModelView,
   ModelViewEvidence,
   RemainingRunBudget,
