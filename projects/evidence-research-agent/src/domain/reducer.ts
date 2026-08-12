@@ -364,6 +364,12 @@ function applyRunEvent(
       if (current.state.pendingToolIntents.length !== 0) {
         throw new IllegalRunEventError("pending Research Tool intent 尚未获得 observation");
       }
+      if (
+        current.retryPolicy !== undefined &&
+        event.payload.attempt === undefined
+      ) {
+        throw new IllegalRunEventError("启用 retry 的 Model Turn 必须原子完成 pending attempt");
+      }
       const { turn } = event.payload;
       const operationAttempts = event.payload.attempt === undefined
         ? current.state.operationAttempts
@@ -372,6 +378,8 @@ function applyRunEvent(
             event.payload.attempt,
             event.occurredAt,
           );
+      const effectiveSteering = event.payload.latestSteering ??
+        current.state.latestSteering;
       if (
         turn.turnId !== `turn-${event.eventId}` ||
         turn.completedAt !== event.occurredAt ||
@@ -393,6 +401,8 @@ function applyRunEvent(
         current.state.modelTurns.length + 2 > current.runBudget.maxModelTurns
         || !isIsoUtc(event.payload.generationStartedAt)
         || Date.parse(event.payload.generationStartedAt) > Date.parse(event.occurredAt)
+        || (event.payload.attempt !== undefined &&
+          event.payload.attempt.latestSteering !== effectiveSteering)
       ) {
         throw new IllegalRunEventError("Model Turn 公共字段无效");
       }
@@ -418,6 +428,29 @@ function applyRunEvent(
       if (current.state.type !== "researching") {
         throw new IllegalRunEventError("只有 researching Run 可以记录 Research Tool observation");
       }
+      if (
+        current.retryPolicy !== undefined &&
+        event.payload.attempt === undefined &&
+        (event.payload.observation.status === "succeeded" ||
+          current.state.operationAttempts.at(-1)?.outcome === "in_progress")
+      ) {
+        throw new IllegalRunEventError("启用 retry 的 Search observation 不能遗留 pending attempt");
+      }
+      const pendingFailedSearchAttempt = current.state.operationAttempts.at(-1);
+      if (
+        event.payload.attempt === undefined &&
+        pendingFailedSearchAttempt?.operationKind === "search_sources" &&
+        pendingFailedSearchAttempt.outcome === "permanent_failure" &&
+        !current.state.researchToolObservations.some(
+          (observation) =>
+            observation.toolCallId === pendingFailedSearchAttempt.toolCallId,
+        ) &&
+        (event.payload.observation.toolCallId !== pendingFailedSearchAttempt.toolCallId ||
+          event.payload.observation.intentId !== pendingFailedSearchAttempt.intentId ||
+          event.payload.observation.status !== "failed")
+      ) {
+        throw new IllegalRunEventError("Search failure observation 与 pending attempt 不一致");
+      }
       const pending = validateResearchObservation(
         current.state.pendingToolIntents,
         current.state.researchToolObservations,
@@ -432,6 +465,14 @@ function applyRunEvent(
             event.payload.attempt,
             event.occurredAt,
           );
+      if (
+        event.payload.attempt !== undefined &&
+        (event.payload.attempt.operationKind !== "search_sources" ||
+          event.payload.attempt.toolCallId !== event.payload.observation.toolCallId ||
+          event.payload.attempt.intentId !== event.payload.observation.intentId)
+      ) {
+        throw new IllegalRunEventError("Search success 与 attempt lineage 不一致");
+      }
       assertResearchToolCallWithinBudget(current, event.payload.observation);
       if (event.payload.observation.status === "succeeded") {
         if (
@@ -888,8 +929,15 @@ function validateStartedAttempt(
   const previousAttempt = sameOperation.at(-1);
   const latestAttempt = state.operationAttempts.at(-1);
   const newOperation = previousAttempt === undefined;
+  const latestOperationClosed = latestAttempt === undefined ||
+    latestAttempt.outcome === "succeeded" ||
+    (latestAttempt.operationKind === "search_sources" &&
+      latestAttempt.outcome === "permanent_failure" &&
+      state.researchToolObservations.some(
+        (observation) => observation.toolCallId === latestAttempt.toolCallId,
+      ));
   const validOperationIdentity = newOperation
-    ? attempt.attemptNumber === 1
+    ? attempt.attemptNumber === 1 && latestOperationClosed
     : previousAttempt === latestAttempt &&
       previousAttempt.outcome === "retryable_failure" &&
       attempt.attemptNumber === previousAttempt.attemptNumber + 1 &&

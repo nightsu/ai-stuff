@@ -920,6 +920,13 @@ export class ResearchAgentRuntime {
       if (current.state.type !== "researching") {
         throw new ResearchLoopError();
       }
+      const recovered = this.#recoverInterruptedAttempt(current);
+      if (recovered !== undefined) {
+        // interrupted attempt 已经是 durable 未决事实；即使重启时 wall time 已耗尽，
+        // 也必须先分类并闭合它，下一轮才能用完整 canonical usage 决定预算暂停。
+        this.#commitFailedAttempt(current, recovered);
+        continue;
+      }
       const now = this.#clock.now();
       const remainingBudget = this.#remainingBudget(current, now);
       const exhausted = firstExhaustedRunBudgetDimension(
@@ -989,11 +996,6 @@ export class ResearchAgentRuntime {
         } catch {
           throw new ResearchLoopError();
         }
-        continue;
-      }
-      const recovered = this.#recoverInterruptedAttempt(current);
-      if (recovered !== undefined) {
-        this.#commitFailedAttempt(current, recovered);
         continue;
       }
       const retryContext = this.#retryContext(current, "model_turn");
@@ -1214,11 +1216,6 @@ export class ResearchAgentRuntime {
     }
     if (current.retryPolicy === undefined) {
       await this.#executeSearchIntentOnce(current, intent, parsed.data);
-      return;
-    }
-    const recovered = this.#recoverInterruptedAttempt(current);
-    if (recovered !== undefined) {
-      this.#commitFailedAttempt(current, recovered);
       return;
     }
     const retryContext = this.#retryContext(current, "search_sources");

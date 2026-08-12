@@ -630,7 +630,7 @@ export interface ModelTurnCompletedPayload {
   readonly generationStartedAt: string;
   /** 本轮构建 Model View 时采用的最新非空 steering。 */
   readonly latestSteering?: string | undefined;
-  /** 与完整 Model Turn 同事务提交的成功物理 generation attempt。 */
+  /** 启用 Retry Policy 时必填并与 Model Turn 同事务提交；legacy Run 可省略。 */
   readonly attempt?: CompletedOperationAttempt | undefined;
 }
 
@@ -672,7 +672,7 @@ export interface RunFailedPayload {
 export interface ResearchToolObservedPayload {
   /** 对一个 durable pending intent 的成功、无效、拒绝或失败 observation。 */
   readonly observation: ResearchToolObservation;
-  /** search success 与 observation 同事务提交的成功物理 attempt。 */
+  /** 启用 retry 的 search success 时必填并同事务提交；其他 observation 可省略。 */
   readonly attempt?: CompletedOperationAttempt | undefined;
 }
 
