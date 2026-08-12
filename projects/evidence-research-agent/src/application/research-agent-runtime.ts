@@ -6,6 +6,7 @@ import {
   createPlanApprovalBinding,
   hashReadSourceRequest,
   hashUtf8Text,
+  hashCanonicalJson,
 } from "../domain/integrity.js";
 import {
   assertEvidenceGateBudget,
@@ -244,6 +245,32 @@ export interface ApprovePublicationCommand {
 export interface PublishLearningArtifactCommand {
   /** 当前必须处于 ready_to_publish 的 Research Run identity。 */
   readonly runId: string;
+}
+
+/** 用户显式暂停一个当前可继续的 Research Run。 */
+export interface PauseRunCommand {
+  /** 要进入 durable user_paused 状态的 Research Run identity。 */
+  readonly runId: string;
+}
+
+/** 恢复一个 user_paused Run，而不重跑已完成工作。 */
+export interface ResumeRunCommand {
+  /** 要恢复其精确 suspended state 的 Research Run identity。 */
+  readonly runId: string;
+}
+
+/** 用户终止一个非 terminal Research Run。 */
+export interface CancelRunCommand {
+  /** 要进入不可恢复 cancelled 终态的 Research Run identity。 */
+  readonly runId: string;
+}
+
+/** 用户批准更大 Run Budget 版本并恢复 budget_exhausted Run。 */
+export interface ExtendRunBudgetCommand {
+  /** 当前必须处于 budget_exhausted 的 Research Run identity。 */
+  readonly runId: string;
+  /** 逐维不缩减、且至少提高一个限制的新版本化 Run Budget。 */
+  readonly runBudget: unknown;
 }
 
 /** 提交的 binding 已不再对应当前等待计划时抛出的安全错误。 */
@@ -558,6 +585,11 @@ const publishLearningArtifactCommandSchema = z
     runId: z.string().trim().min(1),
   })
   .strict();
+
+const extendRunBudgetCommandSchema = z.object({
+  runId: z.string().trim().min(1),
+  runBudget: z.unknown(),
+}).strict();
 
 const advanceResearchCommandSchema = z
   .object({
@@ -922,7 +954,9 @@ export class ResearchAgentRuntime {
       if (
         current.state.type === "budget_exhausted" ||
         current.state.type === "retry_exhausted" ||
-        current.state.type === "failed"
+        current.state.type === "failed" ||
+        current.state.type === "user_paused" ||
+        current.state.type === "cancelled"
       ) {
         return current;
       }
@@ -1026,11 +1060,7 @@ export class ResearchAgentRuntime {
           await this.#runResearchLoopHook(
             this.#researchLoopHooks.beforeModelTurnJournalAppend,
           );
-          this.#store.appendEvents(
-            runId,
-            current.lastEventSequence,
-            [event],
-          );
+          this.#appendCompletedResearchResults(current, [event]);
           await this.#runResearchLoopHook(
             this.#researchLoopHooks.afterModelTurnJournalAppend,
           );
@@ -1120,11 +1150,7 @@ export class ResearchAgentRuntime {
         await this.#runResearchLoopHook(
           this.#researchLoopHooks.beforeModelTurnJournalAppend,
         );
-        this.#store.appendEvents(
-          runId,
-          started.projection.lastEventSequence,
-          [event],
-        );
+        this.#appendCompletedResearchResults(started.projection, [event]);
         await this.#runResearchLoopHook(
           this.#researchLoopHooks.afterModelTurnJournalAppend,
         );
@@ -1384,9 +1410,8 @@ export class ResearchAgentRuntime {
         occurredAt: observedAt,
         payload: { observation, attempt: succeededAttempt },
       };
-      this.#store.appendEvents(
-        current.runId,
-        started.projection.lastEventSequence,
+      this.#appendCompletedResearchResults(
+        started.projection,
         [event],
         [artifact],
       );
@@ -1445,12 +1470,7 @@ export class ResearchAgentRuntime {
         occurredAt: observedAt,
         payload: { observation },
       };
-      this.#store.appendEvents(
-        current.runId,
-        current.lastEventSequence,
-        [event],
-        [artifact],
-      );
+      this.#appendCompletedResearchResults(current, [event], [artifact]);
       await this.#runResearchLoopHook(
         this.#researchLoopHooks.afterSearchObservationJournalAppend,
       );
@@ -1586,11 +1606,7 @@ export class ResearchAgentRuntime {
     await this.#runResearchLoopHook(
       this.#researchLoopHooks.beforeCompletionJournalAppend,
     );
-    this.#store.appendEvents(
-      current.runId,
-      current.lastEventSequence,
-      events,
-    );
+    this.#appendCompletedResearchResults(current, events);
     await this.#runResearchLoopHook(
       this.#researchLoopHooks.afterCompletionJournalAppend,
     );
@@ -1608,7 +1624,7 @@ export class ResearchAgentRuntime {
       occurredAt: observation.observedAt,
       payload: { observation },
     };
-    return this.#store.appendEvents(current.runId, current.lastEventSequence, [event]);
+    return this.#appendCompletedResearchResults(current, [event]);
   }
 
   #appendGenericToolObservation(
@@ -1842,11 +1858,7 @@ export class ResearchAgentRuntime {
             },
       } as ResearchRunEvent);
     }
-    return this.#store.appendEvents(
-      current.runId,
-      current.lastEventSequence,
-      events,
-    );
+    return this.#appendCompletedResearchResults(current, events);
   }
 
   #commitAbortedAttempt(
@@ -1860,9 +1872,8 @@ export class ResearchAgentRuntime {
     ) {
       throw new ResearchLoopError();
     }
-    return this.#store.appendEvents(
-      current.runId,
-      current.lastEventSequence,
+    return this.#appendCompletedResearchResults(
+      current,
       [{
         eventId: this.#ids.nextEventId(),
         runId: current.runId,
@@ -1872,6 +1883,46 @@ export class ResearchAgentRuntime {
         payload: { attempt },
       }],
     );
+  }
+
+  #appendCompletedResearchResults(
+    expected: RunProjection,
+    events: readonly ResearchRunEvent[],
+    artifacts: readonly PersistedArtifact[] = [],
+    sourceSnapshots: readonly PersistedSourceSnapshot[] = [],
+  ): RunProjection {
+    try {
+      return this.#store.appendEvents(
+        expected.runId,
+        expected.lastEventSequence,
+        events,
+        artifacts,
+        sourceSnapshots,
+      );
+    } catch (error) {
+      if (!(error instanceof ConcurrentRunWriteError)) throw error;
+      const current = this.#store.readProjection(expected.runId);
+      if (current.state.type !== "cancelled") throw error;
+      // 外部 Model/Research Tool 已完整返回后，并发 cancellation 可以先成为
+      // terminal fact；完整结果仍按原事件顺序进入 cancelled snapshot 供审计，
+      // 但 reducer 永远保留外层 cancelled，Harness 因而不会消费后续 intent。
+      const completedFacts = events.filter((event) =>
+        event.type !== "run_budget_exhausted" &&
+        event.type !== "run_retry_exhausted" &&
+        event.type !== "run_failed"
+      );
+      const resequenced = completedFacts.map((event, index) => ({
+        ...event,
+        sequence: current.lastEventSequence + index + 1,
+      })) as readonly ResearchRunEvent[];
+      return this.#store.appendEvents(
+        current.runId,
+        current.lastEventSequence,
+        resequenced,
+        artifacts,
+        sourceSnapshots,
+      );
+    }
   }
 
   #normalizeModelFailure(error: unknown): NormalizedFailure {
@@ -1933,11 +1984,7 @@ export class ResearchAgentRuntime {
         payload: { observation },
       },
     ];
-    return this.#store.appendEvents(
-      current.runId,
-      current.lastEventSequence,
-      events,
-    );
+    return this.#appendCompletedResearchResults(current, events);
   }
 
   #classifyResearchObservationFailure(
@@ -2158,13 +2205,20 @@ export class ResearchAgentRuntime {
     };
 
     try {
-      const projection = this.#store.appendEvents(
-        runId,
-        current.lastEventSequence,
-        [event],
-        [],
-        persistedSourceSnapshot === undefined ? [] : [persistedSourceSnapshot],
-      );
+      const projection = researchIntent === undefined
+        ? this.#store.appendEvents(
+            runId,
+            current.lastEventSequence,
+            [event],
+            [],
+            persistedSourceSnapshot === undefined ? [] : [persistedSourceSnapshot],
+          )
+        : this.#appendCompletedResearchResults(
+            current,
+            [event],
+            [],
+            persistedSourceSnapshot === undefined ? [] : [persistedSourceSnapshot],
+          );
       if (researchIntent !== undefined) {
         await this.#runResearchLoopHook(
           this.#researchLoopHooks.afterReadObservationJournalAppend,
@@ -2275,11 +2329,9 @@ export class ResearchAgentRuntime {
           this.#researchLoopHooks.beforeEvidenceJournalAppend,
         );
       }
-      const projection = this.#store.appendEvents(
-        runId,
-        current.lastEventSequence,
-        [event],
-      );
+      const projection = researchIntent === undefined
+        ? this.#store.appendEvents(runId, current.lastEventSequence, [event])
+        : this.#appendCompletedResearchResults(current, [event]);
       if (researchIntent !== undefined) {
         await this.#runResearchLoopHook(
           this.#researchLoopHooks.afterEvidenceJournalAppend,
@@ -2367,11 +2419,9 @@ export class ResearchAgentRuntime {
           this.#researchLoopHooks.beforeClaimJournalAppend,
         );
       }
-      const projection = this.#store.appendEvents(
-        runId,
-        current.lastEventSequence,
-        [event],
-      );
+      const projection = researchIntent === undefined
+        ? this.#store.appendEvents(runId, current.lastEventSequence, [event])
+        : this.#appendCompletedResearchResults(current, [event]);
       if (researchIntent !== undefined) {
         await this.#runResearchLoopHook(
           this.#researchLoopHooks.afterClaimJournalAppend,
@@ -2689,6 +2739,81 @@ export class ResearchAgentRuntime {
       }
       throw new LearningArtifactPublicationError();
     }
+  }
+
+  public async pauseRun(command: PauseRunCommand): Promise<RunProjection> {
+    const { runId } = runIdentityCommandSchema.parse(command);
+    const current = this.#store.readProjection(runId);
+    if (current.state.type === "user_paused") return current;
+    const occurredAt = this.#clock.now();
+    return this.#store.appendEvents(runId, current.lastEventSequence, [{
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "run_paused",
+      occurredAt,
+      payload: {},
+    }]);
+  }
+
+  public async resumeRun(command: ResumeRunCommand): Promise<RunProjection> {
+    const { runId } = runIdentityCommandSchema.parse(command);
+    const current = this.#store.readProjection(runId);
+    const occurredAt = this.#clock.now();
+    return this.#store.appendEvents(runId, current.lastEventSequence, [{
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "run_resumed",
+      occurredAt,
+      payload: {},
+    }]);
+  }
+
+  public async cancelRun(command: CancelRunCommand): Promise<RunProjection> {
+    const { runId } = runIdentityCommandSchema.parse(command);
+    const current = this.#store.readProjection(runId);
+    if (current.state.type === "cancelled") return current;
+    const occurredAt = this.#clock.now();
+    return this.#store.appendEvents(runId, current.lastEventSequence, [{
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "run_cancelled",
+      occurredAt,
+      payload: {},
+    }]);
+  }
+
+  public async extendRunBudget(
+    command: ExtendRunBudgetCommand,
+  ): Promise<RunProjection> {
+    const parsed = extendRunBudgetCommandSchema.parse(command);
+    const current = this.#store.readProjection(parsed.runId);
+    const runBudget = parseRunBudget(parsed.runBudget);
+    const approvedAt = this.#clock.now();
+    const approvalReceipt = {
+      approvalId: this.#ids.nextApprovalId(),
+      kind: "run_budget_extension",
+      approvedBy: "user-command",
+      approvedAt,
+      previousBudgetVersion: current.runBudget.version,
+      previousBudgetHash: hashCanonicalJson(current.runBudget),
+      runBudgetVersion: runBudget.version,
+      runBudgetHash: hashCanonicalJson(runBudget),
+    } as const;
+    return this.#store.appendEvents(
+      parsed.runId,
+      current.lastEventSequence,
+      [{
+        eventId: this.#ids.nextEventId(),
+        runId: parsed.runId,
+        sequence: current.lastEventSequence + 1,
+        type: "run_budget_extended",
+        occurredAt: approvedAt,
+        payload: { runBudget, approvalReceipt },
+      }],
+    );
   }
 
   public async rebuildRunProjection(

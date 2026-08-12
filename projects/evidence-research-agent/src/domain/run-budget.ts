@@ -46,7 +46,8 @@ export function calculateRemainingRunBudget(
     context.state.researchStartedAt === undefined
       ? 0
       : Date.parse(context.evaluatedAt) -
-        Date.parse(context.state.researchStartedAt);
+        Date.parse(context.state.researchStartedAt) -
+        context.state.suspendedDurationMs;
   if (!Number.isSafeInteger(elapsedMs) || elapsedMs < 0) {
     throw new RunBudgetCalculationError("Research Loop wall time 无效");
   }

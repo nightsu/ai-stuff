@@ -190,6 +190,97 @@ export async function runCli(
         }
         return 0;
       }
+      case "pause":
+      case "resume":
+      case "cancel": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(
+            requireOption(values["runtime-home"], "--runtime-home"),
+          ),
+          model: new ScriptedModel([]),
+        });
+        try {
+          const runId = requireOption(values["run-id"], "--run-id");
+          const projection = command === "pause"
+            ? await runtime.pauseRun({ runId })
+            : command === "resume"
+              ? await runtime.resumeRun({ runId })
+              : await runtime.cancelRun({ runId });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
+      case "extend-budget": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "max-distinct-sources": { type: "string" },
+            "max-model-turns": { type: "string" },
+            "max-source-bytes": { type: "string" },
+            "max-tool-calls": { type: "string" },
+            "max-wall-time-ms": { type: "string" },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+            version: { type: "string" },
+          },
+        });
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(
+            requireOption(values["runtime-home"], "--runtime-home"),
+          ),
+          model: new ScriptedModel([]),
+        });
+        try {
+          const projection = await runtime.extendRunBudget({
+            runId: requireOption(values["run-id"], "--run-id"),
+            runBudget: {
+              version: requireOption(values.version, "--version"),
+              maxModelTurns: parsePositiveInteger(
+                requireOption(values["max-model-turns"], "--max-model-turns"),
+                "--max-model-turns",
+              ),
+              maxToolCalls: parsePositiveInteger(
+                requireOption(values["max-tool-calls"], "--max-tool-calls"),
+                "--max-tool-calls",
+              ),
+              maxDistinctSources: parsePositiveInteger(
+                requireOption(
+                  values["max-distinct-sources"],
+                  "--max-distinct-sources",
+                ),
+                "--max-distinct-sources",
+              ),
+              maxSourceBytes: parsePositiveInteger(
+                requireOption(values["max-source-bytes"], "--max-source-bytes"),
+                "--max-source-bytes",
+              ),
+              maxWallTimeMs: parsePositiveInteger(
+                requireOption(values["max-wall-time-ms"], "--max-wall-time-ms"),
+                "--max-wall-time-ms",
+              ),
+            },
+          });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
       default:
         throw new CliUsageError("命令参数无效");
     }

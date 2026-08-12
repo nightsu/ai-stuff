@@ -424,6 +424,17 @@ const researchToolIntentSchema = z
   })
   .strict();
 
+const runBudgetApprovalReceiptSchema = z.object({
+  approvalId: z.string().trim().min(1),
+  kind: z.literal("run_budget_extension"),
+  approvedBy: z.literal("user-command"),
+  approvedAt: z.iso.datetime(),
+  previousBudgetVersion: z.string().trim().min(1),
+  previousBudgetHash: sha256Schema,
+  runBudgetVersion: z.string().trim().min(1),
+  runBudgetHash: sha256Schema,
+}).strict();
+
 const modelUsageSchema = z
   .object({
     inputTokens: z.number().int().nonnegative().optional(),
@@ -556,6 +567,7 @@ const evidenceBackedStateFields = {
   pendingToolIntents: z.array(researchToolIntentSchema),
   latestSteering: z.string().trim().min(1).optional(),
   researchStartedAt: z.iso.datetime().optional(),
+  suspendedDurationMs: z.number().int().nonnegative().default(0),
   retryAttempts: z.array(retryAttemptSchema),
 };
 
@@ -584,6 +596,7 @@ const legacyExplicitPublicationFields = {
   researchToolObservations: z.tuple([]),
   evidenceGaps: z.tuple([]),
   pendingToolIntents: z.tuple([]),
+  suspendedDurationMs: z.number().int().nonnegative().default(0),
   retryAttempts: z.array(retryAttemptSchema),
 };
 
@@ -599,11 +612,42 @@ const researchLoopPublicationFields = {
   pendingToolIntents: z.tuple([]),
   latestSteering: z.string().trim().min(1).optional(),
   researchStartedAt: z.iso.datetime(),
+  suspendedDurationMs: z.number().int().nonnegative().default(0),
   completion: researchCompletionSchema,
   retryAttempts: z.array(retryAttemptSchema),
 };
 
-const runStateSchema = z.union([
+const researchingRunStateSchema = z.object({
+  type: z.literal("researching"),
+  ...evidenceBackedStateFields,
+});
+
+const researchCompleteRunStateSchema = z.object({
+  type: z.literal("research_complete"),
+  ...evidenceBackedStateFields,
+  completion: researchCompletionSchema,
+});
+
+const readyToPublishRunStateSchema = z.union([
+  z.object({
+    type: z.literal("ready_to_publish"),
+    ...legacyExplicitPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("ready_to_publish"),
+    ...researchLoopPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+  }).strict(),
+]);
+
+const pausableRunStateSchema = z.union([
+  researchingRunStateSchema,
+  researchCompleteRunStateSchema,
+  readyToPublishRunStateSchema,
+]);
+
+const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
   z.object({ type: z.literal("created") }),
   z.object({
     type: z.literal("planning"),
@@ -615,15 +659,8 @@ const runStateSchema = z.union([
     approvalBinding: planApprovalBindingSchema,
     proposedAt: z.iso.datetime(),
   }),
-  z.object({
-    type: z.literal("researching"),
-    ...evidenceBackedStateFields,
-  }),
-  z.object({
-    type: z.literal("research_complete"),
-    ...evidenceBackedStateFields,
-    completion: researchCompletionSchema,
-  }),
+  researchingRunStateSchema,
+  researchCompleteRunStateSchema,
   z.object({
     type: z.literal("budget_exhausted"),
     ...evidenceBackedStateFields,
@@ -676,16 +713,7 @@ const runStateSchema = z.union([
     ...researchLoopPublicationFields,
     proposedAt: z.iso.datetime(),
   }).strict(),
-  z.object({
-    type: z.literal("ready_to_publish"),
-    ...legacyExplicitPublicationFields,
-    publicationReceipt: publicationApprovalReceiptSchema,
-  }).strict(),
-  z.object({
-    type: z.literal("ready_to_publish"),
-    ...researchLoopPublicationFields,
-    publicationReceipt: publicationApprovalReceiptSchema,
-  }).strict(),
+  readyToPublishRunStateSchema,
   z.object({
     type: z.literal("completed"),
     ...legacyExplicitPublicationFields,
@@ -698,13 +726,68 @@ const runStateSchema = z.union([
     publicationReceipt: publicationApprovalReceiptSchema,
     learningArtifact: publishedLearningArtifactSchema,
   }).strict(),
-]).transform((state): ResearchRunState => state);
+  z.object({
+    type: z.literal("user_paused"),
+    suspendedState: pausableRunStateSchema,
+    pausedAt: z.iso.datetime(),
+  }).strict(),
+  z.object({
+    type: z.literal("cancelled"),
+    cancelledState: z.lazy(() => z.union([
+      z.object({ type: z.literal("created") }),
+      z.object({ type: z.literal("planning"), startedAt: z.iso.datetime() }),
+      z.object({
+        type: z.literal("waiting_plan_approval"),
+        planArtifact: artifactReferenceSchema,
+        approvalBinding: planApprovalBindingSchema,
+        proposedAt: z.iso.datetime(),
+      }),
+      researchingRunStateSchema,
+      researchCompleteRunStateSchema,
+      z.object({
+        type: z.literal("budget_exhausted"),
+        ...evidenceBackedStateFields,
+        researchOutcome: z.literal("incomplete"),
+        exhaustedDimension: z.enum([
+          "model_turns", "tool_calls", "distinct_sources", "source_bytes", "wall_time",
+        ]),
+        remainingBudget: remainingRunBudgetSchema,
+      }),
+      z.object({
+        type: z.literal("retry_exhausted"),
+        ...evidenceBackedStateFields,
+        retrySequenceId: z.string().trim().min(1),
+        retrySequenceKind: z.enum(["model_turn", "search_sources"]),
+        attemptsUsed: z.number().int().positive(),
+        failure: normalizedFailureSchema,
+      }),
+      z.object({
+        type: z.literal("waiting_publication_approval"),
+        ...legacyExplicitPublicationFields,
+        proposedAt: z.iso.datetime(),
+      }).strict(),
+      z.object({
+        type: z.literal("waiting_publication_approval"),
+        ...researchLoopPublicationFields,
+        proposedAt: z.iso.datetime(),
+      }).strict(),
+      readyToPublishRunStateSchema,
+      z.object({
+        type: z.literal("user_paused"),
+        suspendedState: pausableRunStateSchema,
+        pausedAt: z.iso.datetime(),
+      }).strict(),
+    ])),
+    cancelledAt: z.iso.datetime(),
+  }).strict(),
+]));
 
 const runProjectionSchema = z.object({
   runId: z.string().min(1),
   question: z.string().min(1),
   sourceScope: sourceScopeValueSchema,
   runBudget: runBudgetValueSchema,
+  runBudgetApprovalReceipts: z.array(runBudgetApprovalReceiptSchema).default([]),
   experimentIdentity: experimentIdentitySchema.optional(),
   retryPolicy: retryPolicySchema.optional(),
   state: runStateSchema,
@@ -859,6 +942,29 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
       ]),
       remainingBudget: remainingRunBudgetSchema,
     }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("run_budget_extended"),
+    payload: z.object({
+      runBudget: runBudgetValueSchema,
+      approvalReceipt: runBudgetApprovalReceiptSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("run_paused"),
+    payload: z.object({}).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("run_resumed"),
+    payload: z.object({}).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("run_cancelled"),
+    payload: z.object({}).strict(),
   }).strict(),
   z
     .object({

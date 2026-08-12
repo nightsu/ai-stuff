@@ -1,8 +1,8 @@
 # Evidence Research Agent
 
-这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #8：除确定性的 Scripted Model 外，Run 也可通过 Vercel AI SDK Core `streamText` 与 `@ai-sdk/openai-compatible` 接入真实模型，同时继续由 Harness 拥有 Research Loop、工具调度、retry、Journal、审批与 publication。
+这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #9：除确定性的 Scripted Model 与 OpenAI-compatible live adapter 外，Harness 还提供 durable user pause、精确恢复、terminal cancellation 和经用户批准的 Run Budget Extension。
 
-当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。live adapter 只做单次 generation：工具没有 AI SDK `execute`，也不使用 `ToolLoopAgent`、`stopWhen`、自动多步执行、`useChat` 或 SDK history。并行 tool batch、预算扩展恢复、`read-source` CLI 与 publication CLI 仍属于后续 tickets。
+当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。live adapter 只做单次 generation：工具没有 AI SDK `execute`，也不使用 `ToolLoopAgent`、`stopWhen`、自动多步执行、`useChat` 或 SDK history。并行 tool batch、`read-source` CLI、publication CLI 与 publication crash reconciliation 仍属于后续 tickets。
 
 ## 快速开始：创建并批准计划
 
@@ -88,6 +88,33 @@ node dist/src/cli.js trace --runtime-home .runtime --run-id <run-id> --json
 ```
 
 计划审批是跨进程可恢复且幂等的。其 binding 覆盖 question、不可变 plan artifact、完整 Source Scope、Run Budget，以及显式启用时的 Retry Policy；模型输出、Research Tool 参数、环境变量或调用方自造 Receipt 都不能替代用户命令。Retry Policy 会改变自动执行外部调用的上限，因此它是 durable Run fact，而不是重启进程可以偷偷替换的本地选项。
+
+## 暂停、恢复、取消与扩展预算
+
+`pause` 只把可继续工作状态包装为 `user_paused`，并在 `suspendedState` 中保留精确 continuation。`resume` 只接受该状态；它先恢复 Journal 中已有的 pending Model Turn/tool fact，不重新采样已经完成的工作。`cancel` 可终止任一非 terminal Run，外层 `cancelled` 永远不可恢复。
+
+```bash
+node dist/src/cli.js pause --runtime-home .runtime --run-id <run-id> --json
+node dist/src/cli.js resume --runtime-home .runtime --run-id <run-id> --json
+node dist/src/cli.js cancel --runtime-home .runtime --run-id <run-id> --json
+```
+
+`budget_exhausted` 保留 `incomplete` 或 `research_complete` provenance。用户必须提交一个不同版本、逐维不缩减且至少提高一个限制的新预算；Runtime 创建绑定前后预算 canonical hashes 的 `RunBudgetApprovalReceipt`，然后恢复耗尽前的精确状态。
+
+```bash
+node dist/src/cli.js extend-budget \
+  --runtime-home .runtime \
+  --run-id <run-id> \
+  --version budget-v2 \
+  --max-model-turns 16 \
+  --max-tool-calls 60 \
+  --max-distinct-sources 24 \
+  --max-source-bytes 5000000 \
+  --max-wall-time-ms 420000 \
+  --json
+```
+
+计划和 publication approval waits 本身也是 Suspended Run：对应 approval 命令会从 durable waiting state 继续。`completed`、`cancelled` 与 `failed` 没有合法 resume 或新工作转换。
 
 ## 运行有界多轮 Research Loop
 
@@ -253,6 +280,8 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 - Run Trace 对 Model contract、Model permanent、permission denial、stale state、ordinary tool execution、infrastructure transient 与 invariant violation 使用稳定、无秘密的 failure category/code；attempt 还暴露 Retry Sequence kind/identity、序号、结果、duration、policy version 和 retry delay。
 - 五个模型可见工具之外的 approval、budget change、publication、shell 与任意写入都不进入 `ResearchToolIntent` 联合。参数 schema 错误、Source Scope denial、stale observation 和普通工具失败都会形成安全 observation，进入下一轮视图。
 - Run Budget 由 Harness 与 reducer 共用一个 domain calculator 从 canonical facts 计算：计划 generation、Research Loop turns、Research Tool calls、不同 Source Snapshot、完整 source bytes 与 Research Loop wall time 分别记账。完成工具会在自己的 durable `completedAt` 再检查 Model Turn/wall time，并把该时间冻结为 Research Loop 计费终点；之后的用户空闲或重复 inspect/advance 不会追溯耗尽预算。任何硬维度耗尽都会 durable 进入带 `incomplete` 或 `research_complete` provenance 的 `budget_exhausted`，该状态不能生成 draft 或伪装为可发布完成。
+- user pause 与 budget exhaustion 的等待时间累计进 `suspendedDurationMs`，不消耗 Research Loop wall time；预算扩展不会清零已有 usage，也不能改变 plan、Source Scope 或 approval authority。
+- cancellation 先成为 terminal Journal fact 时，已经完整返回的 Model Turn、Search/read、Evidence、Claim、completion 或 aborted Retry Attempt 仍可追加到 `cancelledState` 供审计；外层保持 `cancelled`，所以这些 late results 不会触发 queued tool、Gate 或 publication。
 - `search_sources` 通过可注入 `SourceSearchPort` 使用默认固定参数 `rg` adapter；它在启动搜索前复核批准 root identity，并把 extensions、exclusions、共享 secret discovery globs 与 file-size bound 下推到 discovery，每个返回命中还会再走共享 realpath preflight。完整命中列表进入私有 JSON Artifact，Journal/Trace 只保留引用和数量，下一轮 Model View 再按需校验展开；搜索不会创建 Source Snapshot。
 - `readSource` 仍只接受 `{ rootIndex, relativePath, startLine, endLine }`，且只允许 `researching` Run；显式完成后会在文件/CAS I/O 前拒绝新读取。成功读取才会保存完整原始 UTF-8 字节到私有 `source-sha256:<hash>` Snapshot；`denied`/`failed` 只写安全 observation，不创建 Snapshot。
 - 一个 Evidence Record 只能逐字段绑定一个现有成功 observation 的 `observationId`、`toolCallId`、Snapshot identity、规范范围和 excerpt hash。一个 Claim 显式标为 `source_fact`，且只能引用当前 Run 已登记的 Evidence IDs。
@@ -281,10 +310,10 @@ Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE
 - `tests/runtime/learning-artifact-publication.test.ts`：ScriptedModel happy path、Gate、target identity、direct replay tamper 与 Trace lineage。
 - `tests/runtime/research-loop.test.ts`：五工具多轮 happy path、重启后 pending intent 恢复、search port/artifact 边界、replay 防篡改、错误 observation、五维预算暂停、steering/pinned Model View 与确定性裁剪。
 - `tests/runtime/retry-policy.test.ts`：Model/Search transient retry、provider hint、attempt lineage、policy approval/restart、崩溃恢复、普通失败、schema/permanent/invariant failure、wall-time 与 SQLite commit failure。
+- `tests/runtime/run-control.test.ts`：pause/resume、预算版本扩展、terminal cancellation、stream/pending tool/completed result race 与 Suspended Run 取消矩阵。
 - `docs/architecture.md`：组件图、状态机、publication effect 的明确恢复边界。
 
 ## 尚未实现
 
-- Issue #9：用户暂停、取消、预算版本扩展与从 `budget_exhausted` 精确恢复。
 - Issue #11：安全 search/read sibling batch 的有界并发与模型原始顺序回填。
 - Issue #14：publication 外部 effect 的 durable operation、crash reconciliation 与精确恢复协议。

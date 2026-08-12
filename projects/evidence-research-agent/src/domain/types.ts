@@ -227,6 +227,26 @@ export interface PlanApprovalReceipt {
   readonly retryPolicyHash?: string | undefined;
 }
 
+/** 用户命令对一个更大 Run Budget 版本的独立持久授权。 */
+export interface RunBudgetApprovalReceipt {
+  /** 本次预算扩展授权的稳定 identity。 */
+  readonly approvalId: string;
+  /** 判别字段；不得与计划或发布审批混用。 */
+  readonly kind: "run_budget_extension";
+  /** 固定为显式用户命令，模型和 Research Tool 不能创建该授权。 */
+  readonly approvedBy: "user-command";
+  /** 授权成为 Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly approvedAt: string;
+  /** 被替换的前一 Run Budget 稳定版本。 */
+  readonly previousBudgetVersion: string;
+  /** 被替换的完整前一 Run Budget canonical JSON SHA-256。 */
+  readonly previousBudgetHash: string;
+  /** 新批准 Run Budget 的稳定版本。 */
+  readonly runBudgetVersion: string;
+  /** 新批准完整 Run Budget canonical JSON SHA-256。 */
+  readonly runBudgetHash: string;
+}
+
 /** 研究计划中的一个有序步骤。 */
 export interface PlanStep {
   /** 在当前计划版本内稳定且唯一的步骤标识。 */
@@ -507,6 +527,8 @@ export interface EvidenceBackedRunStateData {
   readonly latestSteering?: string | undefined;
   /** 第一个 Research Loop Model Turn 的 ISO 8601 UTC 时间；审批等待不计入 wall time。 */
   readonly researchStartedAt?: string | undefined;
+  /** user pause 与 budget exhaustion 等 Suspended Run 期间累计不计费的毫秒数。 */
+  readonly suspendedDurationMs: number;
   /** 物理 Model/search attempts 的 canonical 历史；不计作额外逻辑 tool calls。 */
   readonly retryAttempts: readonly RetryAttempt[];
 }
@@ -594,6 +616,53 @@ export interface FailedRunState extends EvidenceBackedRunStateData {
   readonly failure: NormalizedFailure;
 }
 
+/** 用户显式暂停时可被完整嵌入、随后精确恢复的工作状态。 */
+export type PausableRunState =
+  | ResearchingRunState
+  | ResearchCompleteRunState
+  | ReadyToPublishRunState;
+
+/** 用户暂停形成的可恢复 Suspended Run。 */
+export interface UserPausedRunState {
+  /** 判别字段；普通推进命令不得越过该暂停。 */
+  readonly type: "user_paused";
+  /** 暂停前的完整可继续状态；resume 不重新采样已完成工作。 */
+  readonly suspendedState: PausableRunState;
+  /** 暂停成为 Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly pausedAt: string;
+}
+
+/** 所有保留 canonical continuation 且允许未来显式恢复的非终态。 */
+export type SuspendedRunState =
+  | WaitingPlanApprovalRunState
+  | WaitingPublicationApprovalRunState
+  | BudgetExhaustedRunState
+  | RetryExhaustedRunState
+  | UserPausedRunState;
+
+/** 用户可终止、但尚未进入不可逆 terminal outcome 的状态。 */
+export type CancellableRunState =
+  | CreatedRunState
+  | PlanningRunState
+  | WaitingPlanApprovalRunState
+  | ResearchingRunState
+  | ResearchCompleteRunState
+  | BudgetExhaustedRunState
+  | RetryExhaustedRunState
+  | WaitingPublicationApprovalRunState
+  | ReadyToPublishRunState
+  | UserPausedRunState;
+
+/** 用户终止后保留取消前全部事实、且永远不能恢复的 Run 终态。 */
+export interface CancelledRunState {
+  /** 判别字段；任何新模型、工具、审批或发布工作都必须拒绝。 */
+  readonly type: "cancelled";
+  /** 取消前的完整状态快照，仅供审计和保留 Evidence/Trace。 */
+  readonly cancelledState: CancellableRunState;
+  /** 取消成为 Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly cancelledAt: string;
+}
+
 /** 当前 planning slice 允许出现的最小 Run 状态联合。 */
 export type ResearchRunState =
   | CreatedRunState
@@ -604,6 +673,8 @@ export type ResearchRunState =
   | BudgetExhaustedRunState
   | RetryExhaustedRunState
   | FailedRunState
+  | UserPausedRunState
+  | CancelledRunState
   | WaitingPublicationApprovalRunState
   | ReadyToPublishRunState
   | CompletedRunState;
@@ -618,6 +689,8 @@ export interface RunProjection {
   readonly sourceScope: SourceScope;
   /** 创建 Run 时冻结且只能通过新批准版本改变的 Run Budget。 */
   readonly runBudget: RunBudget;
+  /** 按 Journal 顺序保留的显式 Run Budget 扩展授权。 */
+  readonly runBudgetApprovalReceipts: readonly RunBudgetApprovalReceipt[];
   /** 创建 Run 时由 Model Port 声明的非秘密实验身份；legacy Run 可省略。 */
   readonly experimentIdentity?: ExperimentIdentity | undefined;
   /** 创建 Run 时冻结并进入计划审批边界的自动 retry 策略；legacy Run 省略。 */
@@ -736,6 +809,14 @@ export interface RunBudgetExhaustedPayload {
   readonly exhaustedDimension: BudgetExhaustedRunState["exhaustedDimension"];
   /** 事件时由 canonical usage facts 计算的剩余预算。 */
   readonly remainingBudget: RemainingRunBudget;
+}
+
+/** `run_budget_extended` 携带新限制与对应用户授权。 */
+export interface RunBudgetExtendedPayload {
+  /** 必须逐维不小于前一版本、且至少提高一个限制的新 Run Budget。 */
+  readonly runBudget: RunBudget;
+  /** 精确绑定前后预算 hashes 的 durable user approval。 */
+  readonly approvalReceipt: RunBudgetApprovalReceipt;
 }
 
 /** `source_read_observed` 事件携带的完整、已消毒读取事实。 */
@@ -1025,6 +1106,10 @@ export type ResearchRunEvent =
   | RunEvent<"research_tool_observed", ResearchToolObservedPayload>
   | RunEvent<"research_completed", ResearchCompletedPayload>
   | RunEvent<"run_budget_exhausted", RunBudgetExhaustedPayload>
+  | RunEvent<"run_budget_extended", RunBudgetExtendedPayload>
+  | RunEvent<"run_paused", Record<never, never>>
+  | RunEvent<"run_resumed", Record<never, never>>
+  | RunEvent<"run_cancelled", Record<never, never>>
   | RunEvent<"source_read_observed", SourceReadObservedPayload>
   | RunEvent<"evidence_recorded", EvidenceRecordedPayload>
   | RunEvent<"claim_recorded", ClaimRecordedPayload>

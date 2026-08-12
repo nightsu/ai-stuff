@@ -32,6 +32,14 @@ _Avoid_: Run Operation, logical tool call
 A non-terminal Research Run that is durably waiting for approval, user continuation, or another recoverable condition. It may resume from its existing Run Journal.
 _Avoid_: Cancelled Run, failed run
 
+**User-paused Run**:
+A Suspended Run created by an explicit user pause command that preserves the exact pre-pause working state. Resuming restores that state without repeating completed Model Turns, Research Tool calls, approvals, or publication work.
+_Avoid_: Process pause, cancelled Run, budget exhaustion
+
+**Run Budget Extension**:
+A durable user approval that replaces an exhausted Run Budget with a distinct, strictly non-decreasing version and resumes the exact state suspended by budget exhaustion. It cannot shrink limits, erase usage, or authorize a different plan or Source Scope.
+_Avoid_: Budget reset, model-selected budget, ordinary resume
+
 **Cancelled Run**:
 A terminal Research Run that must never resume or start new work. Continuing its investigation requires a new Research Run that explicitly references reusable prior evidence.
 _Avoid_: Suspended Run, paused run

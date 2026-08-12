@@ -485,6 +485,7 @@ describe("plan_approved schema and reducer boundary", () => {
       researchToolObservations: [],
       evidenceGaps: [],
       pendingToolIntents: [],
+      suspendedDurationMs: 0,
       retryAttempts: [],
     });
     expect(projection.lastEventSequence).toBe(4);

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 
 import { runCli, type CliIo } from "../../src/cli.js";
+import { ResearchAgentRuntime, ScriptedModel } from "../../src/index.js";
 import type { RunProjection } from "../../src/index.js";
 
 const runtimeHomes: string[] = [];
@@ -123,6 +124,153 @@ it("creates, inspects, approves, and traces one Run through process-like CLI cal
     ),
   ).toBe(0);
   expect(output.pop()).toContain("#4 plan_approved → researching");
+  expect(errorOutput).toEqual([]);
+});
+
+it("pauses, resumes, and cancels a Run through isolated CLI commands", async () => {
+  const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
+  runtimeHomes.push(runtimeHome);
+  const output: string[] = [];
+  const errorOutput: string[] = [];
+  const io = {
+    stdout: (line: string) => output.push(line),
+    stderr: (line: string) => errorOutput.push(line),
+  };
+  const waiting = await createWaitingRunViaCli(runtimeHome, output, io);
+  if (waiting.state.type !== "waiting_plan_approval") {
+    throw new Error("测试要求 CLI 创建等待计划审批的 Run");
+  }
+  await runCli([
+    "approve-plan",
+    "--runtime-home",
+    runtimeHome,
+    "--run-id",
+    waiting.runId,
+    "--binding-hash",
+    waiting.state.approvalBinding.bindingHash,
+    "--json",
+  ], io);
+  output.length = 0;
+
+  expect(await runCli([
+    "pause",
+    "--runtime-home",
+    runtimeHome,
+    "--run-id",
+    waiting.runId,
+    "--json",
+  ], io)).toBe(0);
+  expect(JSON.parse(output.pop() ?? "null")).toMatchObject({
+    state: { type: "user_paused", suspendedState: { type: "researching" } },
+  });
+
+  expect(await runCli([
+    "resume",
+    "--runtime-home",
+    runtimeHome,
+    "--run-id",
+    waiting.runId,
+    "--json",
+  ], io)).toBe(0);
+  expect(JSON.parse(output.pop() ?? "null")).toMatchObject({
+    state: { type: "researching" },
+  });
+
+  expect(await runCli([
+    "cancel",
+    "--runtime-home",
+    runtimeHome,
+    "--run-id",
+    waiting.runId,
+    "--json",
+  ], io)).toBe(0);
+  expect(JSON.parse(output.pop() ?? "null")).toMatchObject({
+    state: { type: "cancelled", cancelledState: { type: "researching" } },
+  });
+  expect(errorOutput).toEqual([]);
+});
+
+it("extends an exhausted Run Budget through the CLI", async () => {
+  const output: string[] = [];
+  const errorOutput: string[] = [];
+  const io = {
+    stdout: (line: string) => output.push(line),
+    stderr: (line: string) => errorOutput.push(line),
+  };
+  // CLI 默认预算需要真实耗尽事件才能扩展；这里通过一个极小 tool-call budget 的 Run
+  // 验证命令参数到 durable receipt 的完整路径，而不是只验证 parser 接受 option。
+  const exhaustedRuntimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
+  runtimeHomes.push(exhaustedRuntimeHome);
+  const exhaustedRuntime = ResearchAgentRuntime.open({
+    runtimeHome: exhaustedRuntimeHome,
+    model: new ScriptedModel([
+      { title: "预算测试", objectives: ["预算测试"], steps: [{ id: "step", description: "step" }] },
+    ], [], [{
+      text: "一次工具调用后耗尽。",
+      evidenceGaps: [],
+      finishReason: "tool_calls",
+      toolIntents: [
+        { intentId: "not-last", name: "complete_research", input: { unresolvedQuestions: [] } },
+        { intentId: "pending", name: "complete_research", input: { unresolvedQuestions: [] } },
+      ],
+    }]),
+  });
+  let exhausted: RunProjection;
+  try {
+    const created = await exhaustedRuntime.createRun({
+      question: "CLI 如何批准新预算？",
+      sourceScope: {
+        roots: [exhaustedRuntimeHome],
+        exclusions: [],
+        allowedExtensions: [".md"],
+        maxFileBytes: 1_000,
+        maxTotalBytes: 10_000,
+      },
+      runBudget: {
+        version: "budget-v1",
+        maxModelTurns: 12,
+        maxToolCalls: 1,
+        maxDistinctSources: 24,
+        maxSourceBytes: 5_000_000,
+        maxWallTimeMs: 300_000,
+      },
+    });
+    if (created.state.type !== "waiting_plan_approval") throw new Error("测试要求等待审批");
+    await exhaustedRuntime.approvePlan({
+      runId: created.runId,
+      bindingHash: created.state.approvalBinding.bindingHash,
+    });
+    exhausted = await exhaustedRuntime.advanceResearch({ runId: created.runId });
+  } finally {
+    exhaustedRuntime.close();
+  }
+  expect(exhausted.state.type).toBe("budget_exhausted");
+
+  expect(await runCli([
+    "extend-budget",
+    "--runtime-home",
+    exhaustedRuntimeHome,
+    "--run-id",
+    exhausted.runId,
+    "--version",
+    "budget-v2",
+    "--max-model-turns",
+    String(exhausted.runBudget.maxModelTurns),
+    "--max-tool-calls",
+    "2",
+    "--max-distinct-sources",
+    String(exhausted.runBudget.maxDistinctSources),
+    "--max-source-bytes",
+    String(exhausted.runBudget.maxSourceBytes),
+    "--max-wall-time-ms",
+    String(exhausted.runBudget.maxWallTimeMs),
+    "--json",
+  ], io)).toBe(0);
+  expect(JSON.parse(output.pop() ?? "null")).toMatchObject({
+    runBudget: { version: "budget-v2", maxToolCalls: 2 },
+    runBudgetApprovalReceipts: [{ kind: "run_budget_extension" }],
+    state: { type: "researching", pendingToolIntents: [{ intentId: "pending" }] },
+  });
   expect(errorOutput).toEqual([]);
 });
 

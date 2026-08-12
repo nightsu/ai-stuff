@@ -18,6 +18,7 @@ import {
 import {
   artifactReferenceHasMatchingContentIdentity,
   createPlanApprovalBinding,
+  hashCanonicalJson,
   hashReadSourceRequest,
   hashUtf8Text,
   sourceSnapshotHasMatchingContentIdentity,
@@ -145,6 +146,7 @@ function applyRunEvent(
       question: event.payload.question,
       sourceScope: event.payload.sourceScope,
       runBudget: event.payload.runBudget,
+      runBudgetApprovalReceipts: [],
       ...(event.payload.experimentIdentity === undefined
         ? {}
         : { experimentIdentity: event.payload.experimentIdentity }),
@@ -280,6 +282,7 @@ function applyRunEvent(
           researchToolObservations: [],
           evidenceGaps: [],
           pendingToolIntents: [],
+          suspendedDurationMs: 0,
           retryAttempts: [],
         },
         lastEventSequence: event.sequence,
@@ -310,20 +313,20 @@ function applyRunEvent(
       };
     }
     case "retry_attempt_failed": {
-      if (current.state.type !== "researching") {
+      const researching = researchingStateForLateResult(current);
+      if (researching === undefined) {
         throw new IllegalRunEventError("只有 researching Run 可以完成失败 attempt");
       }
       const attempts = completePendingAttempt(
-        current.state.retryAttempts,
+        researching.retryAttempts,
         event.payload.attempt,
         event.occurredAt,
       );
-      return {
-        ...current,
-        state: { ...current.state, retryAttempts: attempts },
-        lastEventSequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
+      return commitResearchResultState(
+        current,
+        { ...researching, retryAttempts: attempts },
+        event,
+      );
     }
     case "run_retry_exhausted": {
       if (current.state.type !== "researching") {
@@ -366,10 +369,11 @@ function applyRunEvent(
       };
     }
     case "model_turn_completed": {
-      if (current.state.type !== "researching") {
+      const researching = researchingStateForLateResult(current);
+      if (researching === undefined) {
         throw new IllegalRunEventError("只有 researching Run 可以提交 Model Turn");
       }
-      if (current.state.pendingToolIntents.length !== 0) {
+      if (researching.pendingToolIntents.length !== 0) {
         throw new IllegalRunEventError("pending Research Tool intent 尚未获得 observation");
       }
       if (
@@ -380,14 +384,14 @@ function applyRunEvent(
       }
       const { turn } = event.payload;
       const retryAttempts = event.payload.attempt === undefined
-        ? current.state.retryAttempts
+        ? researching.retryAttempts
         : completePendingAttempt(
-            current.state.retryAttempts,
+            researching.retryAttempts,
             event.payload.attempt,
             event.occurredAt,
           );
       const effectiveSteering = event.payload.latestSteering ??
-        current.state.latestSteering;
+        researching.latestSteering;
       if (
         turn.turnId !== `turn-${event.eventId}` ||
         turn.completedAt !== event.occurredAt ||
@@ -406,7 +410,7 @@ function applyRunEvent(
               "complete_research",
             ].includes(intent.name),
         ) ||
-        current.state.modelTurns.length + 2 > current.runBudget.maxModelTurns
+        researching.modelTurns.length + 2 > current.runBudget.maxModelTurns
         || !isIsoUtc(event.payload.generationStartedAt)
         || Date.parse(event.payload.generationStartedAt) > Date.parse(event.occurredAt)
         || (event.payload.attempt !== undefined &&
@@ -414,42 +418,40 @@ function applyRunEvent(
       ) {
         throw new IllegalRunEventError("Model Turn 公共字段无效");
       }
-      return {
-        ...current,
-        state: {
-          ...current.state,
-          modelTurns: [...current.state.modelTurns, turn],
+      const completedState: import("./types.js").ResearchingRunState = {
+          ...researching,
+          modelTurns: [...researching.modelTurns, turn],
           evidenceGaps: turn.evidenceGaps,
           pendingToolIntents: turn.toolIntents,
           ...(event.payload.latestSteering === undefined
             ? {}
             : { latestSteering: event.payload.latestSteering }),
           researchStartedAt:
-            current.state.researchStartedAt ?? event.payload.generationStartedAt,
+            researching.researchStartedAt ?? event.payload.generationStartedAt,
           retryAttempts,
-        },
-        lastEventSequence: event.sequence,
-        updatedAt: event.occurredAt,
       };
+      return commitResearchResultState(current, completedState, event);
     }
     case "research_tool_observed": {
-      if (current.state.type !== "researching") {
+      const researching = researchingStateForLateResult(current);
+      if (researching === undefined) {
         throw new IllegalRunEventError("只有 researching Run 可以记录 Research Tool observation");
       }
+      const activeProjection = { ...current, state: researching } as RunProjection;
       if (
         current.retryPolicy !== undefined &&
         event.payload.attempt === undefined &&
         (event.payload.observation.status === "succeeded" ||
-          current.state.retryAttempts.at(-1)?.outcome === "in_progress")
+          researching.retryAttempts.at(-1)?.outcome === "in_progress")
       ) {
         throw new IllegalRunEventError("启用 retry 的 Search observation 不能遗留 pending attempt");
       }
-      const pendingFailedSearchAttempt = current.state.retryAttempts.at(-1);
+      const pendingFailedSearchAttempt = researching.retryAttempts.at(-1);
       if (
         event.payload.attempt === undefined &&
         pendingFailedSearchAttempt?.retrySequenceKind === "search_sources" &&
         pendingFailedSearchAttempt.outcome === "permanent_failure" &&
-        !current.state.researchToolObservations.some(
+        !researching.researchToolObservations.some(
           (observation) =>
             observation.toolCallId === pendingFailedSearchAttempt.toolCallId,
         ) &&
@@ -464,16 +466,16 @@ function applyRunEvent(
         throw new IllegalRunEventError("Search failure observation 与 pending attempt 不一致");
       }
       const pending = validateResearchObservation(
-        current.state.pendingToolIntents,
-        current.state.researchToolObservations,
+        researching.pendingToolIntents,
+        researching.researchToolObservations,
         event.payload.observation,
         event.occurredAt,
       );
       const output = event.payload.observation.output;
       const retryAttempts = event.payload.attempt === undefined
-        ? current.state.retryAttempts
+        ? researching.retryAttempts
         : completePendingAttempt(
-            current.state.retryAttempts,
+            researching.retryAttempts,
             event.payload.attempt,
             event.occurredAt,
           );
@@ -485,7 +487,7 @@ function applyRunEvent(
       ) {
         throw new IllegalRunEventError("Search success 与 attempt lineage 不一致");
       }
-      assertResearchToolCallWithinBudget(current, event.payload.observation);
+      assertResearchToolCallWithinBudget(activeProjection, event.payload.observation);
       if (event.payload.observation.status === "succeeded") {
         if (
           event.payload.observation.toolName !== "search_sources" ||
@@ -503,30 +505,31 @@ function applyRunEvent(
       } else if (output !== undefined) {
         throw new IllegalRunEventError("非成功 Research Tool observation 不能携带 output");
       }
-      return {
-        ...current,
-        state: {
-          ...current.state,
+      return commitResearchResultState(
+        current,
+        {
+          ...researching,
           researchToolObservations: [
-            ...current.state.researchToolObservations,
+            ...researching.researchToolObservations,
             event.payload.observation,
           ],
           pendingToolIntents: pending,
           retryAttempts,
         },
-        lastEventSequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
+        event,
+      );
     }
     case "source_read_observed": {
-      if (current.state.type !== "researching") {
+      const researching = researchingStateForLateResult(current);
+      if (researching === undefined) {
         throw new IllegalRunEventError(
           "只有 researching Run 可以记录来源读取 observation",
         );
       }
+      const activeProjection = { ...current, state: researching } as RunProjection;
       const observation = event.payload.observation;
       assertResearchToolCallWithinBudget(
-        current,
+        activeProjection,
         event.payload.researchObservation ?? observation,
       );
       if (
@@ -549,7 +552,7 @@ function applyRunEvent(
       }
       validateSourceReadObservation(
         current.sourceScope,
-        current.state.sourceReadObservations,
+        researching.sourceReadObservations,
         observation,
         event.occurredAt,
       );
@@ -557,9 +560,9 @@ function applyRunEvent(
       // sourceBytesRead 是 Journal 的派生量。每次回放都从成功 observation 重新
       // 求和，拒绝相信事件或缓存声称的 counter，避免篡改累计预算事实。
       const priorSourceBytes = sourceBytesFromObservations(
-        current.state.sourceReadObservations,
+        researching.sourceReadObservations,
       );
-      if (priorSourceBytes !== current.state.sourceBytesRead) {
+      if (priorSourceBytes !== researching.sourceBytesRead) {
         throw new IllegalRunEventError("来源读取累计字节派生值不一致");
       }
       const sourceBytesRead =
@@ -573,7 +576,7 @@ function applyRunEvent(
         throw new IllegalRunEventError("来源读取 observation 超出批准累计字节限制");
       }
       const distinctSources = new Set(
-        [...current.state.sourceReadObservations, observation].flatMap((candidate) =>
+        [...researching.sourceReadObservations, observation].flatMap((candidate) =>
           candidate.status === "succeeded"
             ? [candidate.sourceSnapshot.snapshotId]
             : [],
@@ -583,107 +586,112 @@ function applyRunEvent(
         throw new IllegalRunEventError("来源读取 observation 超出批准 distinct source 限制");
       }
 
-      return {
-        ...current,
-        state: {
-          ...current.state,
+      return commitResearchResultState(
+        current,
+        {
+          ...researching,
           sourceReadObservations: [
-            ...current.state.sourceReadObservations,
+            ...researching.sourceReadObservations,
             observation,
           ],
           sourceBytesRead,
           ...consumeEmbeddedResearchObservation(
-            current.state,
+            researching,
             event.payload.researchObservation,
             event.occurredAt,
           ),
         },
-        lastEventSequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
+        event,
+      );
     }
     case "evidence_recorded": {
-      if (current.state.type !== "researching") {
+      const researching = researchingStateForLateResult(current);
+      if (researching === undefined) {
         throw new IllegalRunEventError(
           "只有 researching Run 可以登记 Evidence Record",
         );
       }
+      const activeProjection = { ...current, state: researching } as RunProjection;
       validateEvidenceRecord(
-        current.state.sourceReadObservations,
-        current.state.evidenceRecords,
+        researching.sourceReadObservations,
+        researching.evidenceRecords,
         event.payload.evidence,
         event.occurredAt,
       );
       validateEmbeddedSuccessObservation(
-        current,
+        activeProjection,
         event.payload.researchObservation,
         "record_evidence",
         "evidenceId",
         event.payload.evidence.evidenceId,
         event.occurredAt,
       );
-      return {
-        ...current,
-        state: {
-          ...current.state,
+      return commitResearchResultState(
+        current,
+        {
+          ...researching,
           evidenceRecords: [
-            ...current.state.evidenceRecords,
+            ...researching.evidenceRecords,
             event.payload.evidence,
           ],
           ...consumeEmbeddedResearchObservation(
-            current.state,
+            researching,
             event.payload.researchObservation,
             event.occurredAt,
           ),
         },
-        lastEventSequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
+        event,
+      );
     }
     case "claim_recorded": {
-      if (current.state.type !== "researching") {
+      const researching = researchingStateForLateResult(current);
+      if (researching === undefined) {
         throw new IllegalRunEventError("只有 researching Run 可以登记 Claim");
       }
+      const activeProjection = { ...current, state: researching } as RunProjection;
       validateClaim(
-        current.state.evidenceRecords,
-        current.state.claims,
+        researching.evidenceRecords,
+        researching.claims,
         event.payload.claim,
         event.occurredAt,
       );
       validateEmbeddedSuccessObservation(
-        current,
+        activeProjection,
         event.payload.researchObservation,
         "propose_claim",
         "claimId",
         event.payload.claim.claimId,
         event.occurredAt,
       );
-      return {
-        ...current,
-        state: {
-          ...current.state,
-          claims: [...current.state.claims, event.payload.claim],
+      return commitResearchResultState(
+        current,
+        {
+          ...researching,
+          claims: [...researching.claims, event.payload.claim],
           ...consumeEmbeddedResearchObservation(
-            current.state,
+            researching,
             event.payload.researchObservation,
             event.occurredAt,
           ),
         },
-        lastEventSequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
+        event,
+      );
     }
     case "research_completed": {
-      if (current.state.type !== "researching") {
+      const researching = researchingStateForLateResult(current);
+      if (researching === undefined) {
         throw new IllegalRunEventError("只有 researching Run 可以显式完成研究");
       }
       const remaining = validateResearchObservation(
-        current.state.pendingToolIntents,
-        current.state.researchToolObservations,
+        researching.pendingToolIntents,
+        researching.researchToolObservations,
         event.payload.observation,
         event.occurredAt,
       );
-      assertResearchToolCallWithinBudget(current, event.payload.observation);
+      assertResearchToolCallWithinBudget(
+        { ...current, state: researching } as RunProjection,
+        event.payload.observation,
+      );
       if (
         event.payload.observation.toolName !== "complete_research" ||
         event.payload.observation.status !== "succeeded" ||
@@ -698,21 +706,20 @@ function applyRunEvent(
       ) {
         throw new IllegalRunEventError("Research completion 与 pending intent 不一致");
       }
-      return {
-        ...current,
-        state: {
-          ...current.state,
+      return commitResearchResultState(
+        current,
+        {
+          ...researching,
           type: "research_complete",
           pendingToolIntents: [],
           researchToolObservations: [
-            ...current.state.researchToolObservations,
+            ...researching.researchToolObservations,
             event.payload.observation,
           ],
           completion: event.payload.completion,
         },
-        lastEventSequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
+        event,
+      );
     }
     case "run_budget_exhausted": {
       if (
@@ -757,6 +764,90 @@ function applyRunEvent(
         updatedAt: event.occurredAt,
       };
     }
+    case "run_budget_extended": {
+      if (current.state.type !== "budget_exhausted") {
+        throw new IllegalRunEventError("只有 budget_exhausted Run 可以批准新预算");
+      }
+      const { runBudget, approvalReceipt } = event.payload;
+      if (
+        approvalReceipt.kind !== "run_budget_extension" ||
+        approvalReceipt.approvedBy !== "user-command" ||
+        approvalReceipt.approvedAt !== event.occurredAt ||
+        approvalReceipt.previousBudgetVersion !== current.runBudget.version ||
+        approvalReceipt.previousBudgetHash !== hashCanonicalJson(current.runBudget) ||
+        approvalReceipt.runBudgetVersion !== runBudget.version ||
+        approvalReceipt.runBudgetHash !== hashCanonicalJson(runBudget) ||
+        !extendsRunBudget(current.runBudget, runBudget)
+      ) {
+        throw new IllegalRunEventError("Run Budget extension 与当前暂停事实不一致");
+      }
+      return {
+        ...current,
+        runBudget,
+        runBudgetApprovalReceipts: [
+          ...current.runBudgetApprovalReceipts,
+          approvalReceipt,
+        ],
+        state: resumeBudgetExhaustedState(
+          current.state,
+          elapsedMilliseconds(current.updatedAt, event.occurredAt),
+        ),
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "run_paused": {
+      if (
+        current.state.type !== "researching" &&
+        current.state.type !== "research_complete" &&
+        current.state.type !== "ready_to_publish"
+      ) {
+        throw new IllegalRunEventError("当前 Run 状态不能接受用户暂停");
+      }
+      return {
+        ...current,
+        state: {
+          type: "user_paused",
+          suspendedState: current.state,
+          pausedAt: event.occurredAt,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "run_resumed": {
+      if (current.state.type !== "user_paused") {
+        throw new IllegalRunEventError("只有 user_paused Run 可以普通恢复");
+      }
+      return {
+        ...current,
+        state: addSuspendedDuration(
+          current.state.suspendedState,
+          elapsedMilliseconds(current.state.pausedAt, event.occurredAt),
+        ),
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "run_cancelled": {
+      if (
+        current.state.type === "completed" ||
+        current.state.type === "failed" ||
+        current.state.type === "cancelled"
+      ) {
+        throw new IllegalRunEventError("terminal Run 不能再次取消");
+      }
+      return {
+        ...current,
+        state: {
+          type: "cancelled",
+          cancelledState: current.state,
+          cancelledAt: event.occurredAt,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
     case "learning_artifact_draft_proposed": {
       if (
         current.state.type !== "researching" &&
@@ -796,6 +887,7 @@ function applyRunEvent(
         proposal: event.payload.proposal,
         publicationTarget: event.payload.publicationTarget,
         publicationBinding: event.payload.publicationBinding,
+        suspendedDurationMs: current.state.suspendedDurationMs,
         retryAttempts: current.state.retryAttempts,
       } as const;
       return {
@@ -913,6 +1005,36 @@ function remainingBudgetFromProjection(
   }
 }
 
+function researchingStateForLateResult(
+  projection: RunProjection,
+): import("./types.js").ResearchingRunState | undefined {
+  if (projection.state.type === "researching") return projection.state;
+  if (
+    projection.state.type === "cancelled" &&
+    projection.state.cancelledState.type === "researching"
+  ) {
+    return projection.state.cancelledState;
+  }
+  return undefined;
+}
+
+function commitResearchResultState(
+  projection: RunProjection,
+  resultState:
+    | import("./types.js").ResearchingRunState
+    | import("./types.js").ResearchCompleteRunState,
+  event: ResearchRunEvent,
+): RunProjection {
+  return {
+    ...projection,
+    state: projection.state.type === "cancelled"
+      ? { ...projection.state, cancelledState: resultState }
+      : resultState,
+    lastEventSequence: event.sequence,
+    updatedAt: event.occurredAt,
+  };
+}
+
 function remainingBudgetsEqual(
   left: import("./types.js").RemainingRunBudget,
   right: import("./types.js").RemainingRunBudget,
@@ -924,6 +1046,58 @@ function remainingBudgetsEqual(
     left.sourceBytes === right.sourceBytes &&
     left.wallTimeMs === right.wallTimeMs
   );
+}
+
+function extendsRunBudget(previous: import("./types.js").RunBudget, next: import("./types.js").RunBudget): boolean {
+  return (
+    next.version !== previous.version &&
+    next.maxModelTurns >= previous.maxModelTurns &&
+    next.maxToolCalls >= previous.maxToolCalls &&
+    next.maxDistinctSources >= previous.maxDistinctSources &&
+    next.maxSourceBytes >= previous.maxSourceBytes &&
+    next.maxWallTimeMs >= previous.maxWallTimeMs &&
+    (
+      next.maxModelTurns > previous.maxModelTurns ||
+      next.maxToolCalls > previous.maxToolCalls ||
+      next.maxDistinctSources > previous.maxDistinctSources ||
+      next.maxSourceBytes > previous.maxSourceBytes ||
+      next.maxWallTimeMs > previous.maxWallTimeMs
+    )
+  );
+}
+
+function resumeBudgetExhaustedState(
+  state: import("./types.js").BudgetExhaustedRunState,
+  suspendedDurationMs: number,
+): import("./types.js").ResearchingRunState | import("./types.js").ResearchCompleteRunState {
+  const {
+    type: _type,
+    researchOutcome,
+    exhaustedDimension: _exhaustedDimension,
+    remainingBudget: _remainingBudget,
+    ...evidenceBacked
+  } = state;
+  const resumed = addSuspendedDuration(evidenceBacked, suspendedDurationMs);
+  return researchOutcome === "research_complete"
+    ? { ...resumed, type: "research_complete", completion: state.completion }
+    : { ...resumed, type: "researching" };
+}
+
+function addSuspendedDuration<
+  State extends import("./types.js").EvidenceBackedRunStateData,
+>(state: State, durationMs: number): State {
+  return {
+    ...state,
+    suspendedDurationMs: state.suspendedDurationMs + durationMs,
+  };
+}
+
+function elapsedMilliseconds(startedAt: string, completedAt: string): number {
+  const durationMs = Date.parse(completedAt) - Date.parse(startedAt);
+  if (!Number.isSafeInteger(durationMs) || durationMs < 0) {
+    throw new IllegalRunEventError("Suspended Run duration 无效");
+  }
+  return durationMs;
 }
 
 function validateStartedAttempt(

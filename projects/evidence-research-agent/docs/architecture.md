@@ -1,8 +1,8 @@
-# Evidence Research Agent 架构（Issue #8）
+# Evidence Research Agent 架构（Issue #9）
 
-当前 slice 在 #7 的 retry/recovery 协议上接入 Vercel AI SDK Core `streamText` 与 `@ai-sdk/openai-compatible`。live adapter 负责 provider transport、stream consumption、schema-only tool definitions、usage 与安全错误归一化；Harness 继续拥有单步 Research Loop、Research Tool 调度、retry、Journal、审批和 publication。partial provider delta 永远不是 canonical Model Turn。
+当前 slice 在 #8 的 live Model Port 上补齐 durable user pause、精确 resume、terminal cancellation 与经用户批准的 Run Budget Extension。Harness 继续拥有单步 Research Loop、Research Tool 调度、retry、Journal、审批和 publication；partial provider delta 永远不是 canonical Model Turn。
 
-外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。当前仍没有并行 tool batch、预算扩展恢复或 publication crash reconciliation；这些分别属于后续 tickets。
+外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。当前仍没有并行 tool batch 或 publication crash reconciliation；这些分别属于后续 tickets。
 
 ## 组件、端口与单向能力流
 
@@ -78,6 +78,8 @@ flowchart LR
 
   Projection --> Budget["Five-dimensional Run Budget"]
   Budget -->|"hard limit"| Exhausted["budget_exhausted"]
+  Caller --> Control["pause / resume / cancel<br/>extend-budget"]
+  Control --> Journal
   Projection --> ResearchComplete["research_complete"]
   Gate["Evidence Gate + deterministic renderer"]
   Publisher["LearningArtifactPublisher<br/>same-directory no-clobber publish"]
@@ -141,14 +143,39 @@ stateDiagram-v2
   waiting_publication_approval --> ready_to_publish: publication_approved
   ready_to_publish --> completed: learning_artifact_published
 
+  researching --> user_paused: run_paused
+  research_complete --> user_paused: run_paused
+  ready_to_publish --> user_paused: run_paused
+  user_paused --> researching: run_resumed (researching origin)
+  user_paused --> research_complete: run_resumed (completed origin)
+  user_paused --> ready_to_publish: run_resumed (publish origin)
+  budget_exhausted --> researching: run_budget_extended (incomplete origin)
+  budget_exhausted --> research_complete: run_budget_extended (completed origin)
+
+  created --> cancelled: run_cancelled
+  planning --> cancelled: run_cancelled
+  waiting_plan_approval --> cancelled: run_cancelled
+  researching --> cancelled: run_cancelled
+  research_complete --> cancelled: run_cancelled
+  budget_exhausted --> cancelled: run_cancelled
+  retry_exhausted --> cancelled: run_cancelled
+  waiting_publication_approval --> cancelled: run_cancelled
+  ready_to_publish --> cancelled: run_cancelled
+  user_paused --> cancelled: run_cancelled
+
   note right of researching
     external I/O starts only after durable attempt
     atomic success prevents duplicate resampling
   end note
 
   note right of budget_exhausted
-    resumable non-success suspension
-    budget extension belongs to Issue #9
+    suspended exact incomplete/completed origin
+    only a larger approved budget version resumes
+  end note
+
+  note right of user_paused
+    suspendedState preserves exact continuation
+    resume never resamples completed work
   end note
 
   note right of retry_exhausted
@@ -159,6 +186,16 @@ stateDiagram-v2
   note right of failed
     terminal model contract/permanent
     or invariant violation
+  end note
+
+  note right of cancelled
+    terminal and never resumable
+    late completed results are audit-only
+  end note
+
+  note right of completed
+    terminal published outcome
+    no resume or new work
   end note
 
   note right of waiting_publication_approval
@@ -172,7 +209,11 @@ stateDiagram-v2
   end note
 ```
 
-`research_complete` 不是最终 terminal `completed`：它只表示模型通过 `complete_research` 显式结束调查并保存 unresolved questions，可以进入确定性 Gate。完成工具返回后 Runtime 会在 completion 的同一个 `occurredAt` 用 canonical budget calculator 再检查 Model Turn 与 wall time，并把 durable `completion.completedAt` 冻结为 Research Loop 的计费终点；之后的用户空闲或重复 `advanceResearch` 不会让合法完成的 Run 追溯耗尽。若 completion 当拍刚好耗尽，`research_completed` 与 `run_budget_exhausted` 会在同一个 SQLite transaction 中追加，最终 Run 直接成为 `budget_exhausted`，并以 `researchOutcome: research_complete` 保留 completion provenance。这样 completion commit 前的崩溃仍留下 pending intent，commit 后的崩溃则一定同时看见 completion 与预算暂停，不存在 exhausted 但可发布的中间 Journal。更早暂停保存 `researchOutcome: incomplete`。两者都是 suspended non-success，均拒绝 draft/publication；Issue #9 才会加入新预算版本、重新审批和精确恢复。
+`research_complete` 不是最终 terminal `completed`：它只表示模型通过 `complete_research` 显式结束调查并保存 unresolved questions，可以进入确定性 Gate。完成工具返回后 Runtime 会在 completion 的同一个 `occurredAt` 用 canonical budget calculator 再检查 Model Turn 与 wall time，并把 durable `completion.completedAt` 冻结为 Research Loop 的计费终点；之后的用户空闲或重复 `advanceResearch` 不会让合法完成的 Run 追溯耗尽。若 completion 当拍刚好耗尽，`research_completed` 与 `run_budget_exhausted` 会在同一个 SQLite transaction 中追加，最终 Run 直接成为 `budget_exhausted`，并以 `researchOutcome: research_complete` 保留 completion provenance。更早暂停保存 `researchOutcome: incomplete`。新的 Run Budget version 必须逐维不缩减、至少提高一维，并由绑定前后 canonical hashes 的用户 Receipt 授权；恢复后分别回到精确的 `researching` 或 `research_complete` origin，已有 usage 不清零。
+
+`SuspendedRunState` 包含 plan/publication approval waits、`budget_exhausted`、`retry_exhausted` 与 `user_paused`。approval waits 由各自的显式 approval 命令继续；普通 `resumeRun` 只接受 `user_paused`。user pause 和 budget exhaustion 的停留时间累加到 `suspendedDurationMs`，不计入 Research Loop wall time。`completed`、`cancelled` 与 `failed` 是不可恢复 terminal states。
+
+取消可以先于并发外部结果成为 Journal fact。若 Model Turn、Search/read observation、Evidence、Claim、completion 或 aborted Retry Attempt 已经完整形成，Runtime 会在乐观并发冲突后重新编号并把该结果追加到 `cancelledState`；reducer 始终保留外层 `cancelled`，不会执行 queued tool、进入 Gate 或推进 publication。partial stream 从未形成 completed result，因而只闭合已 durable started 的 attempt，不持久化 delta。
 
 publication 状态以 `researchOrigin` 判别 provenance：Issue #5 的零 Research Loop Model Turn 显式教学路径只能是 `legacy_explicit`，真正多轮路径只能是 `research_loop` 且结构上必须同时保留非空 Model Turns、tool observations、`researchStartedAt` 与 `completion`。因此 schema 和 reducer 都无法表达“有 Research Loop turns 但没有完成事实”或“零 turn 凭空带 completion”的非法组合。
 
@@ -190,6 +231,5 @@ Trace 先暴露非秘密 Experiment Identity，再依次暴露不含秘密的 li
 
 ## 当前边界与后续 ticket
 
-- Issue #9 才加入用户暂停、取消、预算版本扩展以及从 `budget_exhausted` 的恢复。
 - Issue #11 才加入 safe search/read sibling batch 的有界并发与模型原始顺序回填。
 - Issue #14 才把 publication 外部 effect 的 crash reconciliation 做成 durable protocol。

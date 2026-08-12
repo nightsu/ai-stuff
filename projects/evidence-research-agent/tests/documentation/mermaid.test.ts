@@ -53,6 +53,8 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   expect(markdown).toContain("Gate --> Draft");
   expect(markdown).toContain("Draft --> Approval");
   expect(markdown).toContain("Approval --> Publisher");
+  expect(markdown).toContain('Control["pause / resume / cancel<br/>extend-budget"]');
+  expect(markdown).toContain("Control --> Journal");
   expect(markdown).toContain("Output Root");
   expect(stateDiagram).toMatch(
     /^\s*researching\s*-->\s*researching\s*:\s*model_turn_completed\s*$/m,
@@ -75,8 +77,21 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   expect(stateDiagram).toMatch(
     /^\s*ready_to_publish\s*-->\s*completed\s*:\s*learning_artifact_published\s*$/m,
   );
+  expect(stateDiagram).toMatch(
+    /^\s*researching\s*-->\s*user_paused\s*:\s*run_paused\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*user_paused\s*-->\s*researching\s*:\s*run_resumed \(researching origin\)\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*budget_exhausted\s*-->\s*research_complete\s*:\s*run_budget_extended \(completed origin\)\s*$/m,
+  );
+  expect(stateDiagram).toMatch(
+    /^\s*waiting_publication_approval\s*-->\s*cancelled\s*:\s*run_cancelled\s*$/m,
+  );
   expect(markdown).toContain("budget_exhausted");
   expect(markdown).toContain("research_complete");
+  expect(markdown).toContain("completed`、`cancelled` 与 `failed` 是不可恢复 terminal states");
 });
 
 async function readArchitecture(): Promise<string> {
