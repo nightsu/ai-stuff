@@ -293,6 +293,9 @@ function applyRunEvent(
           ],
           researchStartedAt:
             current.state.researchStartedAt ?? event.payload.attempt.startedAt,
+          ...(event.payload.attempt.latestSteering === undefined
+            ? {}
+            : { latestSteering: event.payload.attempt.latestSteering }),
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -882,8 +885,18 @@ function validateStartedAttempt(
   const sameOperation = state.operationAttempts.filter(
     (candidate) => candidate.operationId === attempt.operationId,
   );
-  const latest = sameOperation.at(-1);
-  const expectedNumber = sameOperation.length + 1;
+  const previousAttempt = sameOperation.at(-1);
+  const latestAttempt = state.operationAttempts.at(-1);
+  const newOperation = previousAttempt === undefined;
+  const validOperationIdentity = newOperation
+    ? attempt.attemptNumber === 1
+    : previousAttempt === latestAttempt &&
+      previousAttempt.outcome === "retryable_failure" &&
+      attempt.attemptNumber === previousAttempt.attemptNumber + 1 &&
+      attempt.operationKind === previousAttempt.operationKind &&
+      retryPoliciesEqual(attempt.retryPolicy, previousAttempt.retryPolicy) &&
+      attempt.toolCallId === previousAttempt.toolCallId &&
+      attempt.intentId === previousAttempt.intentId;
   const modelShape =
     attempt.operationKind === "model_turn" &&
     attempt.toolCallId === undefined &&
@@ -898,7 +911,7 @@ function validateStartedAttempt(
   if (
     attempt.attemptId.trim() === "" ||
     attempt.operationId.trim() === "" ||
-    attempt.attemptNumber !== expectedNumber ||
+    !validOperationIdentity ||
     attempt.startedAt !== occurredAt ||
     !isIsoUtc(attempt.startedAt) ||
     state.operationAttempts.some(
@@ -906,7 +919,6 @@ function validateStartedAttempt(
     ) ||
     projection.retryPolicy === undefined ||
     !retryPoliciesEqual(attempt.retryPolicy, projection.retryPolicy) ||
-    (latest !== undefined && latest.outcome === "in_progress") ||
     (!modelShape && !searchShape)
   ) {
     throw new IllegalRunEventError("operation attempt start 与当前逻辑操作不一致");

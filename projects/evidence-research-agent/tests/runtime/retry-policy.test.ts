@@ -16,6 +16,7 @@ import type {
   IdGenerator,
   ModelPort,
   ModelView,
+  RetryPolicy,
   RetryScheduler,
   ResearchRunEvent,
   RunBudget,
@@ -244,7 +245,9 @@ describe("ResearchAgentRuntime retry policy", () => {
     const sourceRoot = await createTemporaryDirectory("retry-restart-source-");
     let interrupt = true;
     let generationCalls = 0;
-    const model = completingModel(() => {
+    const generatedViews: ModelView[] = [];
+    const model = completingModel((view) => {
+      generatedViews.push(structuredClone(view));
       generationCalls += 1;
     });
     const policy = {
@@ -278,14 +281,19 @@ describe("ResearchAgentRuntime retry policy", () => {
       bindingHash: waiting.bindingHash,
     });
     await expect(
-      first.advanceResearch({ runId: waiting.runId }),
+      first.advanceResearch({
+        runId: waiting.runId,
+        steering: "只验证 durable steering",
+      }),
     ).rejects.toMatchObject({ name: "ResearchLoopError" });
     const interrupted = await first.inspectRun({ runId: waiting.runId });
     expect(interrupted.state).toMatchObject({
       type: "researching",
+      latestSteering: "只验证 durable steering",
       operationAttempts: [expect.objectContaining({
         attemptNumber: 1,
         outcome: "in_progress",
+        latestSteering: "只验证 durable steering",
         retryPolicy: policy,
       })],
     });
@@ -328,12 +336,18 @@ describe("ResearchAgentRuntime retry policy", () => {
           expect.objectContaining({
             attemptNumber: 2,
             outcome: "succeeded",
+            latestSteering: "只验证 durable steering",
             retryPolicy: policy,
           }),
         ],
       });
       expect(waits).toEqual([15]);
       expect(generationCalls).toBe(1);
+      expect(generatedViews).toEqual([
+        expect.objectContaining({
+          latestSteering: "只验证 durable steering",
+        }),
+      ]);
     } finally {
       restarted.close();
     }
@@ -834,6 +848,53 @@ describe("ResearchAgentRuntime retry policy", () => {
     expect(() => reduceRunEvents(mismatchedTerminalFailure)).toThrow(
       IllegalRunEventError,
     );
+  });
+
+  it("rejects reuse of a succeeded Model or Search operation identity", () => {
+    expect(() => reduceRunEvents(modelOperationIdReuseEvents())).toThrow(
+      IllegalRunEventError,
+    );
+    expect(() => reduceRunEvents(searchOperationIdReuseEvents())).toThrow(
+      IllegalRunEventError,
+    );
+  });
+
+  it("keeps every Search retry on the frozen logical Tool Call lineage", () => {
+    const validRetry = retryableSearchAttemptEvents();
+    expect(() => reduceRunEvents(validRetry)).not.toThrow();
+
+    for (const replacement of [
+      { toolCallId: "tool-call-replaced" },
+      { intentId: "intent-replaced" },
+      { operationKind: "model_turn" as const, toolCallId: undefined, intentId: undefined },
+      {
+        retryPolicy: {
+          version: "retry-replaced",
+          modelMaxAttempts: 2,
+          toolMaxAttempts: 2,
+          baseDelayMs: 10,
+          maxDelayMs: 100,
+        },
+      },
+    ]) {
+      const tampered = structuredClone(validRetry);
+      const retryStart = tampered.at(-1);
+      if (retryStart?.type !== "operation_attempt_started") {
+        throw new Error("测试夹具缺少 retry started attempt");
+      }
+      tampered[tampered.length - 1] = {
+        ...retryStart,
+        payload: {
+          attempt: {
+            ...retryStart.payload.attempt,
+            ...replacement,
+          },
+        },
+      };
+      expect(() => reduceRunEvents(tampered)).toThrow(
+        IllegalRunEventError,
+      );
+    }
   });
 
   it("rejects malformed attempt facts at the Journal schema boundary", () => {
@@ -1377,7 +1438,302 @@ function retryReducerEvents(modelMaxAttempts = 1): ResearchRunEvent[] {
   ];
 }
 
-function completingModel(onGenerate: () => void): ModelPort {
+function modelOperationIdReuseEvents(): ResearchRunEvent[] {
+  const events = retryReducerEvents(2).slice(0, 5);
+  const started = events[4];
+  if (started?.type !== "operation_attempt_started") {
+    throw new Error("测试夹具缺少 Model started attempt");
+  }
+  const completedAt = "2026-08-12T08:00:01.005Z";
+  events.push({
+    eventId: "event-006",
+    runId: started.runId,
+    sequence: 6,
+    type: "model_turn_completed",
+    occurredAt: completedAt,
+    payload: {
+      generationStartedAt: started.occurredAt,
+      turn: {
+        turnId: "turn-event-006",
+        text: "先完成一个 Model operation。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [{
+          intentId: "search-001",
+          name: "search_sources",
+          input: { query: "journal", maxResults: 1 },
+        }],
+        completedAt,
+      },
+      attempt: {
+        ...started.payload.attempt,
+        outcome: "succeeded",
+        completedAt,
+        durationMs: 5,
+      },
+    },
+  });
+  events.push({
+    eventId: "event-007",
+    runId: started.runId,
+    sequence: 7,
+    type: "research_tool_observed",
+    occurredAt: "2026-08-12T08:00:01.006Z",
+    payload: {
+      observation: {
+        observationId: "observation-001",
+        toolCallId: "tool-call-invalid",
+        intentId: "search-001",
+        toolName: "search_sources",
+        status: "invalid",
+        code: "invalid_tool_schema",
+        failure: {
+          category: "model_contract",
+          code: "invalid_tool_schema",
+        },
+        summary: "invalid search schema",
+        observedAt: "2026-08-12T08:00:01.006Z",
+      },
+    },
+  });
+  events.push({
+    eventId: "event-008",
+    runId: started.runId,
+    sequence: 8,
+    type: "operation_attempt_started",
+    occurredAt: "2026-08-12T08:00:01.007Z",
+    payload: {
+      attempt: {
+        ...started.payload.attempt,
+        attemptId: "attempt-002",
+        attemptNumber: 2,
+        startedAt: "2026-08-12T08:00:01.007Z",
+      },
+    },
+  });
+  return events;
+}
+
+function searchOperationIdReuseEvents(): ResearchRunEvent[] {
+  const events = retryReducerEvents(2).slice(0, 4);
+  const runId = events[0]?.runId;
+  const retryPolicy = events[0]?.type === "run_created"
+    ? events[0].payload.retryPolicy
+    : undefined;
+  if (runId === undefined || retryPolicy === undefined) {
+    throw new Error("测试夹具缺少 Run retry policy");
+  }
+  events.push(modelSearchIntentEvent(runId, 5, "search-001"));
+  events.push(searchAttemptStartedEvent({
+    runId,
+    sequence: 6,
+    retryPolicy,
+    attemptId: "search-attempt-001",
+    operationId: "search-operation-001",
+    attemptNumber: 1,
+    toolCallId: "tool-call-001",
+    intentId: "search-001",
+  }));
+  events.push(searchSucceededEvent({
+    runId,
+    sequence: 7,
+    retryPolicy,
+    attemptId: "search-attempt-001",
+    operationId: "search-operation-001",
+    attemptNumber: 1,
+    toolCallId: "tool-call-001",
+    intentId: "search-001",
+  }));
+  events.push(modelSearchIntentEvent(runId, 8, "search-002"));
+  events.push(searchAttemptStartedEvent({
+    runId,
+    sequence: 9,
+    retryPolicy,
+    attemptId: "search-attempt-002",
+    operationId: "search-operation-001",
+    attemptNumber: 2,
+    toolCallId: "tool-call-002",
+    intentId: "search-002",
+  }));
+  return events;
+}
+
+function retryableSearchAttemptEvents(): ResearchRunEvent[] {
+  const events = retryReducerEvents(2).slice(0, 4);
+  const runId = events[0]?.runId;
+  const retryPolicy = events[0]?.type === "run_created"
+    ? events[0].payload.retryPolicy
+    : undefined;
+  if (runId === undefined || retryPolicy === undefined) {
+    throw new Error("测试夹具缺少 Run retry policy");
+  }
+  events.push(modelSearchIntentEvent(runId, 5, "search-001"));
+  const started = searchAttemptStartedEvent({
+    runId,
+    sequence: 6,
+    retryPolicy,
+    attemptId: "search-attempt-001",
+    operationId: "search-operation-001",
+    attemptNumber: 1,
+    toolCallId: "tool-call-001",
+    intentId: "search-001",
+  });
+  events.push(started);
+  events.push({
+    eventId: "event-search-failed-007",
+    runId,
+    sequence: 7,
+    type: "operation_attempt_failed",
+    occurredAt: "2026-08-12T08:00:02.005Z",
+    payload: {
+      attempt: {
+        ...started.payload.attempt,
+        outcome: "retryable_failure",
+        completedAt: "2026-08-12T08:00:02.005Z",
+        durationMs: 5,
+        failure: {
+          category: "infrastructure_transient",
+          code: "connection_failed",
+        },
+        retryDelayMs: 10,
+      },
+    },
+  });
+  events.push(searchAttemptStartedEvent({
+    runId,
+    sequence: 8,
+    retryPolicy,
+    attemptId: "search-attempt-002",
+    operationId: "search-operation-001",
+    attemptNumber: 2,
+    toolCallId: "tool-call-001",
+    intentId: "search-001",
+  }));
+  return events;
+}
+
+function modelSearchIntentEvent(
+  runId: string,
+  sequence: number,
+  intentId: string,
+): ResearchRunEvent {
+  const occurredAt = `2026-08-12T08:00:0${sequence - 4}.000Z`;
+  const eventId = `event-model-${sequence}`;
+  return {
+    eventId,
+    runId,
+    sequence,
+    type: "model_turn_completed",
+    occurredAt,
+    payload: {
+      generationStartedAt: occurredAt,
+      turn: {
+        turnId: `turn-${eventId}`,
+        text: "请求搜索。",
+        evidenceGaps: [],
+        finishReason: "tool_calls",
+        toolIntents: [{
+          intentId,
+          name: "search_sources",
+          input: { query: "journal", maxResults: 1 },
+        }],
+        completedAt: occurredAt,
+      },
+    },
+  };
+}
+
+/** 构造 Search attempt 回放夹具所需的稳定 lineage 字段。 */
+interface SearchAttemptFixtureInput {
+  /** 夹具事件所属的 Research Run identity。 */
+  readonly runId: string;
+  /** 夹具事件在 Run Journal 中的连续序号。 */
+  readonly sequence: number;
+  /** Search 逻辑操作首次 attempt 冻结的 Retry Policy。 */
+  readonly retryPolicy: RetryPolicy;
+  /** 当前物理 Search attempt identity。 */
+  readonly attemptId: string;
+  /** 所有 Search retries 共享的逻辑 operation identity。 */
+  readonly operationId: string;
+  /** 当前物理 attempt 在逻辑 operation 内的 1-based 序号。 */
+  readonly attemptNumber: number;
+  /** 所有 Search retries 必须共享的逻辑 Research Tool call identity。 */
+  readonly toolCallId: string;
+  /** Search attempts 必须保持绑定的 pending intent identity。 */
+  readonly intentId: string;
+}
+
+function searchAttemptStartedEvent(input: SearchAttemptFixtureInput) {
+  const startedAt = `2026-08-12T08:00:0${input.sequence - 4}.000Z`;
+  return {
+    eventId: `event-search-started-${input.sequence}`,
+    runId: input.runId,
+    sequence: input.sequence,
+    type: "operation_attempt_started",
+    occurredAt: startedAt,
+    payload: {
+      attempt: {
+        attemptId: input.attemptId,
+        operationId: input.operationId,
+        operationKind: "search_sources",
+        attemptNumber: input.attemptNumber,
+        retryPolicy: input.retryPolicy,
+        startedAt,
+        outcome: "in_progress",
+        toolCallId: input.toolCallId,
+        intentId: input.intentId,
+      },
+    },
+  } as const;
+}
+
+function searchSucceededEvent(input: SearchAttemptFixtureInput) {
+  const observedAt = `2026-08-12T08:00:0${input.sequence - 4}.000Z`;
+  const hash = "b".repeat(64);
+  return {
+    eventId: `event-search-succeeded-${input.sequence}`,
+    runId: input.runId,
+    sequence: input.sequence,
+    type: "research_tool_observed",
+    occurredAt: observedAt,
+    payload: {
+      observation: {
+        observationId: "observation-search-001",
+        toolCallId: input.toolCallId,
+        intentId: input.intentId,
+        toolName: "search_sources",
+        status: "succeeded",
+        summary: "search_sources succeeded",
+        output: {
+          searchResultArtifact: {
+            artifactId: `sha256:${hash}`,
+            sha256: hash,
+            mediaType: "application/json",
+            byteLength: 2,
+            relativePath: `artifacts/sha256/bb/${hash}.json`,
+          },
+          matchCount: 0,
+        },
+        observedAt,
+      },
+      attempt: {
+        attemptId: input.attemptId,
+        operationId: input.operationId,
+        operationKind: "search_sources",
+        attemptNumber: input.attemptNumber,
+        retryPolicy: input.retryPolicy,
+        startedAt: `2026-08-12T08:00:0${input.sequence - 5}.000Z`,
+        outcome: "succeeded",
+        toolCallId: input.toolCallId,
+        intentId: input.intentId,
+        completedAt: observedAt,
+        durationMs: 1_000,
+      },
+    },
+  } as const;
+}
+
+function completingModel(onGenerate: (view: ModelView) => void): ModelPort {
   return {
     proposePlan: async () => ({
       title: "验证 interrupted attempt",
@@ -1387,8 +1743,8 @@ function completingModel(onGenerate: () => void): ModelPort {
     proposeLearningArtifact: async () => {
       throw new Error("测试不会生成 Learning Artifact");
     },
-    generateResearchTurn: async () => {
-      onGenerate();
+    generateResearchTurn: async (view) => {
+      onGenerate(view);
       return {
         text: "重启后完成。",
         evidenceGaps: [],

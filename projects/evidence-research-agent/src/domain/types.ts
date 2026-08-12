@@ -100,7 +100,7 @@ export interface RetryPolicy {
   readonly toolMaxAttempts: number;
   /** 第一次自动 retry 的 Harness backoff，单位为毫秒。 */
   readonly baseDelayMs: number;
-  /** provider hint 与指数 backoff 共同受此毫秒上限约束。 */
+  /** 本地指数 backoff 的毫秒上限；provider 最短等待 hint 可以超过此值。 */
   readonly maxDelayMs: number;
 }
 
