@@ -3072,9 +3072,13 @@ export class ResearchAgentRuntime {
       if (projection.state.type === "cancelled") return projection;
       const control = this.#store.inspectRunOperation(runId);
       const now = this.#operationClock.now();
-      if (control.lease?.ownerId === this.#runtimeOwnerId) {
+      if (
+        control.lease?.ownerId === this.#runtimeOwnerId &&
+        Date.parse(control.lease.expiresAt) > Date.parse(now)
+      ) {
         // 同一 Runtime 的独立 cancel call 不继承 advanceResearch 的 async context，
-        // 但可以由 owner identity 证明它持有 provider controller；直接结算后 abort。
+        // 未过期 owner identity 可证明它持有 provider controller；过期 owner 不能
+        // 再授权 mutation，必须走下方 takeover 并从 canonical Journal 恢复。
         return this.#consumeCancellationRequest(
           request,
           control.lease.operationId,

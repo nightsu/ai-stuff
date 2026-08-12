@@ -418,6 +418,74 @@ describe("ResearchAgentRuntime durable Run Operations", () => {
     }
   });
 
+  it("takes over an expired same-Runtime owner to consume durable cancellation", async () => {
+    const runtimeHome = await temporaryDirectory("run-expired-owner-cancel-runtime-");
+    const sourceRoot = await temporaryDirectory("run-expired-owner-cancel-source-");
+    const [operationClock, setOperationTime] = controlledClock(
+      "2026-08-12T10:00:00.000Z",
+    );
+    let enterStream: (() => void) | undefined;
+    let releaseStream: (() => void) | undefined;
+    const entered = new Promise<void>((resolve) => {
+      enterStream = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const runtime = ResearchAgentRuntime.open({
+      runtimeHome,
+      operationClock,
+      operationLeaseDurationMs: 1_000,
+      operationHeartbeatIntervalMs: 900,
+      model: {
+        proposePlan: async () => learningPlan(),
+        proposeLearningArtifact: async () => {
+          throw new Error("测试不会生成 Learning Artifact");
+        },
+        generateResearchTurn: async () => {
+          enterStream?.();
+          await released;
+          return {
+            text: "过期 owner 返回时 Run 已被 durable 取消。",
+            evidenceGaps: [],
+            finishReason: "tool_calls",
+            toolIntents: [{
+              intentId: "expired-owner-complete",
+              name: "complete_research",
+              input: { unresolvedQuestions: [] },
+            }],
+          };
+        },
+      },
+    });
+
+    try {
+      const runId = await createApprovedRun(runtime, sourceRoot);
+      const staleAdvance = runtime.advanceResearch({ runId });
+      await entered;
+      setOperationTime("2026-08-12T10:00:02.000Z");
+
+      await expect(runtime.cancelRun({ runId })).resolves.toMatchObject({
+        lastEventSequence: 5,
+        state: { type: "cancelled" },
+      });
+      releaseStream?.();
+      await expect(staleAdvance).rejects.toMatchObject({
+        name: "ResearchLoopError",
+      });
+      await expect(runtime.inspectRunOperation({ runId })).resolves.toMatchObject({
+        lease: undefined,
+        cancellationRequest: {
+          consumedAt: expect.any(String),
+          consumedByOperationId: expect.stringMatching(/^operation-/),
+        },
+      });
+    } finally {
+      releaseStream?.();
+      runtime.close();
+    }
+  });
+
   it("consumes a durable cancellation request before the next mutation after the requester crashes", async () => {
     const runtimeHome = await temporaryDirectory("run-cancel-recovery-runtime-");
     const sourceRoot = await temporaryDirectory("run-cancel-recovery-source-");
