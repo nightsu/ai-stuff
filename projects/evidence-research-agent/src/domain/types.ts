@@ -643,6 +643,8 @@ export type SuspendedRunState =
   | WaitingPublicationApprovalRunState
   | BudgetExhaustedRunState
   | RetryExhaustedRunState
+  | PublicationUnknownRunState
+  | PublicationConflictRunState
   | UserPausedRunState;
 
 /** 用户可终止、但尚未进入不可逆 terminal outcome 的状态。 */
@@ -657,6 +659,7 @@ export type CancellableRunState =
   | WaitingEvaluatorResolutionRunState
   | WaitingPublicationApprovalRunState
   | ReadyToPublishRunState
+  | PublicationPendingRunState
   | UserPausedRunState;
 
 /** 用户终止后保留取消前全部事实、且永远不能恢复的 Run 终态。 */
@@ -684,6 +687,10 @@ export type ResearchRunState =
   | WaitingEvaluatorResolutionRunState
   | WaitingPublicationApprovalRunState
   | ReadyToPublishRunState
+  | PublicationPendingRunState
+  | PublicationExecutingRunState
+  | PublicationUnknownRunState
+  | PublicationConflictRunState
   | CompletedRunState;
 
 /** 从 Run Journal 确定性派生的当前 Run 视图。 */
@@ -725,6 +732,7 @@ export type RunOperationKind =
   | "skip_evaluator_review"
   | "approve_publication"
   | "publish_learning_artifact"
+  | "reconcile_publication_effect"
   | "pause_run"
   | "resume_run"
   | "consume_cancellation"
@@ -1257,6 +1265,83 @@ export interface PublishedLearningArtifact {
   readonly publishedAt: string;
 }
 
+/** Publication Effect 各状态共享且不得在 retry/reconcile 中改变的 action identity。 */
+export interface PublicationEffectIdentity {
+  /** 由 run、approved draft hash 与 canonical target path 派生的稳定 identity。 */
+  readonly effectId: string;
+  /** action 所属的 Research Run identity。 */
+  readonly runId: string;
+  /** action 唯一允许发布的 approved Markdown SHA-256。 */
+  readonly draftHash: string;
+  /** action 唯一允许影响的 canonical target path。 */
+  readonly targetCanonicalPath: string;
+  /** 授权该 action 的 durable Publication Approval Receipt identity。 */
+  readonly publicationApprovalId: string;
+  /** action 首次 durable prepare 的 ISO 8601 UTC 时间。 */
+  readonly preparedAt: string;
+}
+
+/** 已 durable prepare、尚未声明外部写入开始的 Publication Effect。 */
+export interface PendingPublicationEffect extends PublicationEffectIdentity {
+  /** 生命周期判别字段；同一 effect retry 不得创建新 identity。 */
+  readonly status: "pending";
+}
+
+/** 已声明开始执行、但 external outcome 尚未结算的共享 identity。 */
+export interface StartedPublicationEffectIdentity
+  extends PublicationEffectIdentity {
+  /** external write attempt 被 durable 声明开始的 ISO 8601 UTC 时间。 */
+  readonly executionStartedAt: string;
+}
+
+/** external write 已开始、进程尚未持久化确定结果的 effect。 */
+export interface ExecutingPublicationEffect
+  extends StartedPublicationEffectIdentity {
+  /** 生命周期判别字段；重启后必须先 reconcile，不能盲目重放。 */
+  readonly status: "executing";
+}
+
+/** external outcome 无法由现有事实唯一确定、等待显式 reconcile。 */
+export interface UnknownPublicationEffect
+  extends StartedPublicationEffectIdentity {
+  /** 生命周期判别字段；UNKNOWN 不是普通失败或自动 retry。 */
+  readonly status: "unknown";
+  /** 不确定性成为 Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly unknownAt: string;
+  /** 不含底层错误或路径细节的稳定不确定性原因。 */
+  readonly reason: "interrupted_execution" | "reconciliation_inconclusive";
+}
+
+/** target 已存在不同内容、必须等待用户处理的 effect。 */
+export interface ConflictingPublicationEffect
+  extends StartedPublicationEffectIdentity {
+  /** 生命周期判别字段；不同内容永远不能被此 action 覆盖。 */
+  readonly status: "conflict";
+  /** conflict 被安全观察并持久化的 ISO 8601 UTC 时间。 */
+  readonly conflictedAt: string;
+  /** 可安全公开的现有 regular-file SHA-256；不可读取时省略。 */
+  readonly observedTargetHash?: string | undefined;
+}
+
+/** 外部 publication 与 Journal settlement 均成功后的终态 effect。 */
+export interface SucceededPublicationEffect
+  extends StartedPublicationEffectIdentity {
+  /** 生命周期判别字段；已成功 effect 不得再次执行。 */
+  readonly status: "succeeded";
+  /** 成功 settlement 成为 Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly succeededAt: string;
+  /** 成功来自当前执行返回，还是 crash 后 target 对账。 */
+  readonly settlement: "direct" | "reconciled";
+}
+
+/** 一个 Publication Effect 的完整封闭生命周期状态。 */
+export type PublicationEffect =
+  | PendingPublicationEffect
+  | ExecutingPublicationEffect
+  | UnknownPublicationEffect
+  | ConflictingPublicationEffect
+  | SucceededPublicationEffect;
+
 /** Issue #5 的显式命令路径在 publication 状态保留的研究 provenance。 */
 export interface LegacyExplicitPublicationResearchData
   extends EvidenceBackedRunStateData {
@@ -1359,6 +1444,50 @@ export type ReadyToPublishRunState = PublicationResearchData &
   readonly publicationReceipt: PublicationApprovalReceipt;
 };
 
+/** exact action 已 durable prepare、可在重启后从同一 identity 继续的 Run 状态。 */
+export type PublicationPendingRunState = PublicationResearchData &
+  PublicationStateData & {
+  /** 判别字段；外部写入开始前必须先存在该 durable 状态。 */
+  readonly type: "publication_pending";
+  /** 当前 action 的稳定 PENDING Publication Effect。 */
+  readonly publicationEffect: PendingPublicationEffect;
+  /** 授权当前 effect 的 exact Publication Approval Receipt。 */
+  readonly publicationReceipt: PublicationApprovalReceipt;
+};
+
+/** external write 已开始、重启时必须先对账的 Run 状态。 */
+export type PublicationExecutingRunState = PublicationResearchData &
+  PublicationStateData & {
+  /** 判别字段；普通 publish 不能从该状态盲目重放。 */
+  readonly type: "publication_executing";
+  /** 已开始执行但结果尚未结算的 exact action。 */
+  readonly publicationEffect: ExecutingPublicationEffect;
+  /** 授权当前 effect 的 exact Publication Approval Receipt。 */
+  readonly publicationReceipt: PublicationApprovalReceipt;
+};
+
+/** crash 后结果无法确定、等待显式 reconcile 的 Suspended Run。 */
+export type PublicationUnknownRunState = PublicationResearchData &
+  PublicationStateData & {
+  /** 判别字段；只有 reconcile command 可以推进。 */
+  readonly type: "publication_unknown";
+  /** 带稳定原因和原 execution identity 的 UNKNOWN effect。 */
+  readonly publicationEffect: UnknownPublicationEffect;
+  /** 授权当前 effect 的 exact Publication Approval Receipt。 */
+  readonly publicationReceipt: PublicationApprovalReceipt;
+};
+
+/** target 不同内容阻塞 publication、等待用户处理的 Suspended Run。 */
+export type PublicationConflictRunState = PublicationResearchData &
+  PublicationStateData & {
+  /** 判别字段；此状态绝不能覆盖现有 target。 */
+  readonly type: "publication_conflict";
+  /** 记录安全 target hash（若可得）的 CONFLICT effect。 */
+  readonly publicationEffect: ConflictingPublicationEffect;
+  /** 授权当前 effect 的 exact Publication Approval Receipt。 */
+  readonly publicationReceipt: PublicationApprovalReceipt;
+};
+
 /** 正常 publisher 返回且 `learning_artifact_published` 已 durably append 后的终态。 */
 export type CompletedRunState = PublicationResearchData &
   PublicationStateData & {
@@ -1366,6 +1495,8 @@ export type CompletedRunState = PublicationResearchData &
   readonly type: "completed";
   /** 授权这次 external publication 的 durable user-command receipt。 */
   readonly publicationReceipt: PublicationApprovalReceipt;
+  /** 已成功结算且不会再次执行的 Publication Effect。 */
+  readonly publicationEffect: SucceededPublicationEffect;
   /** 外部 publisher 成功后写入 Journal 的已发布内容 identity。 */
   readonly learningArtifact: PublishedLearningArtifact;
 };
@@ -1406,8 +1537,40 @@ export interface PublicationApprovedPayload {
   readonly publicationReceipt: PublicationApprovalReceipt;
 }
 
+/** `publication_effect_prepared` 事件携带的稳定 PENDING action。 */
+export interface PublicationEffectPreparedPayload {
+  /** 已绑定 run、approved draft 与 canonical target 的 durable effect。 */
+  readonly publicationEffect: PendingPublicationEffect;
+}
+
+/** `publication_effect_execution_started` 事件携带的 EXECUTING action。 */
+export interface PublicationEffectExecutionStartedPayload {
+  /** 从 exact PENDING effect 派生且 identity 不变的执行事实。 */
+  readonly publicationEffect: ExecutingPublicationEffect;
+}
+
+/** `publication_effect_unknown` 事件携带的 durable ambiguity。 */
+export interface PublicationEffectUnknownPayload {
+  /** 从 exact EXECUTING effect 派生的 UNKNOWN 事实。 */
+  readonly publicationEffect: UnknownPublicationEffect;
+}
+
+/** `publication_effect_conflicted` 事件携带的 no-clobber conflict。 */
+export interface PublicationEffectConflictedPayload {
+  /** 从 exact started effect 派生的 CONFLICT 事实。 */
+  readonly publicationEffect: ConflictingPublicationEffect;
+}
+
+/** `publication_effect_retry_scheduled` 把 missing target 安全恢复为 PENDING。 */
+export interface PublicationEffectRetryScheduledPayload {
+  /** 保持原 action identity/preparedAt 的 PENDING effect。 */
+  readonly publicationEffect: PendingPublicationEffect;
+}
+
 /** `learning_artifact_published` 事件携带的正常外部写入确认事实。 */
 export interface LearningArtifactPublishedPayload {
+  /** 本次成功 settlement 对应的完整 SUCCEEDED Publication Effect。 */
+  readonly publicationEffect: SucceededPublicationEffect;
   /** publisher 成功后得到的 exact target/content identity。 */
   readonly learningArtifact: PublishedLearningArtifact;
 }
@@ -1459,6 +1622,23 @@ export type ResearchRunEvent =
       LearningArtifactDraftProposedPayload
     >
   | RunEvent<"publication_approved", PublicationApprovedPayload>
+  | RunEvent<
+      "publication_effect_prepared",
+      PublicationEffectPreparedPayload
+    >
+  | RunEvent<
+      "publication_effect_execution_started",
+      PublicationEffectExecutionStartedPayload
+    >
+  | RunEvent<"publication_effect_unknown", PublicationEffectUnknownPayload>
+  | RunEvent<
+      "publication_effect_conflicted",
+      PublicationEffectConflictedPayload
+    >
+  | RunEvent<
+      "publication_effect_retry_scheduled",
+      PublicationEffectRetryScheduledPayload
+    >
   | RunEvent<
       "learning_artifact_published",
       LearningArtifactPublishedPayload
@@ -1605,6 +1785,10 @@ export interface RunTraceEvent {
   readonly evaluationHash?: string;
   /** 仅 publication approval 事件暴露的 durable receipt identity。 */
   readonly publicationApprovalId?: string;
+  /** Publication Effect lifecycle 事件暴露的稳定 action identity。 */
+  readonly publicationEffectId?: string;
+  /** Publication Effect lifecycle 事件暴露的封闭状态。 */
+  readonly publicationEffectStatus?: PublicationEffect["status"];
   /** 仅完成发布事件暴露的已写入 Markdown 内容 SHA-256。 */
   readonly learningArtifactSha256?: string;
   /** Retry Attempt 事件或原子成功事件对应的 Retry Sequence identity。 */

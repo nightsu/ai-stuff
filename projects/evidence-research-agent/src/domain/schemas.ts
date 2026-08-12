@@ -26,8 +26,13 @@ import type {
   PublicationApprovalBinding,
   PublicationApprovalSummary,
   PublicationApprovalReceipt,
+  ConflictingPublicationEffect,
+  ExecutingPublicationEffect,
+  PendingPublicationEffect,
   PublicationTarget,
   PublishedLearningArtifact,
+  SucceededPublicationEffect,
+  UnknownPublicationEffect,
   ReadSourceRequest,
   RetryPolicy,
   ResearchPlan,
@@ -477,6 +482,55 @@ const publishedLearningArtifactSchema = z
   .strict()
   .transform((artifact): PublishedLearningArtifact => artifact);
 
+const pendingPublicationEffectSchema = z.object({
+  effectId: z.string().regex(/^publication-effect:[a-f0-9]{64}$/),
+  runId: z.string().trim().min(1),
+  draftHash: sha256Schema,
+  targetCanonicalPath: z.string().min(1).refine(isAbsolute),
+  publicationApprovalId: z.string().trim().min(1),
+  status: z.literal("pending"),
+  preparedAt: z.iso.datetime(),
+}).strict().transform((effect): PendingPublicationEffect => effect);
+
+const publicationEffectIdentityFields = {
+  effectId: z.string().regex(/^publication-effect:[a-f0-9]{64}$/),
+  runId: z.string().trim().min(1),
+  draftHash: sha256Schema,
+  targetCanonicalPath: z.string().min(1).refine(isAbsolute),
+  publicationApprovalId: z.string().trim().min(1),
+  preparedAt: z.iso.datetime(),
+};
+
+const executingPublicationEffectSchema = z.object({
+  ...publicationEffectIdentityFields,
+  status: z.literal("executing"),
+  executionStartedAt: z.iso.datetime(),
+}).strict().transform((effect): ExecutingPublicationEffect => effect);
+
+const unknownPublicationEffectSchema = z.object({
+  ...publicationEffectIdentityFields,
+  status: z.literal("unknown"),
+  executionStartedAt: z.iso.datetime(),
+  unknownAt: z.iso.datetime(),
+  reason: z.enum(["interrupted_execution", "reconciliation_inconclusive"]),
+}).strict().transform((effect): UnknownPublicationEffect => effect);
+
+const conflictingPublicationEffectSchema = z.object({
+  ...publicationEffectIdentityFields,
+  status: z.literal("conflict"),
+  executionStartedAt: z.iso.datetime(),
+  conflictedAt: z.iso.datetime(),
+  observedTargetHash: sha256Schema.optional(),
+}).strict().transform((effect): ConflictingPublicationEffect => effect);
+
+const succeededPublicationEffectSchema = z.object({
+  ...publicationEffectIdentityFields,
+  status: z.literal("succeeded"),
+  executionStartedAt: z.iso.datetime(),
+  succeededAt: z.iso.datetime(),
+  settlement: z.enum(["direct", "reconciled"]),
+}).strict().transform((effect): SucceededPublicationEffect => effect);
+
 const planApprovalBindingSchema = z
   .object({
     questionHash: sha256Schema,
@@ -791,6 +845,66 @@ const readyToPublishRunStateSchema = z.union([
   }).strict(),
 ]);
 
+const publicationPendingRunStateSchema = z.union([
+  z.object({
+    type: z.literal("publication_pending"),
+    ...legacyExplicitPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: pendingPublicationEffectSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("publication_pending"),
+    ...researchLoopPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: pendingPublicationEffectSchema,
+  }).strict(),
+]);
+
+const publicationExecutingRunStateSchema = z.union([
+  z.object({
+    type: z.literal("publication_executing"),
+    ...legacyExplicitPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: executingPublicationEffectSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("publication_executing"),
+    ...researchLoopPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: executingPublicationEffectSchema,
+  }).strict(),
+]);
+
+const publicationUnknownRunStateSchema = z.union([
+  z.object({
+    type: z.literal("publication_unknown"),
+    ...legacyExplicitPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: unknownPublicationEffectSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("publication_unknown"),
+    ...researchLoopPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: unknownPublicationEffectSchema,
+  }).strict(),
+]);
+
+const publicationConflictRunStateSchema = z.union([
+  z.object({
+    type: z.literal("publication_conflict"),
+    ...legacyExplicitPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: conflictingPublicationEffectSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("publication_conflict"),
+    ...researchLoopPublicationFields,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: conflictingPublicationEffectSchema,
+  }).strict(),
+]);
+
 const pausableRunStateSchema = z.union([
   researchingRunStateSchema,
   researchCompleteRunStateSchema,
@@ -882,16 +996,22 @@ const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
     proposedAt: z.iso.datetime(),
   }).strict(),
   readyToPublishRunStateSchema,
+  publicationPendingRunStateSchema,
+  publicationExecutingRunStateSchema,
+  publicationUnknownRunStateSchema,
+  publicationConflictRunStateSchema,
   z.object({
     type: z.literal("completed"),
     ...legacyExplicitPublicationFields,
     publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: succeededPublicationEffectSchema,
     learningArtifact: publishedLearningArtifactSchema,
   }).strict(),
   z.object({
     type: z.literal("completed"),
     ...researchLoopPublicationFields,
     publicationReceipt: publicationApprovalReceiptSchema,
+    publicationEffect: succeededPublicationEffectSchema,
     learningArtifact: publishedLearningArtifactSchema,
   }).strict(),
   z.object({
@@ -968,6 +1088,7 @@ const runStateSchema: z.ZodType<ResearchRunState> = z.lazy(() => z.union([
         proposedAt: z.iso.datetime(),
       }).strict(),
       readyToPublishRunStateSchema,
+      publicationPendingRunStateSchema,
       z.object({
         type: z.literal("user_paused"),
         suspendedState: pausableRunStateSchema,
@@ -1043,6 +1164,41 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
         .strict(),
     })
     .strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("publication_effect_prepared"),
+    payload: z.object({
+      publicationEffect: pendingPublicationEffectSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("publication_effect_execution_started"),
+    payload: z.object({
+      publicationEffect: executingPublicationEffectSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("publication_effect_unknown"),
+    payload: z.object({
+      publicationEffect: unknownPublicationEffectSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("publication_effect_conflicted"),
+    payload: z.object({
+      publicationEffect: conflictingPublicationEffectSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("publication_effect_retry_scheduled"),
+    payload: z.object({
+      publicationEffect: pendingPublicationEffectSchema,
+    }).strict(),
+  }).strict(),
   z
     .object({
       ...eventEnvelopeSchema,
@@ -1213,6 +1369,7 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
       type: z.literal("learning_artifact_published"),
       payload: z
         .object({
+          publicationEffect: succeededPublicationEffectSchema,
           learningArtifact: publishedLearningArtifactSchema,
         })
         .strict(),

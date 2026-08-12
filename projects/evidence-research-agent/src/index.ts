@@ -58,6 +58,7 @@ export { runCli } from "./cli.js";
 export { PrivateRuntimeHomeError } from "./infrastructure/private-runtime-home.js";
 export {
   LearningArtifactPublishError,
+  PublicationTargetConflictError,
   PublicationTargetPreparationError,
 } from "./infrastructure/learning-artifact-publisher.js";
 export { EvidenceGateError, evaluateEvidenceGate } from "./domain/evidence-gate.js";
@@ -100,6 +101,7 @@ export type {
   OpenRuntimeOptions,
   ProposeLearningArtifactCommand,
   PublishLearningArtifactCommand,
+  ReconcilePublicationEffectCommand,
   RetryEvaluatorReviewCommand,
   SkipEvaluatorReviewCommand,
   PauseRunCommand,
@@ -109,6 +111,7 @@ export type {
   RebuildRunProjectionCommand,
   ResearchLoopLifecycleHooks,
   RunOperationLifecycleHooks,
+  PublicationEffectLifecycleHooks,
   ResumeRunCommand,
   TraceRunCommand,
 } from "./application/research-agent-runtime.js";
@@ -178,10 +181,20 @@ export type {
   PublicationAdvisoryWarning,
   PublicationHardGateSummary,
   PublicationApprovalReceipt,
+  PublicationEffect,
+  PendingPublicationEffect,
+  ExecutingPublicationEffect,
+  UnknownPublicationEffect,
+  ConflictingPublicationEffect,
+  SucceededPublicationEffect,
   PublicationEvaluation,
   PublicationTarget,
   PublishedLearningArtifact,
   ReadyToPublishRunState,
+  PublicationPendingRunState,
+  PublicationExecutingRunState,
+  PublicationUnknownRunState,
+  PublicationConflictRunState,
   WaitingPublicationApprovalRunState,
   WaitingEvaluatorResolutionRunState,
 } from "./domain/types.js";

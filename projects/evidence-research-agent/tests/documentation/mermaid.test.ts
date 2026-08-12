@@ -12,7 +12,7 @@ const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 it("parses every architecture Mermaid block", async () => {
   const diagrams = extractMermaidDiagrams(await readArchitecture());
 
-  expect(diagrams).toHaveLength(3);
+  expect(diagrams).toHaveLength(4);
   for (const diagram of diagrams) {
     await expect(mermaid.parse(diagram)).resolves.toBeTruthy();
   }
@@ -64,7 +64,9 @@ it("documents the bounded Research Loop and its publication handoff", async () =
   expect(markdown).toContain("Gate --> Renderer");
   expect(markdown).toContain("Renderer --> Draft");
   expect(markdown).toContain("Draft --> Approval");
-  expect(markdown).toContain("Approval --> Publisher");
+  expect(markdown).toContain("Approval --> Effect");
+  expect(markdown).toContain("Effect --> Publisher");
+  expect(markdown).toContain("Publisher --> Effect");
   expect(markdown).toContain('Control["pause / resume / cancel<br/>extend-budget"]');
   expect(markdown).toContain("Control --> Journal");
   expect(markdown).toContain("Output Root");
@@ -96,8 +98,15 @@ it("documents the bounded Research Loop and its publication handoff", async () =
     /^\s*waiting_publication_approval\s*-->\s*ready_to_publish\s*:\s*publication_approved\s*$/m,
   );
   expect(stateDiagram).toMatch(
-    /^\s*ready_to_publish\s*-->\s*completed\s*:\s*learning_artifact_published\s*$/m,
+    /^\s*ready_to_publish\s*-->\s*publication_pending\s*:\s*publication_effect_prepared\s*$/m,
   );
+  expect(stateDiagram).toMatch(
+    /^\s*publication_pending\s*-->\s*publication_executing\s*:\s*publication_effect_execution_started\s*$/m,
+  );
+  expect(markdown).toContain("UNKNOWN --> SUCCEEDED: reconcile matching target");
+  expect(markdown).toContain("UNKNOWN --> PENDING: reconcile missing target / safe retry");
+  expect(markdown).toContain("UNKNOWN --> CONFLICT: reconcile different target bytes");
+  expect(markdown).toContain("SUCCEEDED --> [*]");
   expect(stateDiagram).toMatch(
     /^\s*researching\s*-->\s*user_paused\s*:\s*run_paused\s*$/m,
   );

@@ -143,6 +143,9 @@ export class RunCancellationPendingError extends Error {}
 /** cancellation request 竞争时发现 Run 已先进入 terminal state。 */
 export class RunCancellationTerminalError extends Error {}
 
+/** cancellation request 竞争时发现 Publication Effect outcome 尚未结算。 */
+export class RunCancellationUnsettledPublicationError extends Error {}
+
 export class SourceSnapshotRegistrationError extends Error {
   public constructor() {
     super("Source Snapshot registry 完整性校验失败");
@@ -542,10 +545,17 @@ export class SqliteRunStore {
         projection.state.type === "completed" ||
         projection.state.type === "failed"
       ) {
+        throw new RunCancellationTerminalError();
+      }
+      if (
+        projection.state.type === "publication_executing" ||
+        projection.state.type === "publication_unknown" ||
+        projection.state.type === "publication_conflict"
+      ) {
         // request insert 与 Journal append 都用 IMMEDIATE 短事务排序：若 terminal
         // event 先提交，取消不能留下永远无法消费的 control-plane 残留；若 request
         // 先提交，appendEvents 的 pending-request fence 会让取消先结算。
-        throw new RunCancellationTerminalError();
+        throw new RunCancellationUnsettledPublicationError();
       }
       const existing = this.#readCancellationRequestRow(request.runId);
       if (existing !== undefined) return cancellationRequestFromRow(existing);

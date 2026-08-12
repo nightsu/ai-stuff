@@ -1,8 +1,8 @@
 # Evidence Research Agent
 
-这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #13：除确定性的 Scripted Model、OpenAI-compatible live adapter、durable Run control 与完整 Claim-to-Evidence lineage Gate 外，Harness 还用独立 `EvaluatorPort` 对已通过 Gate 的 Claims/cited Evidence 做 advisory review，并生成 publish-ready Learning Artifact。
+这是一个以学习 Agent 工程为目的的本地 TypeScript 项目。当前完成到 Issue #14：除确定性的 Scripted Model、OpenAI-compatible live adapter、durable Run control、完整 Claim-to-Evidence lineage Gate 与独立 Evaluator Review 外，Learning Artifact publication 已成为可跨崩溃恢复的 durable Publication Effect。
 
-当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。同一 Model Turn 开头连续、已通过顺序 preflight 的 `search_sources` / `read_source` 会按 `safeReadConcurrency` 有界并发；状态型工具仍严格顺序执行。Evaluator 使用单独的 versioned prompt，只看到用户问题、选中 Claims 和各自 cited Evidence 摘录，不接收 Model View、Run Journal 或 Research Loop history。`read-source` CLI、publication CLI 与 publication crash reconciliation 仍属于后续 tickets。
+当前 Research Loop 已包含 `search_sources`、`read_source`、`record_evidence`、`propose_claim` 与 `complete_research`，并支持对显式标记的基础设施瞬时失败执行有界 retry。同一 Model Turn 开头连续、已通过顺序 preflight 的 `search_sources` / `read_source` 会按 `safeReadConcurrency` 有界并发；状态型工具仍严格顺序执行。Evaluator 使用单独的 versioned prompt，只看到用户问题、选中 Claims 和各自 cited Evidence 摘录，不接收 Model View、Run Journal 或 Research Loop history。CLI 已提供显式 `reconcile` 命令；跨进程推进 Research Loop 与完整 publication approval/publish 演示由毕业 ticket 继续补齐。
 
 ## 快速开始：创建并批准计划
 
@@ -94,6 +94,22 @@ await runtime.skipEvaluatorReview({ runId: waiting.runId });
 ```
 
 publication approval 状态会同时展示已通过的 hard Evidence Gate 摘要与 advisory warnings；receipt 除 exact draft/target 外，还绑定 review artifact hash 或 explicit skip identity hash。真正发布前 Runtime 会再次读取并校验 Source Snapshots 和 reviewed JSON Artifact；任一 CAS bytes 缺失、篡改或 verdict coverage/order 不一致都保持 `ready_to_publish` 并 fail closed。Trace 暴露安全的 evaluator failure、input/model/prompt identity、review artifact 或 skip identity，不包含 prompt 输入正文、provider payload 或 credential。
+
+## Durable Publication Effect 与 reconcile
+
+`publishLearningArtifact` 先把稳定 effect identity 作为 PENDING 写入 Run Journal，再写入 EXECUTING，最后执行同目录 temporary-file + atomic hard-link no-clobber publication。identity 由 Run、approved draft hash 与 canonical target path 派生；重启、missing retry 与 conflict resolution 都复用同一 identity。
+
+进程在 final bytes 可见后、success settlement 前崩溃时，Run 保持 `publication_executing`。恢复必须显式调用：
+
+```bash
+node dist/src/cli.js reconcile \
+  --runtime-home .runtime \
+  --output-root "$PWD/learning-artifacts" \
+  --run-id <run-id> \
+  --json
+```
+
+reconcile 先持久化 UNKNOWN，再重新验证 Publication Approval、CAS Snapshot/review bytes、Output Root 与 target identity：matching target 结算为 `completed` 且不重写；missing target 回到 `publication_pending` 供同 effect retry；different bytes 进入 `publication_conflict` 且绝不覆盖；无法可靠判断则保持 `publication_unknown`。普通 publish 不能从 EXECUTING、UNKNOWN 或 CONFLICT 盲目重放。PENDING 尚未声明 external execution，因此取消仍可先成为 terminal fact；EXECUTING、UNKNOWN 与 CONFLICT 的外部 outcome 尚未安全结算，取消会被拒绝。
 
 记下 `runId`，通过 `inspect` 读取 `state.approvalBinding.bindingHash`，再原样提交：
 
@@ -348,12 +364,14 @@ pnpm exec vitest run tests/runtime/learning-artifact-publication.test.ts
 - Evaluator Port 只接收用户问题、最终展示顺序的 Claims 与各自 cited Evidence；每个 Claim 必须恰好得到一个同序封闭 verdict。失败后的 retry 保持 exact input/proposal/target，显式 skip 只记录用户 identity，不生成 review 或 verdict。publication approval projection 同时公开 hard Gate pass 摘要和由 review/skip 派生的 advisory warnings。
 - `outputRoot` 是 Runtime 打开时显式配置、且与 private Runtime Home 不重叠的 canonical 目录。private Markdown draft 的 hash、Output Root identity、canonical target path 和目标父目录 `device`/`inode` 共同构成 publication binding。任何 binding、root 或 parent identity 变化都会使旧 approval 失效。
 - normal publish 不覆盖不同既有内容：publisher 使用同目录 `0600` temporary file、fsync 和 atomic hard-link no-clobber publication。真正写出前会再次从私有 CAS 验证 approved draft 的完整 Snapshot lineage 与 reviewed JSON Artifact；draft/approval 后任一私有 bytes 缺失或篡改会保持 `ready_to_publish` 并 fail closed。已有文件若字节完全一致则幂等成功；final symlink、非文件、不同字节或父目录替换同样会被拒绝。
+- Publication Effect 以 Run Journal facts 表达 PENDING、EXECUTING、UNKNOWN、CONFLICT 与 SUCCEEDED；Run Operation lease 只表达 command ownership，不能代替外部 effect outcome。prepare、PENDING retry 与 reconcile 每次都重验 exact approval action。matching target 不重写，missing target 保留 effect identity，different target 永不覆盖，inconclusive inspection 持久保留 UNKNOWN。
+- 一旦 effect 进入 EXECUTING，取消请求会被拒绝，直到显式 reconcile 把 outcome 结算为 SUCCEEDED、PENDING 或仍需用户处理的状态；这防止 terminal `cancelled` 永久掩盖可能已发生的外部写入。
 
 ## Journal、Trace 与恢复边界
 
 Run Journal 是 canonical history；Projection cache、Model View 和 Trace 都可丢弃并重建。Trace 按顺序保留 Retry Attempts、completed Model Turns、轻量工具 observations、来源读取的 observation/tool call/Snapshot、Evidence、Claim kind/Evidence IDs、Evidence Gate repair code、research completion/budget/retry suspension、terminal failure、draft、publication receipt 与最终 Markdown SHA-256；search 行正文只存在于被引用的私有 Artifact，并只在最近 Model View 窗口按需展开。`ResearchLoopLifecycleHooks` 在 attempt started、Model Turn 以及五个 Research Tool 的命名 durable seam 注入中断：attempt started 后的中断证明未完成 I/O 可以跨重启分类并按 policy 恢复；search/read 还覆盖 CAS Artifact/Snapshot 写入后与 Journal 事务提交后；Evidence/Claim/completion 覆盖 Journal commit 前后。成功事实若 SQLite commit 失败，命令只返回稳定错误，Journal 中仍只有 `in_progress` attempt；它不会声称 Model Turn 已持久化。`complete_research` 若在同一时刻暴露预算耗尽，会把 `research_completed` 与 `run_budget_exhausted` 放进一个 SQLite event batch，崩溃无法留下 exhausted 但可发布的单独 `research_complete`。Trace 不包含绝对来源路径、私有 Runtime Home、search 行正文、provider payload 或 OS 错误。
 
-`publication_approved` 只表示用户授权了精确 draft/target，状态为 `ready_to_publish`。重启不会自动写文件；只有显式 `publishLearningArtifact` 成功返回后才追加 `learning_artifact_published` 并进入 `completed`。如果进程在外部写入尝试和该 Journal 事件之间崩溃，当前实现不会把“文件可能存在”猜成完成；完整 effect crash reconciliation 留给 Issue #14。
+`publication_approved` 只表示用户授权了精确 draft/target，状态为 `ready_to_publish`。重启不会自动写文件；显式 publish 依次进入 PENDING 和 EXECUTING，只有 direct settlement 或显式 reconcile 的 matching settlement 才追加 `learning_artifact_published` 并进入 `completed`。命名 fault points 覆盖 prepare、temporary write、atomic publication、success settlement 与 reconciliation 的前后边界。
 
 Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE)`。来源读取和 target publication 都使用 symlink 拒绝、`O_NOFOLLOW`、file-handle/parent identity 复核，对稳定可观测变化 fail closed；它们不承诺隔离 hostile same-user concurrent rename。
 
@@ -366,7 +384,7 @@ Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE
 - `src/infrastructure/private-source-access.ts`：canonical Source Scope、handle 读取与 Snapshot 前的 policy boundary。
 - `src/infrastructure/sqlite-run-store.ts`：Journal、Projection cache、Source Snapshot registry 与通用 artifact registry 的事务对应关系。
 - `src/infrastructure/learning-artifact-publisher.ts`：target identity、same-directory no-clobber atomic publication 与不同内容拒绝。
-- `tests/runtime/learning-artifact-publication.test.ts`：独立 ScriptedModel/ScriptedEvaluator happy path、Evaluator retry/skip、CAS tamper、Gate、target identity 与 Trace lineage。
+- `tests/runtime/learning-artifact-publication.test.ts`：独立 ScriptedModel/ScriptedEvaluator happy path、Evaluator retry/skip、CAS tamper、Publication Effect fault matrix、matching/missing/conflict/UNKNOWN reconcile 与 Trace lineage。
 - `tests/runtime/research-loop.test.ts`：五工具多轮 happy path、重启后 pending intent 恢复、search port/artifact 边界、replay 防篡改、错误 observation、五维预算暂停、steering/pinned Model View 与确定性裁剪。
 - `tests/runtime/retry-policy.test.ts`：Model/Search transient retry、provider hint、attempt lineage、policy approval/restart、崩溃恢复、普通失败、schema/permanent/invariant failure、wall-time 与 SQLite commit failure。
 - `tests/runtime/run-control.test.ts`：pause/resume、预算版本扩展、terminal cancellation、stream/pending tool/completed result race 与 Suspended Run 取消矩阵。
@@ -375,4 +393,4 @@ Node.js 24 没有可移植的 `openat`/`openat2` 与 `renameat2(RENAME_NOREPLACE
 
 ## 尚未实现
 
-- Issue #14：publication 外部 effect 的 durable operation、crash reconciliation 与精确恢复协议。
+- Issue #15：完整毕业 fault matrix、版本化真实模型 eval，以及所有 CLI 命令的端到端毕业演示。

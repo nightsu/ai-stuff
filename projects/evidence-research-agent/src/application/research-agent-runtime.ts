@@ -36,6 +36,14 @@ import {
   calculateLearningArtifactToolUsage,
   renderLearningArtifact,
 } from "../domain/learning-artifact.js";
+import {
+  createPendingPublicationEffect,
+  markPublicationEffectConflict,
+  markPublicationEffectUnknown,
+  retryPendingPublicationEffect,
+  startPublicationEffect,
+  succeedPublicationEffect,
+} from "../domain/publication-effect.js";
 import { hasPreRenderedCitationToken } from "../domain/citation-safety.js";
 import { buildRunTrace, reduceRunEvents } from "../domain/reducer.js";
 import {
@@ -55,6 +63,11 @@ import type {
   LearningArtifactProposal,
   PublicationApprovalReceipt,
   PublicationTarget,
+  PublicationPendingRunState,
+  PublicationExecutingRunState,
+  PublicationUnknownRunState,
+  PublicationConflictRunState,
+  ReadyToPublishRunState,
   ResearchRunEvent,
   PersistedSourceSnapshot,
   PersistedArtifact,
@@ -97,6 +110,7 @@ import {
   ConcurrentRunWriteError,
   RunCancellationPendingError,
   RunCancellationTerminalError,
+  RunCancellationUnsettledPublicationError,
   RunNotFoundError,
   RunOperationBusyError,
   SourceSnapshotRegistrationError,
@@ -105,6 +119,7 @@ import {
 import { preparePrivateRuntimeHome } from "../infrastructure/private-runtime-home.js";
 import {
   LearningArtifactPublisher,
+  PublicationTargetConflictError,
   PublicationTargetPreparationError,
 } from "../infrastructure/learning-artifact-publisher.js";
 import { RgSourceSearch } from "../infrastructure/private-source-search.js";
@@ -157,6 +172,32 @@ export interface OpenRuntimeOptions {
   readonly sourceAccessHooks?: SourceAccessLifecycleHooks;
   /** Run Operation durable seam 的可选命名中断点。 */
   readonly runOperationHooks?: RunOperationLifecycleHooks;
+  /** Publication Effect prepare/write/settlement 的可选命名故障注入点。 */
+  readonly publicationEffectHooks?: PublicationEffectLifecycleHooks;
+}
+
+/** Publication Effect durable lifecycle 的命名故障注入点。 */
+export interface PublicationEffectLifecycleHooks {
+  /** PENDING effect 写入 Journal 前运行；中断时不得留下 effect fact。 */
+  readonly beforeEffectPrepared?: () => void | Promise<void>;
+  /** PENDING effect 已 durable append、任何 external publication 尚未开始后运行。 */
+  readonly afterEffectPrepared?: () => void | Promise<void>;
+  /** 同目录 temporary file 已创建、approved bytes 尚未写入前运行。 */
+  readonly beforeTemporaryWrite?: () => void | Promise<void>;
+  /** temporary bytes 与 file fsync 已完成、final name 尚不可见时运行。 */
+  readonly afterTemporaryWrite?: () => void | Promise<void>;
+  /** durable temporary file 已就绪、no-clobber atomic publication 前运行。 */
+  readonly beforeAtomicPublish?: () => void | Promise<void>;
+  /** final approved bytes 已可见且 parent directory 已 fsync 后运行。 */
+  readonly afterAtomicPublish?: () => void | Promise<void>;
+  /** external outcome 已确定、SUCCEEDED settlement 尚未写入 Journal 前运行。 */
+  readonly beforeSuccessSettlement?: () => void | Promise<void>;
+  /** SUCCEEDED settlement 已 durable append、命令尚未返回调用方前运行。 */
+  readonly afterSuccessSettlement?: () => void | Promise<void>;
+  /** 显式 reconcile 已持久化 UNKNOWN、读取 target outcome 前运行。 */
+  readonly beforeReconciliation?: () => void | Promise<void>;
+  /** target inspection 已完成、对应 settlement 尚未写入 Journal 前运行。 */
+  readonly afterReconciliation?: () => void | Promise<void>;
 }
 
 /** Run Operation control-plane 的命名故障注入点。 */
@@ -301,7 +342,13 @@ export interface ApprovePublicationCommand {
 
 /** 在 durable publication approval 后执行一次正常 no-clobber 写入的应用命令。 */
 export interface PublishLearningArtifactCommand {
-  /** 当前必须处于 ready_to_publish 的 Research Run identity。 */
+  /** 当前必须处于 ready_to_publish 或 publication_pending 的 Run identity。 */
+  readonly runId: string;
+}
+
+/** 对 crash window 中的 durable Publication Effect 执行一次显式安全对账。 */
+export interface ReconcilePublicationEffectCommand {
+  /** 当前必须处于 publication_executing、unknown 或 conflict 的 Run identity。 */
   readonly runId: string;
 }
 
@@ -680,6 +727,8 @@ const publishLearningArtifactCommandSchema = z
   })
   .strict();
 
+const reconcilePublicationEffectCommandSchema = publishLearningArtifactCommandSchema;
+
 const evaluatorResolutionCommandSchema = z.object({
   runId: z.string().trim().min(1),
   abortSignal: z.custom<AbortSignal>(
@@ -923,6 +972,8 @@ export class ResearchAgentRuntime {
   readonly #sourceAccessHooks: SourceAccessLifecycleHooks;
   /** durable control-plane seam 的可选命名中断点。 */
   readonly #runOperationHooks: RunOperationLifecycleHooks;
+  /** Publication Effect prepare/write/settlement 的命名故障注入点。 */
+  readonly #publicationEffectHooks: PublicationEffectLifecycleHooks;
   /** 只允许同一异步 command chain 的嵌套 mutation 复用当前 lease。 */
   readonly #operationContext = new AsyncLocalStorage<RunOperationLease>();
   /** 当前 Runtime 进程内由 `advanceResearch` 持有的 provider cancellation controllers。 */
@@ -976,6 +1027,9 @@ export class ResearchAgentRuntime {
     });
     this.#runOperationHooks = Object.freeze({
       ...(options.runOperationHooks ?? {}),
+    });
+    this.#publicationEffectHooks = Object.freeze({
+      ...(options.publicationEffectHooks ?? {}),
     });
   }
 
@@ -4221,12 +4275,334 @@ export class ResearchAgentRuntime {
     if (current.state.type === "completed") {
       return current;
     }
-    if (current.state.type !== "ready_to_publish") {
+    if (
+      current.state.type !== "ready_to_publish" &&
+      current.state.type !== "publication_pending"
+    ) {
       throw new IllegalLearningArtifactPublicationStateError();
     }
+    if (current.state.type === "ready_to_publish") {
+      await this.#renderApprovedPublication(current, current.state);
+      try {
+        await this.#publicationEffectHooks.beforeEffectPrepared?.();
+      } catch {
+        throw new LearningArtifactPublicationError();
+      }
+      const preparedAt = this.#clock.now();
+      const publicationEffect = createPendingPublicationEffect({
+        runId,
+        draftHash: current.state.draftArtifact.sha256,
+        publicationTarget: current.state.publicationTarget,
+        publicationReceipt: current.state.publicationReceipt,
+        preparedAt,
+      });
+      current = this.#appendEvents(runId, current.lastEventSequence, [{
+        eventId: this.#ids.nextEventId(),
+        runId,
+        sequence: current.lastEventSequence + 1,
+        type: "publication_effect_prepared",
+        occurredAt: preparedAt,
+        payload: { publicationEffect },
+      }]);
+      try {
+        await this.#publicationEffectHooks.afterEffectPrepared?.();
+      } catch {
+        // hook 模拟进程在 durable prepare 之后消失；effect identity 已进入 Journal，
+        // 因此公开错误不能把它退回 ready 或暗示外部写入已经发生。
+        throw new LearningArtifactPublicationError();
+      }
+      const cancelled = this.#consumePendingCancellationForActiveOperation(runId);
+      if (cancelled !== undefined) return cancelled;
+      current = this.#store.readProjection(runId);
+      if (current.state.type === "cancelled") return current;
+    }
+    if (current.state.type !== "publication_pending") {
+      throw new LearningArtifactPublicationError();
+    }
     const ready = current.state;
-    let markdown: string;
+    const markdown = await this.#renderApprovedPublication(current, ready);
+    const executionStartedAt = this.#clock.now();
+    const executingEffect = startPublicationEffect(
+      ready.publicationEffect,
+      executionStartedAt,
+    );
     try {
+      current = this.#appendEvents(runId, current.lastEventSequence, [{
+        eventId: this.#ids.nextEventId(),
+        runId,
+        sequence: current.lastEventSequence + 1,
+        type: "publication_effect_execution_started",
+        occurredAt: executionStartedAt,
+        payload: { publicationEffect: executingEffect },
+      }]);
+    } catch (error) {
+      if (error instanceof RunCancellationPendingError) {
+        const cancelled = this.#consumePendingCancellationForActiveOperation(
+          runId,
+        );
+        if (cancelled !== undefined) return cancelled;
+      }
+      if (error instanceof ConcurrentRunWriteError) {
+        const persisted = this.#store.readProjection(runId);
+        if (persisted.state.type === "cancelled") return persisted;
+      }
+      throw new LearningArtifactPublicationError();
+    }
+    if (current.state.type !== "publication_executing") {
+      throw new LearningArtifactPublicationError();
+    }
+    const executing = current.state;
+    try {
+      await this.#publisher.publish(executing.publicationTarget, markdown, {
+        ...(this.#publicationEffectHooks.beforeTemporaryWrite === undefined
+          ? {}
+          : { beforeTemporaryWrite:
+              this.#publicationEffectHooks.beforeTemporaryWrite }),
+        ...(this.#publicationEffectHooks.afterTemporaryWrite === undefined
+          ? {}
+          : { afterTemporaryWrite:
+              this.#publicationEffectHooks.afterTemporaryWrite }),
+        ...(this.#publicationEffectHooks.beforeAtomicPublish === undefined
+          ? {}
+          : { beforeAtomicPublish:
+              this.#publicationEffectHooks.beforeAtomicPublish }),
+        ...(this.#publicationEffectHooks.afterAtomicPublish === undefined
+          ? {}
+          : { afterAtomicPublish:
+              this.#publicationEffectHooks.afterAtomicPublish }),
+      });
+      await this.#publicationEffectHooks.beforeSuccessSettlement?.();
+    } catch (error) {
+      if (error instanceof PublicationTargetConflictError) {
+        const conflictedAt = this.#clock.now();
+        return this.#appendEvents(runId, current.lastEventSequence, [{
+          eventId: this.#ids.nextEventId(),
+          runId,
+          sequence: current.lastEventSequence + 1,
+          type: "publication_effect_conflicted",
+          occurredAt: conflictedAt,
+          payload: {
+            publicationEffect: markPublicationEffectConflict(
+              executing.publicationEffect,
+              conflictedAt,
+              error.observedTargetHash,
+            ),
+          },
+        }]);
+      }
+      // publisher 的内部诊断可能暴露私有路径；public seam 只返回稳定错误。
+      throw new LearningArtifactPublicationError();
+    }
+
+    const publishedAt = this.#clock.now();
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "learning_artifact_published",
+      occurredAt: publishedAt,
+      payload: {
+        publicationEffect: succeedPublicationEffect(
+          executing.publicationEffect,
+          publishedAt,
+          "direct",
+        ),
+        learningArtifact: {
+          targetCanonicalPath: executing.publicationTarget.targetCanonicalPath,
+          sha256: executing.draftArtifact.sha256,
+          publishedAt,
+        },
+      },
+    };
+    try {
+      const completed = this.#appendEvents(
+        runId,
+        current.lastEventSequence,
+        [event],
+      );
+      // settlement 已成为 canonical Journal fact；此后即使命令进程消失，重启
+      // 也只能返回 completed，绝不能再次调用 publisher 或重新解释外部 outcome。
+      await this.#publicationEffectHooks.afterSuccessSettlement?.();
+      return completed;
+    } catch {
+      throw new LearningArtifactPublicationError();
+    }
+  }
+
+  public async reconcilePublicationEffect(
+    command: ReconcilePublicationEffectCommand,
+  ): Promise<RunProjection> {
+    const parsed = reconcilePublicationEffectCommandSchema.safeParse(command);
+    if (!parsed.success) throw new InvalidLearningArtifactCommandError();
+    return this.#withRunOperation(
+      parsed.data.runId,
+      "reconcile_publication_effect",
+      () => this.#reconcilePublicationEffect(parsed.data.runId),
+    );
+  }
+
+  async #reconcilePublicationEffect(runId: string): Promise<RunProjection> {
+    let current: RunProjection;
+    try {
+      current = this.#store.readProjection(runId);
+    } catch {
+      throw new LearningArtifactPublicationError();
+    }
+    if (current.state.type === "completed") return current;
+    if (
+      current.state.type !== "publication_executing" &&
+      current.state.type !== "publication_unknown" &&
+      current.state.type !== "publication_conflict"
+    ) {
+      throw new IllegalLearningArtifactPublicationStateError();
+    }
+
+    if (current.state.type === "publication_executing") {
+      const unknownAt = this.#clock.now();
+      current = this.#appendEvents(runId, current.lastEventSequence, [{
+        eventId: this.#ids.nextEventId(),
+        runId,
+        sequence: current.lastEventSequence + 1,
+        type: "publication_effect_unknown",
+        occurredAt: unknownAt,
+        payload: {
+          publicationEffect: markPublicationEffectUnknown(
+            current.state.publicationEffect,
+            unknownAt,
+            "interrupted_execution",
+          ),
+        },
+      }]);
+    }
+    if (
+      current.state.type !== "publication_unknown" &&
+      current.state.type !== "publication_conflict"
+    ) {
+      throw new LearningArtifactPublicationError();
+    }
+    // Reconcile 和首次执行使用同一 approved-byte reconstruction；先把 crash
+    // ambiguity durable 化，再重验 Receipt 所绑定的 CAS、review、Output Root 和
+    // target identity。重验失败会保持 UNKNOWN，绝不把旧批准当作新 action 权限。
+    const markdown = await this.#renderApprovedPublication(
+      current,
+      current.state,
+      "reconciliation",
+    );
+    try {
+      await this.#publicationEffectHooks.beforeReconciliation?.();
+      const inspection = await this.#publisher.inspectTarget(
+        current.state.publicationTarget,
+        markdown,
+      );
+      await this.#publicationEffectHooks.afterReconciliation?.();
+      const settledAt = this.#clock.now();
+      if (inspection.kind === "matching") {
+        const succeeded = succeedPublicationEffect(
+          current.state.publicationEffect,
+          settledAt,
+          "reconciled",
+        );
+        return this.#appendEvents(runId, current.lastEventSequence, [{
+          eventId: this.#ids.nextEventId(),
+          runId,
+          sequence: current.lastEventSequence + 1,
+          type: "learning_artifact_published",
+          occurredAt: settledAt,
+          payload: {
+            publicationEffect: succeeded,
+            learningArtifact: {
+              targetCanonicalPath: current.state.publicationTarget
+                .targetCanonicalPath,
+              sha256: current.state.draftArtifact.sha256,
+              publishedAt: settledAt,
+            },
+          },
+        }]);
+      }
+      if (inspection.kind === "missing") {
+        return this.#appendEvents(runId, current.lastEventSequence, [{
+          eventId: this.#ids.nextEventId(),
+          runId,
+          sequence: current.lastEventSequence + 1,
+          type: "publication_effect_retry_scheduled",
+          occurredAt: settledAt,
+          payload: {
+            publicationEffect: retryPendingPublicationEffect(
+              current.state.publicationEffect,
+            ),
+          },
+        }]);
+      }
+      if (inspection.kind === "conflict") {
+        if (
+          current.state.type === "publication_conflict" &&
+          current.state.publicationEffect.observedTargetHash ===
+            inspection.observedTargetHash
+        ) {
+          return current;
+        }
+        return this.#appendEvents(runId, current.lastEventSequence, [{
+          eventId: this.#ids.nextEventId(),
+          runId,
+          sequence: current.lastEventSequence + 1,
+          type: "publication_effect_conflicted",
+          occurredAt: settledAt,
+          payload: {
+            publicationEffect: markPublicationEffectConflict(
+              current.state.publicationEffect,
+              settledAt,
+              inspection.observedTargetHash,
+            ),
+          },
+        }]);
+      }
+      return this.#appendEvents(runId, current.lastEventSequence, [{
+        eventId: this.#ids.nextEventId(),
+        runId,
+        sequence: current.lastEventSequence + 1,
+        type: "publication_effect_unknown",
+        occurredAt: settledAt,
+        payload: {
+          publicationEffect: markPublicationEffectUnknown(
+            current.state.publicationEffect,
+            settledAt,
+            "reconciliation_inconclusive",
+          ),
+        },
+      }]);
+    } catch {
+      throw new LearningArtifactPublicationError();
+    }
+  }
+
+  /**
+   * effect prepare 与每次恢复执行前都重新构造 exact approved bytes。审批只授权
+   * identity，不保证私有 CAS 或 Output Root 在命令执行时仍完整可用。
+   */
+  async #renderApprovedPublication(
+    current: RunProjection,
+    ready:
+      | ReadyToPublishRunState
+      | PublicationPendingRunState
+      | PublicationExecutingRunState
+      | PublicationUnknownRunState
+      | PublicationConflictRunState,
+    targetValidation: "execution" | "reconciliation" = "execution",
+  ): Promise<string> {
+    try {
+      if (targetValidation === "execution") {
+        const currentTarget = await this.#publisher.prepareTarget(
+          ready.publicationTarget.targetCanonicalPath,
+        );
+        if (!publicationTargetsEqual(currentTarget, ready.publicationTarget)) {
+          throw new LearningArtifactPublicationError();
+        }
+      } else {
+        // Reconcile 必须重验 approval 所绑定的 root/parent identity，但 final
+        // target 可能恰好是 symlink、directory 或瞬态不可读；这些不是 stale
+        // approval，而是 inspection 应持久化为 UNKNOWN 的 external outcome。
+        await this.#publisher.validateTargetIdentity(ready.publicationTarget);
+      }
       const gate = evaluateEvidenceGate(
         ready.proposal,
         ready.claims,
@@ -4266,7 +4642,7 @@ export class ResearchAgentRuntime {
           throw new LearningArtifactPublicationError();
         }
       }
-      markdown = renderLearningArtifact(
+      const markdown = renderLearningArtifact(
         ready.proposal,
         gate,
         ready.evaluation,
@@ -4287,36 +4663,9 @@ export class ResearchAgentRuntime {
       ) {
         throw new LearningArtifactPublicationError();
       }
-      await this.#publisher.publish(ready.publicationTarget, markdown);
+      return markdown;
     } catch {
-      // renderer、Gate 与 publisher 的内部诊断都可能暴露私有内容或路径；public
-      // seam 统一映射为稳定错误，且不改变已获批准的 waiting Projection。
-      throw new LearningArtifactPublicationError();
-    }
-
-    const publishedAt = this.#clock.now();
-    const event: ResearchRunEvent = {
-      eventId: this.#ids.nextEventId(),
-      runId,
-      sequence: current.lastEventSequence + 1,
-      type: "learning_artifact_published",
-      occurredAt: publishedAt,
-      payload: {
-        learningArtifact: {
-          targetCanonicalPath: ready.publicationTarget.targetCanonicalPath,
-          sha256: ready.draftArtifact.sha256,
-          publishedAt,
-        },
-      },
-    };
-    try {
-      return this.#appendEvents(runId, current.lastEventSequence, [event]);
-    } catch (error) {
-      if (error instanceof ConcurrentRunWriteError) {
-        // 外部 bytes 已经 no-clobber 发布，后续显式相同 publish 会先验证精确 bytes
-        // 再安全重试 Journal append；runtime restart 不会自动猜测该 effect 已完成。
-        throw new LearningArtifactPublicationError();
-      }
+      // renderer、Gate、CAS 与 target 的内部诊断都可能暴露私有内容或路径。
       throw new LearningArtifactPublicationError();
     }
   }
@@ -4362,7 +4711,17 @@ export class ResearchAgentRuntime {
     const { runId } = runIdentityCommandSchema.parse(command);
     const current = this.#store.readProjection(runId);
     if (current.state.type === "cancelled") return current;
-    if (current.state.type === "completed" || current.state.type === "failed") {
+    if (
+      current.state.type === "publication_executing" ||
+      current.state.type === "publication_unknown" ||
+      current.state.type === "publication_conflict"
+    ) {
+      throw new Error("Publication Effect outcome 未结算，不能取消");
+    }
+    if (
+      current.state.type === "completed" ||
+      current.state.type === "failed"
+    ) {
       throw new Error("terminal Run 不能再次取消");
     }
     await this.#runOperationHook(
@@ -4380,6 +4739,9 @@ export class ResearchAgentRuntime {
     } catch (error) {
       if (error instanceof RunCancellationTerminalError) {
         throw new Error("terminal Run 不能再次取消");
+      }
+      if (error instanceof RunCancellationUnsettledPublicationError) {
+        throw new Error("Publication Effect outcome 未结算，不能取消");
       }
       throw error;
     }
@@ -4434,6 +4796,13 @@ export class ResearchAgentRuntime {
   ): RunProjection {
     const current = this.#store.readProjection(request.runId);
     if (current.state.type === "cancelled") return current;
+    if (
+      current.state.type === "publication_executing" ||
+      current.state.type === "publication_unknown" ||
+      current.state.type === "publication_conflict"
+    ) {
+      throw new Error("Publication Effect outcome 未结算，不能取消");
+    }
     const occurredAt = this.#clock.now();
     const cancelled = this.#appendEvents(request.runId, current.lastEventSequence, [{
       eventId: this.#ids.nextEventId(),
@@ -4767,5 +5136,19 @@ function isDeepEqualEvaluatorIdentity(
     left.provider === right.provider &&
     left.model === right.model &&
     left.promptVersion === right.promptVersion
+  );
+}
+
+function publicationTargetsEqual(
+  left: PublicationTarget,
+  right: PublicationTarget,
+): boolean {
+  return (
+    left.outputRootCanonicalPath === right.outputRootCanonicalPath &&
+    left.outputRootDevice === right.outputRootDevice &&
+    left.outputRootInode === right.outputRootInode &&
+    left.targetCanonicalPath === right.targetCanonicalPath &&
+    left.parentDevice === right.parentDevice &&
+    left.parentInode === right.parentInode
   );
 }

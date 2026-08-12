@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -137,6 +137,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
       runtimeHome: fixture.runtimeHome,
       outputRoot: fixture.outputDirectory,
       ids: createIds(100),
+      clock: fixedPublicationClock(),
       model,
       evaluator,
     });
@@ -197,6 +198,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
       runtimeHome: fixture.runtimeHome,
       outputRoot: fixture.outputDirectory,
       ids: createIds(150),
+      clock: fixedPublicationClock(),
       model: new ScriptedModel([], [{
         title: "Closed evaluator verdicts",
         summary: "非法 verdict 不能进入 publication state。",
@@ -243,6 +245,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
       runtimeHome: fixture.runtimeHome,
       outputRoot: fixture.outputDirectory,
       ids: createIds(200),
+      clock: fixedPublicationClock(),
       model: new ScriptedModel([], [{
         title: "Explicit skip",
         summary: "用户可审计地跳过 advisory review。",
@@ -330,6 +333,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
       runtimeHome: fixture.runtimeHome,
       outputRoot: fixture.outputDirectory,
       ids: createIds(300),
+      clock: fixedPublicationClock(),
       model: new ScriptedModel([], [{
         title: "Evaluator control",
         summary: "Evaluator wait 是独立 suspended state。",
@@ -364,6 +368,8 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
     const restarted = ResearchAgentRuntime.open({
       runtimeHome: fixture.runtimeHome,
       outputRoot: fixture.outputDirectory,
+      ids: createIds(350),
+      clock: fixedPublicationClock(),
       model: new ScriptedModel([]),
     });
     try {
@@ -799,7 +805,7 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         "tool-call-001",
       );
       const trace = await restarted.traceRun({ runId: fixture.runId });
-      expect(trace.events.slice(-5)).toEqual([
+      expect(trace.events.slice(-7)).toEqual([
         expect.objectContaining({
           type: "evidence_recorded",
           evidenceId: "evidence-event-006",
@@ -815,6 +821,14 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
         expect.objectContaining({
           type: "publication_approved",
           publicationApprovalId: expect.stringMatching(/^approval-/),
+        }),
+        expect.objectContaining({
+          type: "publication_effect_prepared",
+          publicationEffectStatus: "pending",
+        }),
+        expect.objectContaining({
+          type: "publication_effect_execution_started",
+          publicationEffectStatus: "executing",
         }),
         expect.objectContaining({
           type: "learning_artifact_published",
@@ -1221,6 +1235,880 @@ describe("ResearchAgentRuntime Learning Artifact publication", () => {
     }
   });
 
+  it("recovers the same durable Publication Effect after preparation commits", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "prepared-effect.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+    let interruptOnce = true;
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(100),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        afterEffectPrepared: () => {
+          if (!interruptOnce) return;
+          interruptOnce = false;
+          throw new Error("simulated process interruption");
+        },
+      },
+    });
+
+    try {
+      await expect(
+        interrupted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Publication Effect|Learning Artifact/);
+      const pending = await interrupted.inspectRun({ runId: fixture.runId });
+      expect(pending.state).toMatchObject({
+        type: "publication_pending",
+        publicationEffect: {
+          effectId: expect.stringMatching(/^publication-effect:[a-f0-9]{64}$/),
+          runId: fixture.runId,
+          draftHash: waiting.state.draftArtifact.sha256,
+          targetCanonicalPath: waiting.state.publicationTarget.targetCanonicalPath,
+          status: "pending",
+        },
+      });
+      const trace = await interrupted.traceRun({ runId: fixture.runId });
+      expect(trace.events.at(-1)).toMatchObject({
+        type: "publication_effect_prepared",
+        stateAfter: "publication_pending",
+        publicationEffectId:
+          (pending.state.type === "publication_pending"
+            ? pending.state.publicationEffect.effectId
+            : undefined),
+        publicationEffectStatus: "pending",
+      });
+    } finally {
+      interrupted.close();
+    }
+  });
+
+  it("lets a durable cancellation win before a PENDING Publication Effect starts external execution", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "cancel-pending-effect.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+
+    let publishingRuntime: ResearchAgentRuntime;
+    publishingRuntime = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(150),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        afterEffectPrepared: async () => {
+          await publishingRuntime.cancelRun({ runId: fixture.runId });
+        },
+      },
+    });
+    try {
+      const cancelled = await publishingRuntime.publishLearningArtifact({
+        runId: fixture.runId,
+      });
+      expect(cancelled.state).toMatchObject({
+        type: "cancelled",
+        cancelledState: {
+          type: "publication_pending",
+          publicationEffect: { status: "pending" },
+        },
+      });
+      const trace = await publishingRuntime.traceRun({ runId: fixture.runId });
+      expect(trace.events.map((event) => event.type)).not.toContain(
+        "publication_effect_execution_started",
+      );
+      await expect(stat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      publishingRuntime.close();
+    }
+  });
+
+  it("reconciles a crash after atomic publication as success without rewriting matching target bytes", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "reconciled-success.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(200),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        afterAtomicPublish: () => {
+          throw new Error("simulated crash after final publication");
+        },
+      },
+    });
+    let effectId: string;
+    try {
+      await expect(
+        interrupted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Publication Effect|Learning Artifact/);
+      const executing = await interrupted.inspectRun({ runId: fixture.runId });
+      expect(executing.state).toMatchObject({
+        type: "publication_executing",
+        publicationEffect: {
+          status: "executing",
+          effectId: expect.stringMatching(/^publication-effect:[a-f0-9]{64}$/),
+        },
+      });
+      if (executing.state.type !== "publication_executing") {
+        throw new Error("测试要求 executing Publication Effect");
+      }
+      effectId = executing.state.publicationEffect.effectId;
+      await expect(
+        interrupted.cancelRun({ runId: fixture.runId }),
+      ).rejects.toThrow(/Publication Effect/);
+      await expect(
+        interrupted.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "publication_executing",
+          publicationEffect: { effectId },
+        },
+      });
+    } finally {
+      interrupted.close();
+    }
+
+    const beforeReconcile = await stat(targetPath, { bigint: true });
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(300),
+      clock: fixedPublicationClock(),
+    });
+    try {
+      const completed = await restarted.reconcilePublicationEffect({
+        runId: fixture.runId,
+      });
+      expect(completed.state).toMatchObject({
+        type: "completed",
+        publicationEffect: {
+          status: "succeeded",
+          effectId,
+          settlement: "reconciled",
+        },
+      });
+      const afterReconcile = await stat(targetPath, { bigint: true });
+      expect(afterReconcile.ino).toBe(beforeReconcile.ino);
+      expect(afterReconcile.mtimeNs).toBe(beforeReconcile.mtimeNs);
+      const trace = await restarted.traceRun({ runId: fixture.runId });
+      expect(trace.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "publication_effect_execution_started",
+          publicationEffectId: effectId,
+          publicationEffectStatus: "executing",
+        }),
+        expect.objectContaining({
+          type: "publication_effect_unknown",
+          publicationEffectId: effectId,
+          publicationEffectStatus: "unknown",
+        }),
+        expect.objectContaining({
+          type: "learning_artifact_published",
+          publicationEffectId: effectId,
+          publicationEffectStatus: "succeeded",
+        }),
+      ]));
+      expect(formatRunTrace(trace, "human")).toContain(
+        `publication-effect=${effectId} publication-effect-status=succeeded`,
+      );
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("retries a missing target with the same Publication Effect identity", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "reconciled-retry.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(400),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        afterAtomicPublish: async () => {
+          await rm(targetPath);
+          throw new Error("simulated lost target before settlement");
+        },
+      },
+    });
+    let effectId: string;
+    try {
+      await expect(
+        interrupted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Publication Effect|Learning Artifact/);
+      const executing = await interrupted.inspectRun({ runId: fixture.runId });
+      if (executing.state.type !== "publication_executing") {
+        throw new Error("测试要求 executing Publication Effect");
+      }
+      effectId = executing.state.publicationEffect.effectId;
+    } finally {
+      interrupted.close();
+    }
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(500),
+      clock: fixedPublicationClock(),
+    });
+    try {
+      const pending = await restarted.reconcilePublicationEffect({
+        runId: fixture.runId,
+      });
+      expect(pending.state).toMatchObject({
+        type: "publication_pending",
+        publicationEffect: { status: "pending", effectId },
+      });
+      const completed = await restarted.publishLearningArtifact({
+        runId: fixture.runId,
+      });
+      expect(completed.state).toMatchObject({
+        type: "completed",
+        publicationEffect: { status: "succeeded", effectId },
+      });
+      await expect(readFile(targetPath, "utf8")).resolves.toContain(
+        "# Journal 的可恢复性",
+      );
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("persists a no-clobber conflict when reconciliation finds different target bytes", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "reconciled-conflict.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(600),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        afterAtomicPublish: async () => {
+          await writeFile(targetPath, "# Other writer\n", "utf8");
+          throw new Error("simulated target replacement before settlement");
+        },
+      },
+    });
+    try {
+      await expect(
+        interrupted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Publication Effect|Learning Artifact/);
+    } finally {
+      interrupted.close();
+    }
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(700),
+      clock: fixedPublicationClock(),
+    });
+    try {
+      const conflicted = await restarted.reconcilePublicationEffect({
+        runId: fixture.runId,
+      });
+      expect(conflicted.state).toMatchObject({
+        type: "publication_conflict",
+        publicationEffect: {
+          status: "conflict",
+          observedTargetHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+      });
+      await expect(
+        restarted.cancelRun({ runId: fixture.runId }),
+      ).rejects.toThrow(/Publication Effect/);
+      await expect(readFile(targetPath, "utf8")).resolves.toBe(
+        "# Other writer\n",
+      );
+      await expect(
+        restarted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/当前 Research Run 状态/);
+      const effectId = conflicted.state.type === "publication_conflict"
+        ? conflicted.state.publicationEffect.effectId
+        : undefined;
+      await rm(targetPath);
+      await mkdir(targetPath);
+      const unknown = await restarted.reconcilePublicationEffect({
+        runId: fixture.runId,
+      });
+      expect(unknown.state).toMatchObject({
+        type: "publication_unknown",
+        publicationEffect: {
+          status: "unknown",
+          effectId,
+          reason: "reconciliation_inconclusive",
+        },
+      });
+      await expect(
+        restarted.cancelRun({ runId: fixture.runId }),
+      ).rejects.toThrow(/Publication Effect/);
+      await rm(targetPath, { recursive: true });
+      const pending = await restarted.reconcilePublicationEffect({
+        runId: fixture.runId,
+      });
+      expect(pending.state).toMatchObject({
+        type: "publication_pending",
+        publicationEffect: { status: "pending", effectId },
+      });
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("enters CONFLICT during direct execution when the approved target already has different bytes", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "direct-conflict.md");
+    await writeFile(targetPath, "# Existing\n", "utf8");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    try {
+      const conflicted = await fixture.runtime.publishLearningArtifact({
+        runId: fixture.runId,
+      });
+      expect(conflicted.state).toMatchObject({
+        type: "publication_conflict",
+        publicationEffect: { status: "conflict" },
+      });
+      await expect(readFile(targetPath, "utf8")).resolves.toBe(
+        "# Existing\n",
+      );
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("keeps UNKNOWN durable when reconciliation cannot safely classify the target", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "reconciled-unknown.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(800),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        afterAtomicPublish: () => {
+          throw new Error("simulated crash after final publication");
+        },
+      },
+    });
+    try {
+      await expect(
+        interrupted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Publication Effect|Learning Artifact/);
+    } finally {
+      interrupted.close();
+    }
+
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(900),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        beforeReconciliation: async () => {
+          await rm(targetPath);
+          await mkdir(targetPath);
+        },
+      },
+    });
+    try {
+      const unknown = await restarted.reconcilePublicationEffect({
+        runId: fixture.runId,
+      });
+      expect(unknown.state).toMatchObject({
+        type: "publication_unknown",
+        publicationEffect: {
+          status: "unknown",
+          reason: "reconciliation_inconclusive",
+        },
+      });
+      const trace = await restarted.traceRun({ runId: fixture.runId });
+      expect(trace.events.slice(-2)).toEqual([
+        expect.objectContaining({
+          type: "publication_effect_unknown",
+          publicationEffectStatus: "unknown",
+        }),
+        expect.objectContaining({
+          type: "publication_effect_unknown",
+          publicationEffectStatus: "unknown",
+        }),
+      ]);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("fails reconciliation closed when the approved target identity changed", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "stale-reconcile.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(1000),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        afterAtomicPublish: () => {
+          throw new Error("simulated crash after final publication");
+        },
+      },
+    });
+    try {
+      await expect(
+        interrupted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Publication Effect|Learning Artifact/);
+    } finally {
+      interrupted.close();
+    }
+
+    const movedOutput = `${fixture.outputDirectory}-before-replace`;
+    await rename(fixture.outputDirectory, movedOutput);
+    await mkdir(fixture.outputDirectory);
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(1100),
+      clock: fixedPublicationClock(),
+    });
+    try {
+      await expect(
+        restarted.reconcilePublicationEffect({ runId: fixture.runId }),
+      ).rejects.toThrow(/Learning Artifact/);
+      const unknown = await restarted.inspectRun({ runId: fixture.runId });
+      expect(unknown.state).toMatchObject({
+        type: "publication_unknown",
+        publicationEffect: { status: "unknown" },
+      });
+    } finally {
+      restarted.close();
+      await rm(fixture.outputDirectory, { force: true, recursive: true });
+      await rename(movedOutput, fixture.outputDirectory);
+    }
+  });
+
+  it("revalidates Publication Approval before retrying a PENDING effect", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(fixture.outputDirectory, "stale-pending.md");
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(1200),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        afterEffectPrepared: () => {
+          throw new Error("simulated crash after prepare");
+        },
+      },
+    });
+    try {
+      await expect(
+        interrupted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Learning Artifact/);
+    } finally {
+      interrupted.close();
+    }
+
+    const movedOutput = `${fixture.outputDirectory}-pending-before-replace`;
+    await rename(fixture.outputDirectory, movedOutput);
+    await mkdir(fixture.outputDirectory);
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(1300),
+      clock: fixedPublicationClock(),
+    });
+    try {
+      await expect(
+        restarted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Learning Artifact/);
+      const pending = await restarted.inspectRun({ runId: fixture.runId });
+      expect(pending.state.type).toBe("publication_pending");
+    } finally {
+      restarted.close();
+      await rm(fixture.outputDirectory, { force: true, recursive: true });
+      await rename(movedOutput, fixture.outputDirectory);
+    }
+  });
+
+  it.each([
+    ["beforeEffectPrepared", "ready_to_publish"],
+    ["afterEffectPrepared", "publication_pending"],
+    ["beforeTemporaryWrite", "publication_executing"],
+    ["afterTemporaryWrite", "publication_executing"],
+    ["beforeAtomicPublish", "publication_executing"],
+    ["afterAtomicPublish", "publication_executing"],
+    ["beforeSuccessSettlement", "publication_executing"],
+  ] as const)(
+    "recovers the durable state after the %s publication fault point",
+    async (faultPoint, expectedState) => {
+      const fixture = await createEvidenceReadyRun();
+      const targetPath = join(
+        fixture.outputDirectory,
+        `fault-${faultPoint}.md`,
+      );
+      const waiting = await fixture.runtime.proposeLearningArtifact({
+        runId: fixture.runId,
+        targetPath,
+      });
+      if (waiting.state.type !== "waiting_publication_approval") {
+        throw new Error("测试夹具要求等待 publication approval");
+      }
+      await fixture.runtime.approvePublication({
+        runId: fixture.runId,
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      });
+      fixture.runtime.close();
+
+      const interrupted = ResearchAgentRuntime.open({
+        runtimeHome: fixture.runtimeHome,
+        outputRoot: fixture.outputDirectory,
+        model: new ScriptedModel([]),
+        ids: createIds(1400),
+        clock: fixedPublicationClock(),
+        publicationEffectHooks: {
+          [faultPoint]: () => {
+            throw new Error(`simulated ${faultPoint}`);
+          },
+        },
+      });
+      try {
+        await expect(
+          interrupted.publishLearningArtifact({ runId: fixture.runId }),
+        ).rejects.toThrow(/Learning Artifact/);
+        const projection = await interrupted.inspectRun({
+          runId: fixture.runId,
+        });
+        expect(projection.state.type).toBe(expectedState);
+      } finally {
+        interrupted.close();
+      }
+
+      const restarted = ResearchAgentRuntime.open({
+        runtimeHome: fixture.runtimeHome,
+        outputRoot: fixture.outputDirectory,
+        model: new ScriptedModel([]),
+        ids: createIds(1500),
+        clock: fixedPublicationClock(),
+      });
+      try {
+        const current = await restarted.inspectRun({ runId: fixture.runId });
+        if (current.state.type === "completed") return;
+        if (current.state.type === "ready_to_publish") {
+          await expect(
+            restarted.publishLearningArtifact({ runId: fixture.runId }),
+          ).resolves.toMatchObject({ state: { type: "completed" } });
+          return;
+        }
+        if (current.state.type === "publication_pending") {
+          // temporary-file fault points leave no final name; a direct safe retry
+          // begins a fresh execution attempt under the same stable effect identity.
+          await expect(
+            restarted.publishLearningArtifact({ runId: fixture.runId }),
+          ).resolves.toMatchObject({ state: { type: "completed" } });
+          return;
+        }
+        const reconciled = await restarted.reconcilePublicationEffect({
+          runId: fixture.runId,
+        });
+        if (reconciled.state.type === "publication_pending") {
+          await expect(
+            restarted.publishLearningArtifact({ runId: fixture.runId }),
+          ).resolves.toMatchObject({ state: { type: "completed" } });
+        } else {
+          expect(reconciled.state.type).toBe("completed");
+        }
+      } finally {
+        restarted.close();
+      }
+    },
+  );
+
+  it("keeps SUCCEEDED terminal after the afterSuccessSettlement fault point", async () => {
+    const fixture = await createEvidenceReadyRun();
+    const targetPath = join(
+      fixture.outputDirectory,
+      "fault-afterSuccessSettlement.md",
+    );
+    const waiting = await fixture.runtime.proposeLearningArtifact({
+      runId: fixture.runId,
+      targetPath,
+    });
+    if (waiting.state.type !== "waiting_publication_approval") {
+      throw new Error("测试夹具要求等待 publication approval");
+    }
+    await fixture.runtime.approvePublication({
+      runId: fixture.runId,
+      bindingHash: waiting.state.publicationBinding.bindingHash,
+    });
+    fixture.runtime.close();
+
+    const interrupted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(1550),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        afterSuccessSettlement: () => {
+          throw new Error("simulated afterSuccessSettlement");
+        },
+      },
+    });
+    try {
+      await expect(
+        interrupted.publishLearningArtifact({ runId: fixture.runId }),
+      ).rejects.toThrow(/Learning Artifact/);
+      await expect(
+        interrupted.inspectRun({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "completed",
+          publicationEffect: { status: "succeeded" },
+        },
+      });
+    } finally {
+      interrupted.close();
+    }
+
+    const beforeRestart = await stat(targetPath, { bigint: true });
+    const restarted = ResearchAgentRuntime.open({
+      runtimeHome: fixture.runtimeHome,
+      outputRoot: fixture.outputDirectory,
+      model: new ScriptedModel([]),
+      ids: createIds(1575),
+      clock: fixedPublicationClock(),
+      publicationEffectHooks: {
+        beforeTemporaryWrite: () => {
+          throw new Error("completed effect must never execute again");
+        },
+      },
+    });
+    try {
+      await expect(
+        restarted.publishLearningArtifact({ runId: fixture.runId }),
+      ).resolves.toMatchObject({
+        state: {
+          type: "completed",
+          publicationEffect: { status: "succeeded" },
+        },
+      });
+      const afterRestart = await stat(targetPath, { bigint: true });
+      expect(afterRestart.ino).toBe(beforeRestart.ino);
+      expect(afterRestart.mtimeNs).toBe(beforeRestart.mtimeNs);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it.each(["beforeReconciliation", "afterReconciliation"] as const)(
+    "keeps UNKNOWN recoverable after the %s fault point",
+    async (faultPoint) => {
+      const fixture = await createEvidenceReadyRun();
+      const targetPath = join(
+        fixture.outputDirectory,
+        `fault-${faultPoint}.md`,
+      );
+      const waiting = await fixture.runtime.proposeLearningArtifact({
+        runId: fixture.runId,
+        targetPath,
+      });
+      if (waiting.state.type !== "waiting_publication_approval") {
+        throw new Error("测试夹具要求等待 publication approval");
+      }
+      await fixture.runtime.approvePublication({
+        runId: fixture.runId,
+        bindingHash: waiting.state.publicationBinding.bindingHash,
+      });
+      fixture.runtime.close();
+
+      const interruptedPublish = ResearchAgentRuntime.open({
+        runtimeHome: fixture.runtimeHome,
+        outputRoot: fixture.outputDirectory,
+        model: new ScriptedModel([]),
+        ids: createIds(1600),
+        clock: fixedPublicationClock(),
+        publicationEffectHooks: {
+          afterAtomicPublish: () => {
+            throw new Error("simulated crash before settlement");
+          },
+        },
+      });
+      try {
+        await expect(
+          interruptedPublish.publishLearningArtifact({ runId: fixture.runId }),
+        ).rejects.toThrow(/Learning Artifact/);
+      } finally {
+        interruptedPublish.close();
+      }
+
+      const interruptedReconcile = ResearchAgentRuntime.open({
+        runtimeHome: fixture.runtimeHome,
+        outputRoot: fixture.outputDirectory,
+        model: new ScriptedModel([]),
+        ids: createIds(1700),
+        clock: fixedPublicationClock(),
+        publicationEffectHooks: {
+          [faultPoint]: () => {
+            throw new Error(`simulated ${faultPoint}`);
+          },
+        },
+      });
+      try {
+        await expect(
+          interruptedReconcile.reconcilePublicationEffect({
+            runId: fixture.runId,
+          }),
+        ).rejects.toThrow(/Learning Artifact/);
+        const unknown = await interruptedReconcile.inspectRun({
+          runId: fixture.runId,
+        });
+        expect(unknown.state).toMatchObject({
+          type: "publication_unknown",
+          publicationEffect: { status: "unknown" },
+        });
+      } finally {
+        interruptedReconcile.close();
+      }
+
+      const restarted = ResearchAgentRuntime.open({
+        runtimeHome: fixture.runtimeHome,
+        outputRoot: fixture.outputDirectory,
+        model: new ScriptedModel([]),
+        ids: createIds(1800),
+        clock: fixedPublicationClock(),
+      });
+      try {
+        await expect(
+          restarted.reconcilePublicationEffect({ runId: fixture.runId }),
+        ).resolves.toMatchObject({ state: { type: "completed" } });
+      } finally {
+        restarted.close();
+      }
+    },
+  );
+
   it("rejects a direct replay that recomputes a binding around a forged draft hash", async () => {
     const fixture = await createEvidenceReadyRun();
     await fixture.runtime.proposeLearningArtifact({
@@ -1381,11 +2269,12 @@ async function createEvidenceReadyRun(options: {
     "utf8",
   );
   const ids = createIds();
+  const clock = options.clock ?? fixedPublicationClock();
   const evaluator = new ScriptedEvaluator();
   const runtime = ResearchAgentRuntime.open({
     runtimeHome,
     outputRoot: outputDirectory,
-    ...(options.clock === undefined ? {} : { clock: options.clock }),
+    clock,
     ids,
     model: new ScriptedModel(
       [
@@ -1552,6 +2441,10 @@ function createIds(startAt = 0): IdGenerator {
     nextObservationId: () =>
       `observation-${String(++observation).padStart(3, "0")}`,
   };
+}
+
+function fixedPublicationClock(): Clock {
+  return { now: () => "2026-08-12T18:18:52.000Z" };
 }
 
 function createTemporaryDirectory(prefix: string): Promise<string> {

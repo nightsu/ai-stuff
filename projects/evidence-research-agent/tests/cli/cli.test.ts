@@ -289,6 +289,33 @@ it("extends an exhausted Run Budget through the CLI", async () => {
   expect(errorOutput).toEqual([]);
 });
 
+it("reconciles a durable Publication Effect through the CLI", async () => {
+  const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
+  const outputRoot = await mkdtemp(join(tmpdir(), "evidence-agent-cli-output-"));
+  runtimeHomes.push(runtimeHome, outputRoot);
+  const output: string[] = [];
+  const errors: string[] = [];
+  const io: CliIo = {
+    stdout: (line) => output.push(line),
+    stderr: (line) => errors.push(line),
+  };
+
+  // CLI graduation path only owns the explicit reconcile boundary; the richer
+  // evidence fixture that creates EXECUTING is covered through ResearchAgentRuntime.
+  expect(await runCli([
+    "reconcile",
+    "--runtime-home",
+    runtimeHome,
+    "--output-root",
+    outputRoot,
+    "--run-id",
+    "missing-run",
+    "--json",
+  ], io)).toBe(1);
+  expect(output).toEqual([]);
+  expect(errors).toHaveLength(1);
+});
+
 it("fails safely when live-model environment is incomplete before opening Runtime Home", async () => {
   const runtimeHome = await mkdtemp(join(tmpdir(), "evidence-agent-cli-"));
   runtimeHomes.push(runtimeHome);

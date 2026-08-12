@@ -40,6 +40,14 @@ import {
   renderLearningArtifact,
 } from "./learning-artifact.js";
 import {
+  createPendingPublicationEffect,
+  markPublicationEffectConflict,
+  markPublicationEffectUnknown,
+  retryPendingPublicationEffect,
+  startPublicationEffect,
+  succeedPublicationEffect,
+} from "./publication-effect.js";
+import {
   sourcePathPolicyDenial,
   sourceRequestDenial,
 } from "./source-policy.js";
@@ -883,9 +891,14 @@ function applyRunEvent(
       if (
         current.state.type === "completed" ||
         current.state.type === "failed" ||
-        current.state.type === "cancelled"
+        current.state.type === "cancelled" ||
+        current.state.type === "publication_executing" ||
+        current.state.type === "publication_unknown" ||
+        current.state.type === "publication_conflict"
       ) {
-        throw new IllegalRunEventError("terminal Run 不能再次取消");
+        throw new IllegalRunEventError(
+          "terminal 或 outcome-ambiguous Publication Effect 不能取消",
+        );
       }
       return {
         ...current,
@@ -1156,11 +1169,164 @@ function applyRunEvent(
         updatedAt: event.occurredAt,
       };
     }
-    case "learning_artifact_published": {
+    case "publication_effect_prepared": {
       if (current.state.type !== "ready_to_publish") {
         throw new IllegalRunEventError(
-          "只有 ready_to_publish Run 可以确认 Learning Artifact 已发布",
+          "只有 ready_to_publish Run 可以 prepare Publication Effect",
         );
+      }
+      const expected = createPendingPublicationEffect({
+        runId: current.runId,
+        draftHash: current.state.draftArtifact.sha256,
+        publicationTarget: current.state.publicationTarget,
+        publicationReceipt: current.state.publicationReceipt,
+        preparedAt: event.occurredAt,
+      });
+      if (!isDeepStrictEqual(event.payload.publicationEffect, expected)) {
+        throw new IllegalRunEventError("Publication Effect identity 无效");
+      }
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "publication_pending",
+          publicationEffect: event.payload.publicationEffect,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "publication_effect_execution_started": {
+      if (current.state.type !== "publication_pending") {
+        throw new IllegalRunEventError(
+          "只有 publication_pending Run 可以开始 Publication Effect",
+        );
+      }
+      const expected = startPublicationEffect(
+        current.state.publicationEffect,
+        event.occurredAt,
+      );
+      if (!isDeepStrictEqual(event.payload.publicationEffect, expected)) {
+        throw new IllegalRunEventError("Publication Effect execution identity 无效");
+      }
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "publication_executing",
+          publicationEffect: event.payload.publicationEffect,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "publication_effect_unknown": {
+      if (
+        current.state.type !== "publication_executing" &&
+        current.state.type !== "publication_unknown" &&
+        current.state.type !== "publication_conflict"
+      ) {
+        throw new IllegalRunEventError(
+          "只有 started Publication Effect 可以进入 UNKNOWN",
+        );
+      }
+      const expected = markPublicationEffectUnknown(
+        current.state.publicationEffect,
+        event.occurredAt,
+        event.payload.publicationEffect.reason,
+      );
+      if (!isDeepStrictEqual(event.payload.publicationEffect, expected)) {
+        throw new IllegalRunEventError("Publication Effect UNKNOWN identity 无效");
+      }
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "publication_unknown",
+          publicationEffect: event.payload.publicationEffect,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "publication_effect_conflicted": {
+      if (
+        current.state.type !== "publication_executing" &&
+        current.state.type !== "publication_unknown" &&
+        current.state.type !== "publication_conflict"
+      ) {
+        throw new IllegalRunEventError(
+          "只有 started Publication Effect 可以进入 CONFLICT",
+        );
+      }
+      const expected = markPublicationEffectConflict(
+        current.state.publicationEffect,
+        event.occurredAt,
+        event.payload.publicationEffect.observedTargetHash,
+      );
+      if (!isDeepStrictEqual(event.payload.publicationEffect, expected)) {
+        throw new IllegalRunEventError("Publication Effect conflict identity 无效");
+      }
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "publication_conflict",
+          publicationEffect: event.payload.publicationEffect,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "publication_effect_retry_scheduled": {
+      if (
+        current.state.type !== "publication_unknown" &&
+        current.state.type !== "publication_conflict"
+      ) {
+        throw new IllegalRunEventError(
+          "只有 UNKNOWN 或 CONFLICT Publication Effect 可以安全 retry",
+        );
+      }
+      const expected = retryPendingPublicationEffect(
+        current.state.publicationEffect,
+      );
+      if (!isDeepStrictEqual(event.payload.publicationEffect, expected)) {
+        throw new IllegalRunEventError("Publication Effect retry identity 无效");
+      }
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "publication_pending",
+          publicationEffect: event.payload.publicationEffect,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "learning_artifact_published": {
+      if (
+        current.state.type !== "publication_executing" &&
+        current.state.type !== "publication_unknown" &&
+        current.state.type !== "publication_conflict"
+      ) {
+        throw new IllegalRunEventError(
+          "只有 started Publication Effect 可以确认 Learning Artifact 已发布",
+        );
+      }
+      const expected = succeedPublicationEffect(
+        current.state.publicationEffect,
+        event.occurredAt,
+        event.payload.publicationEffect.settlement,
+      );
+      if (
+        !isDeepStrictEqual(event.payload.publicationEffect, expected) ||
+        (current.state.type === "publication_executing" &&
+          event.payload.publicationEffect.settlement !== "direct") ||
+        (current.state.type !== "publication_executing" &&
+          event.payload.publicationEffect.settlement !== "reconciled")
+      ) {
+        throw new IllegalRunEventError("Publication Effect settlement identity 无效");
       }
       validatePublishedLearningArtifact(
         current.state.draftArtifact,
@@ -1173,6 +1339,7 @@ function applyRunEvent(
         state: {
           ...current.state,
           type: "completed",
+          publicationEffect: event.payload.publicationEffect,
           learningArtifact: event.payload.learningArtifact,
         },
         lastEventSequence: event.sequence,
@@ -1527,6 +1694,8 @@ function traceLineage(
   | "evaluatorSkipId"
   | "evaluationHash"
   | "publicationApprovalId"
+  | "publicationEffectId"
+  | "publicationEffectStatus"
   | "learningArtifactSha256"
   | "retrySequenceId"
   | "retrySequenceKind"
@@ -1663,8 +1832,24 @@ function traceLineage(
   if (event.type === "publication_approved") {
     return { publicationApprovalId: event.payload.publicationReceipt.approvalId };
   }
+  if (
+    event.type === "publication_effect_prepared" ||
+    event.type === "publication_effect_execution_started" ||
+    event.type === "publication_effect_unknown" ||
+    event.type === "publication_effect_conflicted" ||
+    event.type === "publication_effect_retry_scheduled"
+  ) {
+    return {
+      publicationEffectId: event.payload.publicationEffect.effectId,
+      publicationEffectStatus: event.payload.publicationEffect.status,
+    };
+  }
   if (event.type === "learning_artifact_published") {
-    return { learningArtifactSha256: event.payload.learningArtifact.sha256 };
+    return {
+      publicationEffectId: event.payload.publicationEffect.effectId,
+      publicationEffectStatus: "succeeded",
+      learningArtifactSha256: event.payload.learningArtifact.sha256,
+    };
   }
   return {};
 }

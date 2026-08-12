@@ -80,6 +80,12 @@ export function formatRunTrace(
         event.publicationApprovalId === undefined
           ? undefined
           : `publication-approval=${event.publicationApprovalId}`,
+        event.publicationEffectId === undefined
+          ? undefined
+          : `publication-effect=${event.publicationEffectId}`,
+        event.publicationEffectStatus === undefined
+          ? undefined
+          : `publication-effect-status=${event.publicationEffectStatus}`,
         event.learningArtifactSha256 === undefined
           ? undefined
           : `published-sha256=${event.learningArtifactSha256}`,

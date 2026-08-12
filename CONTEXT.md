@@ -140,6 +140,10 @@ _Avoid_: Approved flag, user confirmation, permanent permission
 The durable, content-addressed action that writes one approved Learning Artifact to one approved target path. Its lifecycle distinguishes pending, executing, succeeded, unknown, and conflicting outcomes so recovery never blindly overwrites or replays a write.
 _Avoid_: File save, write tool, publication approval
 
+**Publication Reconciliation**:
+The explicit recovery command that revalidates the exact Publication Approval and safely inspects the approved target before settling an executing, unknown, or conflicting Publication Effect as succeeded, pending retry, conflicting, or still unknown.
+_Avoid_: Automatic replay, ordinary resume, overwrite retry
+
 **Learning Artifact**:
 The approved Markdown report produced by a Research Run, containing traceable conclusions, an Evidence Index, and a compact tool-usage summary. Full tool arguments, results, and runtime transitions remain in the separate Run Trace.
 _Avoid_: Final answer, chat response, transcript

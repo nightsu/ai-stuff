@@ -316,6 +316,37 @@ export async function runCli(
         }
         return 0;
       }
+      case "reconcile": {
+        const { values } = parseArgs({
+          args: commandArgs,
+          allowPositionals: false,
+          strict: true,
+          options: {
+            json: { type: "boolean", default: false },
+            "output-root": { type: "string" },
+            "run-id": { type: "string" },
+            "runtime-home": { type: "string" },
+          },
+        });
+        const runtime = ResearchAgentRuntime.open({
+          runtimeHome: resolve(
+            requireOption(values["runtime-home"], "--runtime-home"),
+          ),
+          outputRoot: resolve(
+            requireOption(values["output-root"], "--output-root"),
+          ),
+          model: new ScriptedModel([]),
+        });
+        try {
+          const projection = await runtime.reconcilePublicationEffect({
+            runId: requireOption(values["run-id"], "--run-id"),
+          });
+          io.stdout(formatProjection(projection, values.json));
+        } finally {
+          runtime.close();
+        }
+        return 0;
+      }
       default:
         throw new CliUsageError("命令参数无效");
     }

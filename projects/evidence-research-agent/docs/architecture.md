@@ -1,6 +1,6 @@
-# Evidence Research Agent 架构（Issue #13）
+# Evidence Research Agent 架构（Issue #14）
 
-当前 slice 在完整 Claim-to-Evidence Gate 之后增加独立 Evaluator Review：`EvaluatorPort` 只接收用户问题、Gate 选中的 Claims 与各自 cited Evidence 摘录；成功 review 写入私有 JSON CAS，失败进入 durable `waiting_evaluator_resolution`。retry 保持 exact proposal/input/target，显式 skip 记录用户事实但不伪造 verdict。最终 renderer 生成 publish-ready report，并把 review artifact hash 或 skip identity hash 绑定进 publication approval。
+当前 slice 把 publish-ready report 的最终写出升级为 durable Publication Effect。action identity 稳定绑定 Run、approved draft hash 与 canonical target path；Run Journal 区分 PENDING、EXECUTING、UNKNOWN、CONFLICT 与 SUCCEEDED。任何 crash window 都必须通过显式 `reconcilePublicationEffect` 检查 exact approved target bytes，绝不盲目重放或覆盖。
 
 外层 workflow 仍由 Harness 确定性控制。Research Model 与 Evaluator 都不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。Evaluator 也不能看到 Model View、Run Journal 或 Research Loop history。
 
@@ -61,6 +61,7 @@ flowchart LR
     Repair["Evidence Gate repairs<br/>stable code + action"]
     Draft["Private Markdown draft<br/>learning_artifact_draft_proposed"]
     Approval["User publication receipt<br/>publication_approved"]
+    Effect["Publication Effect facts<br/>PENDING / EXECUTING / UNKNOWN / CONFLICT / SUCCEEDED"]
   end
 
   Search --> Policy
@@ -112,8 +113,10 @@ flowchart LR
   Gate --> Renderer
   Renderer --> Draft
   Draft --> Approval
-  Approval --> Publisher
-  Publisher --> Journal
+  Approval --> Effect
+  Effect --> Publisher
+  Publisher --> Effect
+  Effect --> Journal
   Journal --> Trace
 ```
 
@@ -173,7 +176,18 @@ stateDiagram-v2
   waiting_evaluator_resolution --> waiting_publication_approval: learning_artifact_draft_proposed<br/>(review retry succeeded / explicit skip)
   research_complete --> waiting_publication_approval: learning_artifact_draft_proposed<br/>(review succeeded)
   waiting_publication_approval --> ready_to_publish: publication_approved
-  ready_to_publish --> completed: learning_artifact_published
+  ready_to_publish --> publication_pending: publication_effect_prepared
+  publication_pending --> publication_executing: publication_effect_execution_started
+  publication_executing --> completed: learning_artifact_published (direct)
+  publication_executing --> publication_unknown: publication_effect_unknown
+  publication_unknown --> completed: learning_artifact_published (matching target)
+  publication_unknown --> publication_pending: publication_effect_retry_scheduled (missing target)
+  publication_unknown --> publication_conflict: publication_effect_conflicted (different target)
+  publication_unknown --> publication_unknown: publication_effect_unknown (inconclusive)
+  publication_conflict --> completed: learning_artifact_published (matching target)
+  publication_conflict --> publication_pending: publication_effect_retry_scheduled (missing target)
+  publication_conflict --> publication_conflict: publication_effect_conflicted (different target)
+  publication_conflict --> publication_unknown: publication_effect_unknown (inconclusive)
 
   researching --> user_paused: run_paused
   research_complete --> user_paused: run_paused
@@ -194,6 +208,7 @@ stateDiagram-v2
   retry_exhausted --> cancelled: run_cancelled
   waiting_publication_approval --> cancelled: run_cancelled
   ready_to_publish --> cancelled: run_cancelled
+  publication_pending --> cancelled: run_cancelled
   user_paused --> cancelled: run_cancelled
 
   note right of researching
@@ -246,11 +261,22 @@ stateDiagram-v2
     restart does not auto-write
     explicit publish command is required
   end note
+
+  note right of publication_unknown
+    durable ambiguity
+    only explicit reconcile can classify target
+    cancellation is rejected until settlement
+  end note
+
+  note right of publication_conflict
+    different existing bytes
+    never overwrite
+  end note
 ```
 
 `research_complete` 不是最终 terminal `completed`：它只表示模型通过 `complete_research` 显式结束调查并保存 unresolved questions，可以进入确定性 Gate。Gate failure 也不是 terminal `failed`；durable repair 会回到 `researching`，并把已完成的 Artifact proposal generation 计入模型预算。完成工具返回后 Runtime 会在 completion 的同一个 `occurredAt` 用 canonical budget calculator 再检查 Model Turn 与 wall time，并把 durable `completion.completedAt` 冻结为 Research Loop 的计费终点；之后的用户空闲或重复 `advanceResearch` 不会让合法完成的 Run 追溯耗尽。若 completion 当拍刚好耗尽，`research_completed` 与 `run_budget_exhausted` 会在同一个 SQLite transaction 中追加，最终 Run 直接成为 `budget_exhausted`，并以 `researchOutcome: research_complete` 保留 completion provenance。更早暂停保存 `researchOutcome: incomplete`。新的 Run Budget version 必须逐维不缩减、至少提高一维，并由绑定前后 canonical hashes 的用户 Receipt 授权；恢复后分别回到精确的 `researching` 或 `research_complete` origin，已有 usage 不清零。
 
-`SuspendedRunState` 包含 plan/publication approval waits、`waiting_evaluator_resolution`、`budget_exhausted`、`retry_exhausted` 与 `user_paused`。Evaluator wait 只能由 exact retry 或 explicit skip 继续；普通 `resumeRun` 只接受 `user_paused`。user pause 和 budget exhaustion 的停留时间累加到 `suspendedDurationMs`，不计入 Research Loop wall time。`completed`、`cancelled` 与 `failed` 是不可恢复 terminal states。
+`SuspendedRunState` 包含 plan/publication approval waits、`waiting_evaluator_resolution`、`publication_unknown`、`publication_conflict`、`budget_exhausted`、`retry_exhausted` 与 `user_paused`。Evaluator wait 只能由 exact retry 或 explicit skip 继续；Publication Effect wait 只能由显式 reconcile 推进；普通 `resumeRun` 只接受 `user_paused`。user pause 和 budget exhaustion 的停留时间累加到 `suspendedDurationMs`，不计入 Research Loop wall time。`completed`、`cancelled` 与 `failed` 是不可恢复 terminal states。
 
 取消可以先于并发外部结果成为 Journal fact。`cancelRun` 先在独立 control table 持久化 cancellation request；active owner 的 heartbeat/poll safe-point 原子提交 `run_cancelled` 与 request consumption，再 abort 当前 operation 的 provider signal。若请求者或 owner 崩溃，下一 mutation 在做业务工作前先消费 pending request。若 Model Turn、Search/read observation、Evidence、Claim、completion 或 aborted Retry Attempt 已经完整形成，Runtime 仍可把该结果追加到 `cancelledState` 供审计；reducer 始终保留外层 `cancelled`，不会执行 queued tool、进入 Gate 或推进 publication。partial stream 从未形成 completed result，因而只闭合已 durable started 的 attempt，不持久化 delta。
 
@@ -286,18 +312,52 @@ mutating public commands validate their input, then acquire one per-run durable 
 
 publication 状态以 `researchOrigin` 判别 provenance：Issue #5 的零 Research Loop Model Turn 显式教学路径只能是 `legacy_explicit`，真正多轮路径只能是 `research_loop` 且结构上必须同时保留非空 Model Turns、tool observations、`researchStartedAt` 与 `completion`。因此 schema 和 reducer 都无法表达“有 Research Loop turns 但没有完成事实”或“零 turn 凭空带 completion”的非法组合。
 
-`publication_approved` 也不是“文件已经写好”的断言。等待状态的 `publicationApprovalSummary` 同时显示 deterministic hard Gate 已通过的 Claim/Evidence 计数，以及 advisory evaluator warnings 或 explicit skip warning；用户无需从 verdict 反推 Gate 是否成功。用户命令批准 `draftHash`、review artifact hash 或 explicit skip identity hash、canonical Output Root、`targetCanonicalPath`、父目录 `device` 和 `inode` 的精确聚合 hash。Runtime 在接受 receipt 前重新捕获 root 与 target parent identity；若任一 component 变化，旧 binding 失效。receipt 进入 `ready_to_publish` 后，只有显式 `publishLearningArtifact` 才会调用外部 publisher；写出前重新读取 CAS review JSON 与 Source Snapshots，正常 publisher 返回后才追加 `learning_artifact_published` 并进入 terminal `completed`。
+`publication_approved` 也不是“文件已经写好”的断言。等待状态的 `publicationApprovalSummary` 同时显示 deterministic hard Gate 已通过的 Claim/Evidence 计数，以及 advisory evaluator warnings 或 explicit skip warning；用户无需从 verdict 反推 Gate 是否成功。用户命令批准 `draftHash`、review artifact hash 或 explicit skip identity hash、canonical Output Root、`targetCanonicalPath`、父目录 `device` 和 `inode` 的精确聚合 hash。Runtime 在接受 receipt、effect prepare、PENDING retry 与 reconcile 时都重新捕获 root/target identity，并重新读取 CAS review JSON 与 Source Snapshots；若任一 component 变化，旧 binding 不再授权 external action。
 
 Trace 先暴露非秘密 Experiment Identity，再依次暴露不含秘密的 lineage：每个 attempt 的 Retry Sequence facts；`read_source` 的 observation/tool call/Snapshot；Evidence 与 Claim lineage；Evidence Gate repair code；Evaluator failure attempt/code/input/model/prompt identity；review artifact 或 explicit skip identity；draft evaluation hash、publication receipt ID 与最终 Markdown SHA-256。它不包含 evaluator request/review正文、绝对来源路径、provider payload、摘录正文、私有 Runtime Home 或 OS 错误。
 
-## 正常发布语义与未实现的 crash 边界
+## Publication Effect 恢复协议
 
-`LearningArtifactPublisher` 不创建父目录，也不跟随 final symlink。它在经批准的同一父目录内创建 `0600`、`O_EXCL|O_NOFOLLOW` temporary file，写完并 fsync 后再用 hard-link 原子创建最终名称，最后删除 temporary file。这里没有使用普通 `rename`：Node 的可移植 `rename` 会覆盖已存在文件，而 Node 没有暴露 `renameat2(RENAME_NOREPLACE)`；hard-link publication 既保证读者看不到半成品，也能在并发存在不同内容时 fail closed。若 final regular file 已经是完全相同的字节，发布幂等成功；若内容不同则绝不覆盖。
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING: publication_effect_prepared
+  PENDING --> EXECUTING: publication_effect_execution_started
+  EXECUTING --> SUCCEEDED: publisher returned + settlement (direct)
+  EXECUTING --> UNKNOWN: crash / settlement ambiguity
+  UNKNOWN --> SUCCEEDED: reconcile matching target
+  UNKNOWN --> PENDING: reconcile missing target / safe retry
+  UNKNOWN --> CONFLICT: reconcile different target bytes
+  UNKNOWN --> UNKNOWN: reconciliation inconclusive
+  CONFLICT --> SUCCEEDED: user restores matching approved bytes + reconcile
+  CONFLICT --> PENDING: user removes target + reconcile
+  CONFLICT --> CONFLICT: different target remains
+  CONFLICT --> UNKNOWN: later inspection inconclusive
+  SUCCEEDED --> [*]
+
+  note right of PENDING
+    stable effectId binds run + draft hash + target path
+    no external write has been declared
+  end note
+
+  note right of EXECUTING
+    external effect may have happened
+    restart must not blindly replay
+  end note
+
+  note right of UNKNOWN
+    durable ambiguity is preserved
+    explicit reconcile is required
+  end note
+
+  note right of CONFLICT
+    different target bytes are never overwritten
+  end note
+```
+
+`LearningArtifactPublisher` 不创建父目录，也不跟随 final symlink。它在经批准的同一父目录内创建 `0600`、`O_EXCL|O_NOFOLLOW` temporary file，写完并 file fsync 后再用 hard-link 原子创建最终名称，随后 directory fsync 并删除 temporary file。这里没有使用普通 `rename`：Node 的可移植 `rename` 会覆盖已存在文件，而 Node 没有暴露 `renameat2(RENAME_NOREPLACE)`；hard-link publication 既保证读者看不到半成品，也能在并发存在不同内容时 fail closed。若 final regular file 已经是完全相同的字节，发布幂等成功；若内容不同则绝不覆盖。
 
 `Output Root` 必须在 Runtime 打开时显式配置，必须是与私有 Runtime Home 不重叠的 canonical directory；publisher 只接受其内 target，并把 root 的 device/inode 绑入 approval。parent identity 与 root identity 会在写入前后复核以检测稳定可观测的替换，但不宣称能够原子隔离 hostile same-user concurrent rename。
 
-更重要的是，本 ticket 只承诺正常返回路径：若进程在外部 publication 尝试与 Journal `learning_artifact_published` 追加之间崩溃，重启不会自动把文件存在推断为完成。Issue #14 将定义 durable effect/operation 记录与 crash reconciliation；当前用户可显式再次调用 publish，publisher 只会接受 exact identical bytes。
+`publishLearningArtifact` 首先把 stable PENDING identity 写入 Journal，再 durable 声明 EXECUTING，最后才调用 publisher。若进程在外部 publication 与 success settlement 之间消失，Journal 保留 EXECUTING；显式 reconcile 先把 ambiguity 记录为 UNKNOWN，再以安全 handle inspection 对账。matching bytes 直接结算 SUCCEEDED/reconciled 且不重写；missing target 保留 effect identity 回到 PENDING；different bytes 进入 CONFLICT；symlink、非 regular file 或不可靠系统调用保持 UNKNOWN。CONFLICT 后用户可移除或恢复 target，再次 reconcile；普通 publish 不能从 EXECUTING、UNKNOWN 或 CONFLICT 盲目继续。
 
-## 当前边界与后续 ticket
-
-- Issue #14 才把 publication 外部 effect 的 crash reconciliation 做成 durable protocol。
+命名 Fault Injection Points 覆盖 effect prepare 前后、temporary write 前后、atomic publication 前后、success settlement 前后与 reconciliation；恢复测试每次重新打开同一 Runtime Home，并通过 `ResearchAgentRuntime` seam 验证 Journal-derived state。
