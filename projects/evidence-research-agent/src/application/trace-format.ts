@@ -23,6 +23,19 @@ export function formatRunTrace(
         event.sourceSnapshotId === undefined
           ? undefined
           : `snapshot=${event.sourceSnapshotId}`,
+        event.evidenceId === undefined
+          ? undefined
+          : `evidence=${event.evidenceId}`,
+        event.claimId === undefined ? undefined : `claim=${event.claimId}`,
+        event.draftArtifactId === undefined
+          ? undefined
+          : `draft=${event.draftArtifactId}`,
+        event.publicationApprovalId === undefined
+          ? undefined
+          : `publication-approval=${event.publicationApprovalId}`,
+        event.learningArtifactSha256 === undefined
+          ? undefined
+          : `published-sha256=${event.learningArtifactSha256}`,
       ].filter((value): value is string => value !== undefined);
       return `#${event.sequence} ${event.type} → ${event.stateAfter} (${event.occurredAt})${lineage.length === 0 ? "" : ` [${lineage.join(" ")}]`}`;
     }),

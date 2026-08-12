@@ -13,25 +13,54 @@ export {
   EvidenceObservationNotAvailableError,
   EvidencePersistenceError,
   EvidenceWriteConflictError,
+  EvidenceGateBlockedError,
+  IllegalLearningArtifactPublicationStateError,
+  IllegalLearningArtifactStateError,
+  IllegalPublicationApprovalStateError,
+  InvalidLearningArtifactCommandError,
+  InvalidPublicationApprovalCommandError,
+  LearningArtifactDraftConflictError,
+  LearningArtifactDraftError,
+  LearningArtifactPublicationError,
+  PublicationApprovalConflictError,
   ResearchAgentRuntime,
   SourceReadConflictError,
   SourceReadPersistenceError,
   SourceReadRunNotFoundError,
+  StalePublicationApprovalError,
   StalePlanApprovalError,
 } from "./application/research-agent-runtime.js";
 export { formatRunTrace } from "./application/trace-format.js";
 export { runCli } from "./cli.js";
 export { PrivateRuntimeHomeError } from "./infrastructure/private-runtime-home.js";
 export {
+  LearningArtifactPublishError,
+  PublicationTargetPreparationError,
+} from "./infrastructure/learning-artifact-publisher.js";
+export { EvidenceGateError, evaluateEvidenceGate } from "./domain/evidence-gate.js";
+export {
+  createPublicationApprovalBinding,
+  renderLearningArtifact,
+} from "./domain/learning-artifact.js";
+export {
   createPlanApprovalBinding,
   hashCanonicalJson,
 } from "./domain/integrity.js";
-export type { Clock, IdGenerator, ModelPort, PlanRequest } from "./application/ports.js";
+export type {
+  Clock,
+  IdGenerator,
+  LearningArtifactProposalRequest,
+  ModelPort,
+  PlanRequest,
+} from "./application/ports.js";
 export type {
   ApprovePlanCommand,
+  ApprovePublicationCommand,
   CreateRunCommand,
   InspectRunCommand,
   OpenRuntimeOptions,
+  ProposeLearningArtifactCommand,
+  PublishLearningArtifactCommand,
   ReadSourceCommand,
   RecordClaimCommand,
   RecordEvidenceCommand,
@@ -41,6 +70,8 @@ export type {
 export type {
   ArtifactReference,
   Claim,
+  CompletedRunState,
+  EvidenceBackedRunStateData,
   PlanApprovalBinding,
   PlanApprovalReceipt,
   ReadSourceRequest,
@@ -64,4 +95,11 @@ export type {
   FailedSourceReadObservation,
   SourceSnapshotReference,
   SourceScope,
+  LearningArtifactProposal,
+  PublicationApprovalBinding,
+  PublicationApprovalReceipt,
+  PublicationTarget,
+  PublishedLearningArtifact,
+  ReadyToPublishRunState,
+  WaitingPublicationApprovalRunState,
 } from "./domain/types.js";

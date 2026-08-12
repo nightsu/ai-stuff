@@ -42,6 +42,9 @@ describe("Source Scope root canonicalization", () => {
         requests.push(request);
         return Promise.resolve(plan);
       },
+      proposeLearningArtifact: () => {
+        throw new Error("本测试不应请求 Learning Artifact 提案");
+      },
     };
     const runtime = ResearchAgentRuntime.open({
       runtimeHome: fixture.runtimeHome,

@@ -188,10 +188,8 @@ export interface WaitingPlanApprovalRunState {
   readonly proposedAt: string;
 }
 
-/** 精确计划已获用户批准、可以进入 Research Loop 的 Run 状态。 */
-export interface ResearchingRunState {
-  /** 判别字段；只允许由合法 `plan_approved` 事件产生。 */
-  readonly type: "researching";
+/** 已完成计划审批后，所有 Evidence/Claim/发布状态共同保留的可回放研究事实。 */
+export interface EvidenceBackedRunStateData {
   /** 已获批准且继续保持内容寻址 identity 的计划 artifact。 */
   readonly planArtifact: ArtifactReference;
   /** 对该计划、问题、Source Scope 与预算精确版本的完整审批凭据。 */
@@ -206,12 +204,21 @@ export interface ResearchingRunState {
   readonly claims: readonly Claim[];
 }
 
+/** 精确计划已获用户批准、可以继续显式收集 Evidence 与 Claim 的 Run 状态。 */
+export interface ResearchingRunState extends EvidenceBackedRunStateData {
+  /** 判别字段；只允许由合法 `plan_approved` 事件产生。 */
+  readonly type: "researching";
+}
+
 /** 当前 planning slice 允许出现的最小 Run 状态联合。 */
 export type ResearchRunState =
   | CreatedRunState
   | PlanningRunState
   | WaitingPlanApprovalRunState
-  | ResearchingRunState;
+  | ResearchingRunState
+  | WaitingPublicationApprovalRunState
+  | ReadyToPublishRunState
+  | CompletedRunState;
 
 /** 从 Run Journal 确定性派生的当前 Run 视图。 */
 export interface RunProjection {
@@ -313,6 +320,147 @@ export interface ClaimRecordedPayload {
   readonly claim: Claim;
 }
 
+/** 模型只能选择既有 Claim、不能自造 citation identity 的有界 Markdown 提案。 */
+export interface LearningArtifactProposal {
+  /** 要渲染为 Markdown 一级标题的简短学习主题。 */
+  readonly title: string;
+  /** 要渲染在 Claim 列表前的简短学习摘要。 */
+  readonly summary: string;
+  /** 模型选择的既有 Claim identities；顺序决定 Markdown 的展示顺序。 */
+  readonly claimIds: readonly string[];
+}
+
+/** 一个经 canonical parent realpath 与 inode 绑定、可被用户批准的 Markdown 目标。 */
+export interface PublicationTarget {
+  /** 由批准时 canonical parent directory 与 basename 组成的绝对目标路径。 */
+  readonly targetCanonicalPath: string;
+  /** 批准时目标父目录设备号的无损十进制字符串。 */
+  readonly parentDevice: string;
+  /** 批准时目标父目录 inode 的无损十进制字符串。 */
+  readonly parentInode: string;
+}
+
+/** 用户批准发布前逐字段匹配的 draft 与目标边界。 */
+export interface PublicationApprovalBinding {
+  /** 私有持久化 Markdown draft 精确 UTF-8 内容的 SHA-256 摘要。 */
+  readonly draftHash: string;
+  /** 经 canonical parent directory 解释后的确切绝对 Markdown 目标路径。 */
+  readonly targetCanonicalPath: string;
+  /** 目标父目录的审批时设备号，防止同名路径被替换后复用旧审批。 */
+  readonly parentDevice: string;
+  /** 目标父目录的审批时 inode，防止同名路径被替换后复用旧审批。 */
+  readonly parentInode: string;
+  /** 对 draft hash 和精确 target component 做 canonical JSON 哈希的聚合摘要。 */
+  readonly bindingHash: string;
+}
+
+/** 由用户命令签发、可回放的精确 Learning Artifact publication approval。 */
+export interface PublicationApprovalReceipt {
+  /** 本次 publication approval 事实的跨进程稳定 identity。 */
+  readonly approvalId: string;
+  /** 审批角色；不得把计划审批解释为发布审批。 */
+  readonly kind: "publication";
+  /** 唯一允许的审批主体，明确排除模型与 Research Tool。 */
+  readonly approvedBy: "user-command";
+  /** 用户命令被接受的 ISO 8601 UTC 时间。 */
+  readonly approvedAt: string;
+  /** Receipt 所授权 Markdown draft 的精确内容 SHA-256。 */
+  readonly draftHash: string;
+  /** Receipt 所授权的 canonical Markdown 目标路径。 */
+  readonly targetCanonicalPath: string;
+  /** Receipt 所授权目标父目录的设备号。 */
+  readonly parentDevice: string;
+  /** Receipt 所授权目标父目录的 inode。 */
+  readonly parentInode: string;
+  /** 覆盖全部 publication component 的聚合审批摘要。 */
+  readonly bindingHash: string;
+}
+
+/** 成功同目录原子发布后写入 Journal 的外部 Learning Artifact 事实。 */
+export interface PublishedLearningArtifact {
+  /** 实际写入且与 approval receipt 完全一致的 canonical Markdown 目标路径。 */
+  readonly targetCanonicalPath: string;
+  /** 实际写入 Markdown 精确 UTF-8 内容的 SHA-256 摘要。 */
+  readonly sha256: string;
+  /** publisher 成功返回后记录为 Journal 事实的 ISO 8601 UTC 时间。 */
+  readonly publishedAt: string;
+}
+
+/** 模型提案已被 Evidence Gate 接受、但仍等待用户精确发布审批的 Run 状态。 */
+export interface WaitingPublicationApprovalRunState
+  extends EvidenceBackedRunStateData {
+  /** 判别字段；只有完整 Evidence-backed draft 可以进入该暂停状态。 */
+  readonly type: "waiting_publication_approval";
+  /** 已存入私有 Artifact Store、可由 reducer 重新渲染验证的 Markdown draft。 */
+  readonly draftArtifact: ArtifactReference;
+  /** 提供标题、摘要和 Claim 展示顺序的有界模型提案。 */
+  readonly proposal: LearningArtifactProposal;
+  /** 由 Runtime 捕获并将成为用户审批主体的 canonical Markdown 目标。 */
+  readonly publicationTarget: PublicationTarget;
+  /** 精确绑定 draft 内容与 publication target identity 的审批摘要。 */
+  readonly publicationBinding: PublicationApprovalBinding;
+  /** draft 被正式写入 Run Journal 的 ISO 8601 UTC 时间。 */
+  readonly proposedAt: string;
+}
+
+/** 用户已批准 exact publication binding、等待显式正常写入命令的 Run 状态。 */
+export interface ReadyToPublishRunState extends EvidenceBackedRunStateData {
+  /** 判别字段；重启不会自动猜测或重放尚未确认的外部写入。 */
+  readonly type: "ready_to_publish";
+  /** 等待时保存的不可变 Markdown draft artifact。 */
+  readonly draftArtifact: ArtifactReference;
+  /** 用于重建 draft 精确内容的有界模型提案。 */
+  readonly proposal: LearningArtifactProposal;
+  /** 已获批准、写入前仍需重新验证的 canonical publication target。 */
+  readonly publicationTarget: PublicationTarget;
+  /** 当初等待状态计算的 exact publication binding。 */
+  readonly publicationBinding: PublicationApprovalBinding;
+  /** 已由用户命令持久化的精确 publication authorization。 */
+  readonly publicationReceipt: PublicationApprovalReceipt;
+}
+
+/** 正常 publisher 返回且 `learning_artifact_published` 已 durably append 后的终态。 */
+export interface CompletedRunState extends EvidenceBackedRunStateData {
+  /** 判别字段；不能从读取、Evidence 或 approval 事件直接跳入。 */
+  readonly type: "completed";
+  /** 已发布前保持不变的私有 Markdown draft artifact。 */
+  readonly draftArtifact: ArtifactReference;
+  /** 用于审计实际 Markdown 内容来源的有界模型提案。 */
+  readonly proposal: LearningArtifactProposal;
+  /** 实际写入前已绑定且已重验的 canonical publication target。 */
+  readonly publicationTarget: PublicationTarget;
+  /** 实际发生 external write 前已批准的 exact publication binding。 */
+  readonly publicationBinding: PublicationApprovalBinding;
+  /** 授权这次 external publication 的 durable user-command receipt。 */
+  readonly publicationReceipt: PublicationApprovalReceipt;
+  /** 外部 publisher 成功后写入 Journal 的已发布内容 identity。 */
+  readonly learningArtifact: PublishedLearningArtifact;
+}
+
+/** `learning_artifact_draft_proposed` 事件携带的 gated draft 与 publication binding。 */
+export interface LearningArtifactDraftProposedPayload {
+  /** 已私有持久化的精确 Markdown draft artifact。 */
+  readonly draftArtifact: ArtifactReference;
+  /** 只含标题、摘要与既有 Claim 选择的有界模型提案。 */
+  readonly proposal: LearningArtifactProposal;
+  /** 由 Runtime 解析而非模型输出的 canonical publication target。 */
+  readonly publicationTarget: PublicationTarget;
+  /** 逐字段绑定 draft 与 target 的等待审批摘要。 */
+  readonly publicationBinding: PublicationApprovalBinding;
+}
+
+/** `publication_approved` 事件携带的用户审批事实。 */
+export interface PublicationApprovedPayload {
+  /** 只能由用户命令创建且必须精确匹配等待 binding 的 Receipt。 */
+  readonly publicationReceipt: PublicationApprovalReceipt;
+}
+
+/** `learning_artifact_published` 事件携带的正常外部写入确认事实。 */
+export interface LearningArtifactPublishedPayload {
+  /** publisher 成功后得到的 exact target/content identity。 */
+  readonly learningArtifact: PublishedLearningArtifact;
+}
+
 /** 一个有顺序、可回放的 Run Journal 语义事件。 */
 export interface RunEvent<Type extends string, Payload> {
   /** 跨重试稳定的事件 identity。 */
@@ -337,7 +485,16 @@ export type ResearchRunEvent =
   | RunEvent<"plan_approved", PlanApprovedPayload>
   | RunEvent<"source_read_observed", SourceReadObservedPayload>
   | RunEvent<"evidence_recorded", EvidenceRecordedPayload>
-  | RunEvent<"claim_recorded", ClaimRecordedPayload>;
+  | RunEvent<"claim_recorded", ClaimRecordedPayload>
+  | RunEvent<
+      "learning_artifact_draft_proposed",
+      LearningArtifactDraftProposedPayload
+    >
+  | RunEvent<"publication_approved", PublicationApprovedPayload>
+  | RunEvent<
+      "learning_artifact_published",
+      LearningArtifactPublishedPayload
+    >;
 
 /** 已写入 Artifact Store、等待登记到 SQLite 的元数据。 */
 export interface PersistedArtifact extends ArtifactReference {
@@ -448,6 +605,12 @@ export interface RunTraceEvent {
   readonly evidenceId?: string;
   /** 仅 `claim_recorded` 暴露的结构化 Claim identity。 */
   readonly claimId?: string;
+  /** 仅 draft proposal 事件暴露的私有 content-addressed Markdown artifact identity。 */
+  readonly draftArtifactId?: string;
+  /** 仅 publication approval 事件暴露的 durable receipt identity。 */
+  readonly publicationApprovalId?: string;
+  /** 仅完成发布事件暴露的已写入 Markdown 内容 SHA-256。 */
+  readonly learningArtifactSha256?: string;
 }
 
 /** 面向人或机器读取、但不作为 canonical history 的 Run Trace。 */

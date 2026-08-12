@@ -7,18 +7,29 @@ import {
   hashReadSourceRequest,
   hashUtf8Text,
 } from "../domain/integrity.js";
+import { EvidenceGateError, evaluateEvidenceGate } from "../domain/evidence-gate.js";
+import {
+  createPublicationApprovalBinding,
+  renderLearningArtifact,
+} from "../domain/learning-artifact.js";
 import { buildRunTrace } from "../domain/reducer.js";
 import {
   parseResearchPlan,
+  parseLearningArtifactProposal,
   readSourceRequestSchema,
   parseRequestedSourceScope,
   parseRunBudget,
 } from "../domain/schemas.js";
 import type {
+  ArtifactReference,
   Claim,
   EvidenceRecord,
+  LearningArtifactProposal,
+  PublicationApprovalReceipt,
+  PublicationTarget,
   ResearchRunEvent,
   PersistedSourceSnapshot,
+  PersistedArtifact,
   ReadSourceRequest,
   RunProjection,
   RunTrace,
@@ -38,6 +49,11 @@ import {
   SqliteRunStore,
 } from "../infrastructure/sqlite-run-store.js";
 import { preparePrivateRuntimeHome } from "../infrastructure/private-runtime-home.js";
+import {
+  LearningArtifactPublisher,
+  LearningArtifactPublishError,
+  PublicationTargetPreparationError,
+} from "../infrastructure/learning-artifact-publisher.js";
 import type { Clock, IdGenerator, ModelPort } from "./ports.js";
 
 /** 打开一个 headless runtime 所需的基础设施与可控边界。 */
@@ -112,6 +128,28 @@ export interface RecordClaimCommand {
   readonly text: string;
   /** 至少一个既有 Evidence identity，顺序是未来渲染的显式引用顺序。 */
   readonly evidenceIds: readonly string[];
+}
+
+/** 让模型在既有 Evidence-backed Claims 中选择 Markdown draft 的应用命令。 */
+export interface ProposeLearningArtifactCommand {
+  /** 当前必须处于 researching 的 Research Run identity。 */
+  readonly runId: string;
+  /** 必须为绝对 Markdown 路径；Runtime 会捕获其 canonical parent identity。 */
+  readonly targetPath: string;
+}
+
+/** 用用户可见 publication binding 批准 exact draft 和 target 的应用命令。 */
+export interface ApprovePublicationCommand {
+  /** 当前必须等待 publication approval 的 Research Run identity。 */
+  readonly runId: string;
+  /** 用户从等待 Projection 原样提交的聚合 publication binding hash。 */
+  readonly bindingHash: string;
+}
+
+/** 在 durable publication approval 后执行一次正常 no-clobber 写入的应用命令。 */
+export interface PublishLearningArtifactCommand {
+  /** 当前必须处于 ready_to_publish 的 Research Run identity。 */
+  readonly runId: string;
 }
 
 /** 提交的 binding 已不再对应当前等待计划时抛出的安全错误。 */
@@ -250,6 +288,94 @@ export class EvidencePersistenceError extends Error {
   }
 }
 
+/** Learning Artifact draft 命令不满足严格输入契约时抛出的安全错误。 */
+export class InvalidLearningArtifactCommandError extends Error {
+  public constructor() {
+    super("Learning Artifact 命令格式无效");
+    this.name = "InvalidLearningArtifactCommandError";
+  }
+}
+
+/** 不能在当前 Run 状态提出 Evidence-backed draft 时抛出的安全错误。 */
+export class IllegalLearningArtifactStateError extends Error {
+  public constructor() {
+    super("当前 Research Run 状态不能提出 Learning Artifact draft");
+    this.name = "IllegalLearningArtifactStateError";
+  }
+}
+
+/** Evidence Gate 未通过时阻止私有 draft 或外部 publication 的安全错误。 */
+export class EvidenceGateBlockedError extends Error {
+  public constructor() {
+    super("Learning Artifact 缺少有效 Evidence 支持");
+    this.name = "EvidenceGateBlockedError";
+  }
+}
+
+/** 模型提案或私有 draft 无法安全生成时抛出的 payload-safe 错误。 */
+export class LearningArtifactDraftError extends Error {
+  public constructor() {
+    super("Learning Artifact draft 无法安全生成");
+    this.name = "LearningArtifactDraftError";
+  }
+}
+
+/** draft Journal 追加与另一项 Run 更新冲突时抛出的安全错误。 */
+export class LearningArtifactDraftConflictError extends Error {
+  public constructor() {
+    super("Learning Artifact draft 与另一项 Run 更新发生冲突");
+    this.name = "LearningArtifactDraftConflictError";
+  }
+}
+
+/** publication approval 命令不满足严格输入契约时抛出的安全错误。 */
+export class InvalidPublicationApprovalCommandError extends Error {
+  public constructor() {
+    super("publication approval 命令格式无效");
+    this.name = "InvalidPublicationApprovalCommandError";
+  }
+}
+
+/** 旧 binding 或已改变 target identity 不能再授权 publication 时抛出的安全错误。 */
+export class StalePublicationApprovalError extends Error {
+  public constructor() {
+    super("publication approval 已过期或与当前等待版本不匹配");
+    this.name = "StalePublicationApprovalError";
+  }
+}
+
+/** 非等待状态收到 publication approval 时抛出的安全状态错误。 */
+export class IllegalPublicationApprovalStateError extends Error {
+  public constructor() {
+    super("当前 Research Run 状态不能接受 publication approval");
+    this.name = "IllegalPublicationApprovalStateError";
+  }
+}
+
+/** publication approval 追加与另一项 Run 更新冲突时抛出的安全错误。 */
+export class PublicationApprovalConflictError extends Error {
+  public constructor() {
+    super("publication approval 与另一项 Run 更新发生冲突");
+    this.name = "PublicationApprovalConflictError";
+  }
+}
+
+/** 非 ready_to_publish 状态收到 publication 命令时抛出的安全状态错误。 */
+export class IllegalLearningArtifactPublicationStateError extends Error {
+  public constructor() {
+    super("当前 Research Run 状态不能发布 Learning Artifact");
+    this.name = "IllegalLearningArtifactPublicationStateError";
+  }
+}
+
+/** publisher 或 published Journal 写入失败被消毒后的公开错误。 */
+export class LearningArtifactPublicationError extends Error {
+  public constructor() {
+    super("Learning Artifact 无法安全发布");
+    this.name = "LearningArtifactPublicationError";
+  }
+}
+
 const createRunCommandSchema = z.object({
   question: z.string().trim().min(1),
   sourceScope: z.unknown(),
@@ -289,6 +415,26 @@ const recordClaimCommandSchema = z
   })
   .strict();
 
+const proposeLearningArtifactCommandSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+    targetPath: z.string().trim().min(1),
+  })
+  .strict();
+
+const approvePublicationCommandSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+    bindingHash: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
+const publishLearningArtifactCommandSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+  })
+  .strict();
+
 const systemClock: Clock = {
   now: () => new Date().toISOString(),
 };
@@ -300,6 +446,12 @@ const uuidGenerator: IdGenerator = {
   nextToolCallId: () => `tool-call-${randomUUID()}`,
   nextObservationId: () => `observation-${randomUUID()}`,
 };
+
+/** 去除 registry-only 时间字段，保证 Journal artifact 引用只保存可回放身份与内容元数据。 */
+function stripArtifactCreatedAt(artifact: PersistedArtifact): ArtifactReference {
+  const { createdAt: _createdAt, ...reference } = artifact;
+  return reference;
+}
 
 /** CLI 与未来 UI 共同依赖的 command-oriented application seam。 */
 export class ResearchAgentRuntime {
@@ -313,6 +465,8 @@ export class ResearchAgentRuntime {
   readonly #artifacts: ContentAddressedArtifactStore;
   /** 持有 canonical Journal 与 derived Projection cache 的 SQLite 组件。 */
   readonly #store: SqliteRunStore;
+  /** 只接收 exact target binding 与 Markdown bytes 的外部 publication 边界。 */
+  readonly #publisher: LearningArtifactPublisher;
 
   private constructor(options: OpenRuntimeOptions) {
     // 两个 store 只能收到同一次集中准备得到的 canonical Runtime Home，避免
@@ -323,6 +477,7 @@ export class ResearchAgentRuntime {
     this.#model = options.model;
     this.#artifacts = new ContentAddressedArtifactStore(runtimeHome);
     this.#store = new SqliteRunStore(runtimeHome);
+    this.#publisher = new LearningArtifactPublisher();
   }
 
   public static open(options: OpenRuntimeOptions): ResearchAgentRuntime {
@@ -728,6 +883,266 @@ export class ResearchAgentRuntime {
         throw new EvidenceWriteConflictError();
       }
       throw new EvidencePersistenceError();
+    }
+  }
+
+  public async proposeLearningArtifact(
+    command: ProposeLearningArtifactCommand,
+  ): Promise<RunProjection> {
+    const parsedCommand = proposeLearningArtifactCommandSchema.safeParse(command);
+    if (!parsedCommand.success) {
+      throw new InvalidLearningArtifactCommandError();
+    }
+    const { runId, targetPath } = parsedCommand.data;
+    let current: RunProjection;
+    try {
+      current = this.#store.readProjection(runId);
+    } catch {
+      throw new LearningArtifactDraftError();
+    }
+    if (current.state.type !== "researching") {
+      throw new IllegalLearningArtifactStateError();
+    }
+    const researching = current.state;
+    if (
+      researching.claims.length === 0 ||
+      researching.evidenceRecords.length === 0
+    ) {
+      // 先执行 cheap durable gate，保证没有来源事实时既不调用模型，也不创建私有
+      // draft artifact；这使“没有 Evidence 就不能 publish”成为可观察不变量。
+      throw new EvidenceGateBlockedError();
+    }
+
+    let proposal: LearningArtifactProposal;
+    let markdown: string;
+    try {
+      proposal = parseLearningArtifactProposal(
+        await this.#model.proposeLearningArtifact({
+          runId,
+          question: current.question,
+          claims: researching.claims,
+          evidenceRecords: researching.evidenceRecords,
+        }),
+      );
+      const gate = evaluateEvidenceGate(
+        proposal,
+        researching.claims,
+        researching.evidenceRecords,
+      );
+      markdown = renderLearningArtifact(proposal, gate);
+    } catch (error) {
+      if (error instanceof EvidenceGateError) {
+        throw new EvidenceGateBlockedError();
+      }
+      // Model adapter、Zod 与 renderer 的诊断可能回显 scripts 或 provider payload；
+      // public seam 只返回稳定错误，不把模型内容当作异常文本泄露。
+      throw new LearningArtifactDraftError();
+    }
+
+    let publicationTarget: PublicationTarget;
+    try {
+      publicationTarget = await this.#publisher.prepareTarget(targetPath);
+    } catch (error) {
+      if (error instanceof PublicationTargetPreparationError) {
+        throw new LearningArtifactDraftError();
+      }
+      throw error;
+    }
+    const proposedAt = this.#clock.now();
+    let draftArtifact: PersistedArtifact;
+    try {
+      draftArtifact = await this.#artifacts.putMarkdown(markdown, proposedAt);
+    } catch {
+      throw new LearningArtifactDraftError();
+    }
+    const publicationBinding = createPublicationApprovalBinding({
+      draftHash: draftArtifact.sha256,
+      publicationTarget,
+    });
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "learning_artifact_draft_proposed",
+      occurredAt: proposedAt,
+      payload: {
+        draftArtifact: stripArtifactCreatedAt(draftArtifact),
+        proposal,
+        publicationTarget,
+        publicationBinding,
+      },
+    };
+
+    try {
+      return this.#store.appendEvents(
+        runId,
+        current.lastEventSequence,
+        [event],
+        [draftArtifact],
+      );
+    } catch (error) {
+      if (error instanceof ConcurrentRunWriteError) {
+        // 私有 CAS 可能已落盘但未被 Journal 引用；不能为追求幂等而再次调用模型，
+        // 调用方必须先读取 canonical 状态并决定是否重新提出新的 exact draft。
+        throw new LearningArtifactDraftConflictError();
+      }
+      throw new LearningArtifactDraftError();
+    }
+  }
+
+  public async approvePublication(
+    command: ApprovePublicationCommand,
+  ): Promise<RunProjection> {
+    const parsedCommand = approvePublicationCommandSchema.safeParse(command);
+    if (!parsedCommand.success) {
+      throw new InvalidPublicationApprovalCommandError();
+    }
+    const { runId, bindingHash } = parsedCommand.data;
+    let current: RunProjection;
+    try {
+      current = this.#store.readProjection(runId);
+    } catch {
+      throw new LearningArtifactPublicationError();
+    }
+    if (
+      current.state.type === "ready_to_publish" &&
+      current.state.publicationReceipt.bindingHash === bindingHash
+    ) {
+      return current;
+    }
+    if (current.state.type !== "waiting_publication_approval") {
+      throw new IllegalPublicationApprovalStateError();
+    }
+    if (bindingHash !== current.state.publicationBinding.bindingHash) {
+      throw new StalePublicationApprovalError();
+    }
+
+    let currentTarget;
+    try {
+      currentTarget = await this.#publisher.prepareTarget(
+        current.state.publicationTarget.targetCanonicalPath,
+      );
+    } catch {
+      throw new StalePublicationApprovalError();
+    }
+    if (
+      currentTarget.targetCanonicalPath !==
+        current.state.publicationTarget.targetCanonicalPath ||
+      currentTarget.parentDevice !== current.state.publicationTarget.parentDevice ||
+      currentTarget.parentInode !== current.state.publicationTarget.parentInode
+    ) {
+      // 审批前 parent directory 被替换或 target 重新 canonicalize 时，旧 binding
+      // 绝不能继续授权；用户必须 inspect 新 draft/target 后显式重新批准。
+      throw new StalePublicationApprovalError();
+    }
+
+    const approvedAt = this.#clock.now();
+    const publicationReceipt: PublicationApprovalReceipt = {
+      approvalId: this.#ids.nextApprovalId(),
+      kind: "publication",
+      approvedBy: "user-command",
+      approvedAt,
+      ...current.state.publicationBinding,
+    };
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "publication_approved",
+      occurredAt: approvedAt,
+      payload: { publicationReceipt },
+    };
+
+    try {
+      return this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+    } catch (error) {
+      if (!(error instanceof ConcurrentRunWriteError)) {
+        throw new LearningArtifactPublicationError();
+      }
+      const persisted = this.#store.readProjection(runId);
+      if (
+        persisted.state.type === "ready_to_publish" &&
+        persisted.state.publicationReceipt.bindingHash === bindingHash
+      ) {
+        return persisted;
+      }
+      throw new PublicationApprovalConflictError();
+    }
+  }
+
+  public async publishLearningArtifact(
+    command: PublishLearningArtifactCommand,
+  ): Promise<RunProjection> {
+    const parsedCommand = publishLearningArtifactCommandSchema.safeParse(command);
+    if (!parsedCommand.success) {
+      throw new InvalidLearningArtifactCommandError();
+    }
+    const { runId } = parsedCommand.data;
+    let current: RunProjection;
+    try {
+      current = this.#store.readProjection(runId);
+    } catch {
+      throw new LearningArtifactPublicationError();
+    }
+    if (current.state.type === "completed") {
+      return current;
+    }
+    if (current.state.type !== "ready_to_publish") {
+      throw new IllegalLearningArtifactPublicationStateError();
+    }
+    const ready = current.state;
+    let markdown: string;
+    try {
+      markdown = renderLearningArtifact(
+        ready.proposal,
+        evaluateEvidenceGate(
+          ready.proposal,
+          ready.claims,
+          ready.evidenceRecords,
+        ),
+      );
+      if (
+        hashUtf8Text(markdown) !== ready.draftArtifact.sha256 ||
+        Buffer.byteLength(markdown, "utf8") !== ready.draftArtifact.byteLength
+      ) {
+        throw new LearningArtifactPublicationError();
+      }
+      await this.#publisher.publish(ready.publicationTarget, markdown);
+    } catch (error) {
+      if (
+        error instanceof EvidenceGateError ||
+        error instanceof LearningArtifactPublishError ||
+        error instanceof LearningArtifactPublicationError
+      ) {
+        throw new LearningArtifactPublicationError();
+      }
+      throw new LearningArtifactPublicationError();
+    }
+
+    const publishedAt = this.#clock.now();
+    const event: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId,
+      sequence: current.lastEventSequence + 1,
+      type: "learning_artifact_published",
+      occurredAt: publishedAt,
+      payload: {
+        learningArtifact: {
+          targetCanonicalPath: ready.publicationTarget.targetCanonicalPath,
+          sha256: ready.draftArtifact.sha256,
+          publishedAt,
+        },
+      },
+    };
+    try {
+      return this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+    } catch (error) {
+      if (error instanceof ConcurrentRunWriteError) {
+        // 外部 bytes 已经 no-clobber 发布，后续显式相同 publish 会先验证精确 bytes
+        // 再安全重试 Journal append；runtime restart 不会自动猜测该 effect 已完成。
+        throw new LearningArtifactPublicationError();
+      }
+      throw new LearningArtifactPublicationError();
     }
   }
 

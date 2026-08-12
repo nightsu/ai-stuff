@@ -11,6 +11,7 @@ import {
 import { reduceRunEvents } from "../domain/reducer.js";
 import { sourceSnapshotHasMatchingContentIdentity } from "../domain/integrity.js";
 import type {
+  ArtifactReference,
   PersistedArtifact,
   PersistedSourceSnapshot,
   ResearchRunEvent,
@@ -41,6 +42,21 @@ interface LastSequenceRow {
   readonly last_sequence: number;
 }
 
+interface ArtifactRow {
+  /** 通用 private artifact 的内容寻址 identity。 */
+  readonly artifact_id: string;
+  /** artifact 精确内容的小写 SHA-256 摘要。 */
+  readonly sha256: string;
+  /** 该 artifact 的固定媒体类型。 */
+  readonly media_type: string;
+  /** artifact 精确持久化字节数。 */
+  readonly byte_length: number;
+  /** 相对于 Runtime Home 的私有 artifact 路径。 */
+  readonly relative_path: string;
+  /** artifact 在 registry 的首次登记时间。 */
+  readonly created_at: string;
+}
+
 interface SourceSnapshotRow {
   /** Source Snapshot 的内容寻址 identity。 */
   readonly snapshot_id: string;
@@ -64,6 +80,14 @@ export class SourceSnapshotRegistrationError extends Error {
   public constructor() {
     super("Source Snapshot registry 完整性校验失败");
     this.name = "SourceSnapshotRegistrationError";
+  }
+}
+
+/** 通用 artifact registry 无法与 Journal 引用原子对应时抛出的内部错误。 */
+export class ArtifactEventInvariantError extends Error {
+  public constructor() {
+    super("Artifact registry 与 Journal 事件的事务不变量校验失败");
+    this.name = "ArtifactEventInvariantError";
   }
 }
 
@@ -124,21 +148,26 @@ export class SqliteRunStore {
           .run(runId, firstEvent.occurredAt);
       }
 
-      for (const artifact of artifacts) {
-        this.#database
-          .prepare(
-            `INSERT OR IGNORE INTO artifacts
-              (artifact_id, sha256, media_type, byte_length, relative_path, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)`,
+      const referencedArtifacts = collectArtifactReferences(events);
+      for (const providedArtifact of artifacts) {
+        if (
+          !referencedArtifacts.some((reference) =>
+            artifactReferenceMatches(reference, providedArtifact),
           )
-          .run(
-            artifact.artifactId,
-            artifact.sha256,
-            artifact.mediaType,
-            artifact.byteLength,
-            artifact.relativePath,
-            artifact.createdAt,
-          );
+        ) {
+          // artifact registry 不是任意 payload 写入口：只有本批 Journal 真正引用的
+          // plan/draft 才能登记，避免调用方把未审批内容塞进私有 registry 伪装可用。
+          throw new ArtifactEventInvariantError();
+        }
+      }
+      for (const artifact of artifacts) {
+        this.#registerArtifact(artifact);
+      }
+      for (const reference of referencedArtifacts) {
+        const row = this.#readArtifactRow(reference.artifactId);
+        if (row === undefined || !artifactRowMatchesReference(row, reference)) {
+          throw new ArtifactEventInvariantError();
+        }
       }
 
       const referencedSourceSnapshots =
@@ -361,6 +390,39 @@ export class SqliteRunStore {
     }
   }
 
+  #registerArtifact(artifact: PersistedArtifact): void {
+    if (
+      artifact.artifactId !== `sha256:${artifact.sha256}` ||
+      !/^[a-f0-9]{64}$/.test(artifact.sha256) ||
+      artifact.mediaType.trim() === "" ||
+      !Number.isSafeInteger(artifact.byteLength) ||
+      artifact.byteLength < 0 ||
+      artifact.relativePath.trim() === "" ||
+      !isIsoUtc(artifact.createdAt)
+    ) {
+      throw new ArtifactEventInvariantError();
+    }
+    this.#database
+      .prepare(
+        `INSERT INTO artifacts
+          (artifact_id, sha256, media_type, byte_length, relative_path, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT DO NOTHING`,
+      )
+      .run(
+        artifact.artifactId,
+        artifact.sha256,
+        artifact.mediaType,
+        artifact.byteLength,
+        artifact.relativePath,
+        artifact.createdAt,
+      );
+    const row = this.#readArtifactRow(artifact.artifactId);
+    if (row === undefined || !artifactRowMatchesPersisted(row, artifact)) {
+      throw new ArtifactEventInvariantError();
+    }
+  }
+
   #validateSourceSnapshot(snapshot: PersistedSourceSnapshot): void {
     if (
       !sourceSnapshotHasMatchingContentIdentity(snapshot) ||
@@ -381,6 +443,16 @@ export class SqliteRunStore {
           WHERE snapshot_id = ?`,
       )
       .get(snapshotId) as SourceSnapshotRow | undefined;
+  }
+
+  #readArtifactRow(artifactId: string): ArtifactRow | undefined {
+    return this.#database
+      .prepare(
+        `SELECT artifact_id, sha256, media_type, byte_length, relative_path, created_at
+           FROM artifacts
+          WHERE artifact_id = ?`,
+      )
+      .get(artifactId) as ArtifactRow | undefined;
   }
 
   #migrate(): void {
@@ -448,6 +520,18 @@ export class SqliteRunStore {
       BEGIN
         SELECT RAISE(ABORT, 'source_snapshots is immutable');
       END;
+
+      CREATE TRIGGER IF NOT EXISTS artifacts_are_immutable_on_update
+      BEFORE UPDATE ON artifacts
+      BEGIN
+        SELECT RAISE(ABORT, 'artifacts is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS artifacts_are_immutable_on_delete
+      BEFORE DELETE ON artifacts
+      BEGIN
+        SELECT RAISE(ABORT, 'artifacts is immutable');
+      END;
     `);
   }
 }
@@ -473,6 +557,54 @@ function sourceSnapshotRowMatches(
     row.relative_path === snapshot.relativePath &&
     isIsoUtc(row.created_at) &&
     (!requireCreatedAtMatch || row.created_at === snapshot.createdAt)
+  );
+}
+
+function collectArtifactReferences(
+  events: readonly ResearchRunEvent[],
+): ArtifactReference[] {
+  const references: ArtifactReference[] = [];
+  for (const event of events) {
+    if (event.type === "plan_proposed") {
+      references.push(event.payload.planArtifact);
+    }
+    if (event.type === "learning_artifact_draft_proposed") {
+      references.push(event.payload.draftArtifact);
+    }
+  }
+  return references;
+}
+
+function artifactReferenceMatches(
+  reference: ArtifactReference,
+  artifact: PersistedArtifact,
+): boolean {
+  return (
+    reference.artifactId === artifact.artifactId &&
+    reference.sha256 === artifact.sha256 &&
+    reference.mediaType === artifact.mediaType &&
+    reference.byteLength === artifact.byteLength &&
+    reference.relativePath === artifact.relativePath
+  );
+}
+
+function artifactRowMatchesPersisted(
+  row: ArtifactRow,
+  artifact: PersistedArtifact,
+): boolean {
+  return artifactRowMatchesReference(row, artifact) && isIsoUtc(row.created_at);
+}
+
+function artifactRowMatchesReference(
+  row: ArtifactRow,
+  reference: ArtifactReference,
+): boolean {
+  return (
+    row.artifact_id === reference.artifactId &&
+    row.sha256 === reference.sha256 &&
+    row.media_type === reference.mediaType &&
+    row.byte_length === reference.byteLength &&
+    row.relative_path === reference.relativePath
   );
 }
 

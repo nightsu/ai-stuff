@@ -91,6 +91,32 @@ export class ContentAddressedArtifactStore {
     };
   }
 
+  /** 把经过 Evidence Gate 的精确 Markdown draft 写入通用私有 artifact namespace。 */
+  public async putMarkdown(
+    markdown: string,
+    createdAt: string,
+  ): Promise<PersistedArtifact> {
+    const bytes = Buffer.from(markdown, "utf8");
+    const sha256 = hashBytes(bytes);
+    const runtimeHome = this.#runtimeHome;
+    const prefixChain = await preparePrivateDirectoryChain(runtimeHome, [
+      "artifacts",
+      "sha256",
+      sha256.slice(0, 2),
+    ]);
+    const absolutePath = join(prefixChain.directory, `${sha256}.md`);
+    await publishExactBytes(bytes, absolutePath, prefixChain);
+
+    return {
+      artifactId: `sha256:${sha256}`,
+      sha256,
+      mediaType: "text/markdown; charset=utf-8",
+      byteLength: bytes.byteLength,
+      relativePath: relative(runtimeHome, absolutePath),
+      createdAt,
+    };
+  }
+
   public async putSourceSnapshot(
     sourceBytes: Uint8Array,
     createdAt: string,

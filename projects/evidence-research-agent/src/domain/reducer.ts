@@ -1,3 +1,6 @@
+import { isAbsolute } from "node:path";
+
+import { EvidenceGateError, evaluateEvidenceGate } from "./evidence-gate.js";
 import {
   artifactReferenceHasMatchingContentIdentity,
   createPlanApprovalBinding,
@@ -6,14 +9,26 @@ import {
   sourceSnapshotHasMatchingContentIdentity,
 } from "./integrity.js";
 import {
+  createPublicationApprovalBinding,
+  publicationBindingsEqual,
+  renderLearningArtifact,
+} from "./learning-artifact.js";
+import {
   sourcePathPolicyDenial,
   sourceRequestDenial,
 } from "./source-policy.js";
 import type {
   Claim,
   EvidenceRecord,
+  ArtifactReference,
+  LearningArtifactDraftProposedPayload,
   PlanApprovalBinding,
+  PublicationApprovalBinding,
+  PublicationApprovalReceipt,
+  PublicationTarget,
+  PublishedLearningArtifact,
   ResearchRunEvent,
+  ResearchingRunState,
   RunProjection,
   SourceReadObservation,
   RunTrace,
@@ -326,6 +341,80 @@ function applyRunEvent(
         updatedAt: event.occurredAt,
       };
     }
+    case "learning_artifact_draft_proposed": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError(
+          "只有 researching Run 可以提出 Learning Artifact draft",
+        );
+      }
+      validateLearningArtifactDraft(
+        current.state,
+        event.payload,
+        event.occurredAt,
+      );
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "waiting_publication_approval",
+          draftArtifact: event.payload.draftArtifact,
+          proposal: event.payload.proposal,
+          publicationTarget: event.payload.publicationTarget,
+          publicationBinding: event.payload.publicationBinding,
+          proposedAt: event.occurredAt,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "publication_approved": {
+      if (current.state.type !== "waiting_publication_approval") {
+        throw new IllegalRunEventError(
+          "只有 waiting_publication_approval Run 可以批准发布",
+        );
+      }
+      validatePublicationApprovalReceipt(
+        current.state.draftArtifact,
+        current.state.publicationTarget,
+        current.state.publicationBinding,
+        event.payload.publicationReceipt,
+        event.occurredAt,
+      );
+      const { proposedAt: _proposedAt, ...readyFields } = current.state;
+      return {
+        ...current,
+        state: {
+          ...readyFields,
+          type: "ready_to_publish",
+          publicationReceipt: event.payload.publicationReceipt,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "learning_artifact_published": {
+      if (current.state.type !== "ready_to_publish") {
+        throw new IllegalRunEventError(
+          "只有 ready_to_publish Run 可以确认 Learning Artifact 已发布",
+        );
+      }
+      validatePublishedLearningArtifact(
+        current.state.draftArtifact,
+        current.state.publicationTarget,
+        event.payload.learningArtifact,
+        event.occurredAt,
+      );
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "completed",
+          learningArtifact: event.payload.learningArtifact,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
   }
 }
 
@@ -338,6 +427,9 @@ function traceLineage(
   | "sourceSnapshotId"
   | "evidenceId"
   | "claimId"
+  | "draftArtifactId"
+  | "publicationApprovalId"
+  | "learningArtifactSha256"
 > {
   if (event.type === "source_read_observed") {
     return {
@@ -356,6 +448,15 @@ function traceLineage(
   }
   if (event.type === "claim_recorded") {
     return { claimId: event.payload.claim.claimId };
+  }
+  if (event.type === "learning_artifact_draft_proposed") {
+    return { draftArtifactId: event.payload.draftArtifact.artifactId };
+  }
+  if (event.type === "publication_approved") {
+    return { publicationApprovalId: event.payload.publicationReceipt.approvalId };
+  }
+  if (event.type === "learning_artifact_published") {
+    return { learningArtifactSha256: event.payload.learningArtifact.sha256 };
   }
   return {};
 }
@@ -515,6 +616,143 @@ function validateClaim(
   ) {
     throw new IllegalRunEventError("Claim 必须精确引用已有 Evidence Record");
   }
+}
+
+function validateLearningArtifactDraft(
+  researching: ResearchingRunState,
+  payload: LearningArtifactDraftProposedPayload,
+  occurredAt: string,
+): void {
+  const { draftArtifact, proposal, publicationTarget, publicationBinding } =
+    payload;
+  if (
+    !hasExactKeys(draftArtifact, [
+      "artifactId",
+      "sha256",
+      "mediaType",
+      "byteLength",
+      "relativePath",
+    ]) ||
+    !artifactReferenceHasMatchingContentIdentity(draftArtifact) ||
+    draftArtifact.mediaType !== "text/markdown; charset=utf-8" ||
+    !Number.isSafeInteger(draftArtifact.byteLength) ||
+    draftArtifact.byteLength <= 0 ||
+    !hasExactKeys(proposal, ["title", "summary", "claimIds"]) ||
+    proposal.title.trim() === "" ||
+    proposal.summary.trim() === "" ||
+    proposal.claimIds.length === 0 ||
+    new Set(proposal.claimIds).size !== proposal.claimIds.length ||
+    !proposal.claimIds.every((claimId) => claimId.trim() !== "") ||
+    !hasExactPublicationTargetShape(publicationTarget) ||
+    !hasExactKeys(publicationBinding, [
+      "draftHash",
+      "targetCanonicalPath",
+      "parentDevice",
+      "parentInode",
+      "bindingHash",
+    ])
+  ) {
+    throw new IllegalRunEventError("Learning Artifact draft 公共字段无效");
+  }
+
+  let markdown: string;
+  try {
+    markdown = renderLearningArtifact(
+      proposal,
+      evaluateEvidenceGate(
+        proposal,
+        researching.claims,
+        researching.evidenceRecords,
+      ),
+    );
+  } catch (error) {
+    if (error instanceof EvidenceGateError) {
+      throw new IllegalRunEventError("Learning Artifact draft 未通过 Evidence Gate");
+    }
+    throw error;
+  }
+  const expectedBinding = createPublicationApprovalBinding({
+    draftHash: draftArtifact.sha256,
+    publicationTarget,
+  });
+  if (
+    hashUtf8Text(markdown) !== draftArtifact.sha256 ||
+    Buffer.byteLength(markdown, "utf8") !== draftArtifact.byteLength ||
+    !publicationBindingsEqual(expectedBinding, publicationBinding) ||
+    publicationBinding.draftHash !== draftArtifact.sha256
+  ) {
+    // draft artifact 不只靠 CAS identity 可信：reducer 对同一 Proposal/Evidence
+    // 重新渲染，确保模型无法把未验证 citation 或另一份 Markdown 偷换进审批。
+    throw new IllegalRunEventError("Learning Artifact draft 与 Evidence 或审批绑定不一致");
+  }
+  if (!isIsoUtc(occurredAt)) {
+    throw new IllegalRunEventError("Learning Artifact draft 时间无效");
+  }
+}
+
+function validatePublicationApprovalReceipt(
+  draftArtifact: ArtifactReference,
+  publicationTarget: PublicationTarget,
+  publicationBinding: PublicationApprovalBinding,
+  receipt: PublicationApprovalReceipt,
+  occurredAt: string,
+): void {
+  const expectedBinding = createPublicationApprovalBinding({
+    draftHash: draftArtifact.sha256,
+    publicationTarget,
+  });
+  if (
+    !hasExactKeys(receipt, [
+      "approvalId",
+      "kind",
+      "approvedBy",
+      "approvedAt",
+      "draftHash",
+      "targetCanonicalPath",
+      "parentDevice",
+      "parentInode",
+      "bindingHash",
+    ]) ||
+    receipt.kind !== "publication" ||
+    receipt.approvedBy !== "user-command" ||
+    receipt.approvalId.trim() === "" ||
+    receipt.approvedAt !== occurredAt ||
+    !isIsoUtc(receipt.approvedAt) ||
+    !publicationBindingsEqual(expectedBinding, publicationBinding) ||
+    !publicationBindingsEqual(expectedBinding, receipt)
+  ) {
+    throw new IllegalRunEventError("publication approval Receipt 与等待边界不一致");
+  }
+}
+
+function validatePublishedLearningArtifact(
+  draftArtifact: ArtifactReference,
+  publicationTarget: PublicationTarget,
+  learningArtifact: PublishedLearningArtifact,
+  occurredAt: string,
+): void {
+  if (
+    !hasExactKeys(learningArtifact, [
+      "targetCanonicalPath",
+      "sha256",
+      "publishedAt",
+    ]) ||
+    learningArtifact.targetCanonicalPath !== publicationTarget.targetCanonicalPath ||
+    learningArtifact.sha256 !== draftArtifact.sha256 ||
+    learningArtifact.publishedAt !== occurredAt ||
+    !isIsoUtc(learningArtifact.publishedAt)
+  ) {
+    throw new IllegalRunEventError("已发布 Learning Artifact 与批准 draft 不一致");
+  }
+}
+
+function hasExactPublicationTargetShape(target: PublicationTarget): boolean {
+  return (
+    hasExactKeys(target, ["targetCanonicalPath", "parentDevice", "parentInode"]) &&
+    isAbsolute(target.targetCanonicalPath) &&
+    /^\d+$/.test(target.parentDevice) &&
+    /^\d+$/.test(target.parentInode)
+  );
 }
 
 function sourceBytesFromObservations(

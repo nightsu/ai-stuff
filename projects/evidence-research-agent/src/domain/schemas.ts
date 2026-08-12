@@ -9,8 +9,13 @@ import {
 import type {
   Claim,
   EvidenceRecord,
+  LearningArtifactProposal,
   PlanApprovalBinding,
   PlanApprovalReceipt,
+  PublicationApprovalBinding,
+  PublicationApprovalReceipt,
+  PublicationTarget,
+  PublishedLearningArtifact,
   ReadSourceRequest,
   ResearchPlan,
   ResearchRunEvent,
@@ -237,6 +242,71 @@ const claimSchema = z
   .strict()
   .transform((claim): Claim => claim);
 
+const learningArtifactProposalSchema = z
+  .object({
+    title: z.string().trim().min(1),
+    summary: z.string().trim().min(1),
+    claimIds: z.array(z.string().trim().min(1)).min(1),
+  })
+  .strict()
+  .transform((proposal): LearningArtifactProposal => proposal);
+
+const publicationTargetSchema = z
+  .object({
+    targetCanonicalPath: z
+      .string()
+      .min(1)
+      .refine(isAbsolute, "Learning Artifact target 必须是绝对路径"),
+    parentDevice: z.string().regex(/^\d+$/),
+    parentInode: z.string().regex(/^\d+$/),
+  })
+  .strict()
+  .transform((target): PublicationTarget => target);
+
+const publicationApprovalBindingSchema = z
+  .object({
+    draftHash: sha256Schema,
+    targetCanonicalPath: z
+      .string()
+      .min(1)
+      .refine(isAbsolute, "publication target 必须是绝对路径"),
+    parentDevice: z.string().regex(/^\d+$/),
+    parentInode: z.string().regex(/^\d+$/),
+    bindingHash: sha256Schema,
+  })
+  .strict()
+  .transform((binding): PublicationApprovalBinding => binding);
+
+const publicationApprovalReceiptSchema = z
+  .object({
+    approvalId: z.string().trim().min(1),
+    kind: z.literal("publication"),
+    approvedBy: z.literal("user-command"),
+    approvedAt: z.iso.datetime(),
+    draftHash: sha256Schema,
+    targetCanonicalPath: z
+      .string()
+      .min(1)
+      .refine(isAbsolute, "publication receipt target 必须是绝对路径"),
+    parentDevice: z.string().regex(/^\d+$/),
+    parentInode: z.string().regex(/^\d+$/),
+    bindingHash: sha256Schema,
+  })
+  .strict()
+  .transform((receipt): PublicationApprovalReceipt => receipt);
+
+const publishedLearningArtifactSchema = z
+  .object({
+    targetCanonicalPath: z
+      .string()
+      .min(1)
+      .refine(isAbsolute, "published target 必须是绝对路径"),
+    sha256: sha256Schema,
+    publishedAt: z.iso.datetime(),
+  })
+  .strict()
+  .transform((artifact): PublishedLearningArtifact => artifact);
+
 const planApprovalBindingSchema = z
   .object({
     questionHash: sha256Schema,
@@ -284,6 +354,49 @@ const runStateSchema = z.discriminatedUnion("type", [
     sourceBytesRead: z.number().int().nonnegative(),
     evidenceRecords: z.array(evidenceRecordSchema),
     claims: z.array(claimSchema),
+  }),
+  z.object({
+    type: z.literal("waiting_publication_approval"),
+    planArtifact: artifactReferenceSchema,
+    approvalReceipt: planApprovalReceiptSchema,
+    sourceReadObservations: z.array(sourceReadObservationSchema),
+    sourceBytesRead: z.number().int().nonnegative(),
+    evidenceRecords: z.array(evidenceRecordSchema),
+    claims: z.array(claimSchema),
+    draftArtifact: artifactReferenceSchema,
+    proposal: learningArtifactProposalSchema,
+    publicationTarget: publicationTargetSchema,
+    publicationBinding: publicationApprovalBindingSchema,
+    proposedAt: z.iso.datetime(),
+  }),
+  z.object({
+    type: z.literal("ready_to_publish"),
+    planArtifact: artifactReferenceSchema,
+    approvalReceipt: planApprovalReceiptSchema,
+    sourceReadObservations: z.array(sourceReadObservationSchema),
+    sourceBytesRead: z.number().int().nonnegative(),
+    evidenceRecords: z.array(evidenceRecordSchema),
+    claims: z.array(claimSchema),
+    draftArtifact: artifactReferenceSchema,
+    proposal: learningArtifactProposalSchema,
+    publicationTarget: publicationTargetSchema,
+    publicationBinding: publicationApprovalBindingSchema,
+    publicationReceipt: publicationApprovalReceiptSchema,
+  }),
+  z.object({
+    type: z.literal("completed"),
+    planArtifact: artifactReferenceSchema,
+    approvalReceipt: planApprovalReceiptSchema,
+    sourceReadObservations: z.array(sourceReadObservationSchema),
+    sourceBytesRead: z.number().int().nonnegative(),
+    evidenceRecords: z.array(evidenceRecordSchema),
+    claims: z.array(claimSchema),
+    draftArtifact: artifactReferenceSchema,
+    proposal: learningArtifactProposalSchema,
+    publicationTarget: publicationTargetSchema,
+    publicationBinding: publicationApprovalBindingSchema,
+    publicationReceipt: publicationApprovalReceiptSchema,
+    learningArtifact: publishedLearningArtifactSchema,
   }),
 ]);
 
@@ -368,6 +481,42 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
         .strict(),
     })
     .strict(),
+  z
+    .object({
+      ...eventEnvelopeSchema,
+      type: z.literal("learning_artifact_draft_proposed"),
+      payload: z
+        .object({
+          draftArtifact: artifactReferenceSchema,
+          proposal: learningArtifactProposalSchema,
+          publicationTarget: publicationTargetSchema,
+          publicationBinding: publicationApprovalBindingSchema,
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...eventEnvelopeSchema,
+      type: z.literal("publication_approved"),
+      payload: z
+        .object({
+          publicationReceipt: publicationApprovalReceiptSchema,
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      ...eventEnvelopeSchema,
+      type: z.literal("learning_artifact_published"),
+      payload: z
+        .object({
+          learningArtifact: publishedLearningArtifactSchema,
+        })
+        .strict(),
+    })
+    .strict(),
 ]);
 
 export function parseSourceScope(input: unknown): SourceScope {
@@ -380,6 +529,12 @@ export function parseRequestedSourceScope(input: unknown): RequestedSourceScope 
 
 export function parseResearchPlan(input: unknown): ResearchPlan {
   return researchPlanSchema.parse(input);
+}
+
+export function parseLearningArtifactProposal(
+  input: unknown,
+): LearningArtifactProposal {
+  return learningArtifactProposalSchema.parse(input);
 }
 
 export function parseRunBudget(input: unknown): RunBudget {
