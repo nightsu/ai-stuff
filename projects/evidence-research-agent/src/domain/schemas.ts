@@ -12,6 +12,7 @@ import type {
   EvidenceRecord,
   LearningArtifactProposal,
   ModelTurn,
+  OperationAttempt,
   PlanApprovalBinding,
   PlanApprovalReceipt,
   PublicationApprovalBinding,
@@ -19,6 +20,7 @@ import type {
   PublicationTarget,
   PublishedLearningArtifact,
   ReadSourceRequest,
+  RetryPolicy,
   ResearchPlan,
   ResearchRunEvent,
   ResearchToolObservation,
@@ -77,6 +79,17 @@ export const runBudgetSchema = z.object({
   maxSourceBytes: z.number().int().positive(),
   maxWallTimeMs: z.number().int().positive(),
 });
+
+export const retryPolicySchema = z.object({
+  version: z.string().trim().min(1),
+  modelMaxAttempts: z.number().int().positive(),
+  toolMaxAttempts: z.number().int().positive(),
+  baseDelayMs: z.number().int().nonnegative(),
+  maxDelayMs: z.number().int().nonnegative(),
+}).strict().refine(
+  (policy) => policy.baseDelayMs <= policy.maxDelayMs,
+  "retry base delay 不能大于上限",
+);
 
 export const researchPlanSchema = z.object({
   title: z.string().trim().min(1),
@@ -358,8 +371,16 @@ const planApprovalBindingSchema = z
     sourceScopeHash: sha256Schema,
     budgetVersion: z.string().trim().min(1),
     budgetHash: sha256Schema,
+    retryPolicyVersion: z.string().trim().min(1).optional(),
+    retryPolicyHash: sha256Schema.optional(),
     bindingHash: sha256Schema,
   })
+  .refine(
+    (binding) =>
+      (binding.retryPolicyVersion === undefined) ===
+        (binding.retryPolicyHash === undefined),
+    "Retry Policy version 与 hash 必须同时存在或同时省略",
+  )
   .transform((binding): PlanApprovalBinding => binding);
 
 const planApprovalReceiptSchema = z
@@ -374,8 +395,16 @@ const planApprovalReceiptSchema = z
     sourceScopeHash: sha256Schema,
     budgetVersion: z.string().trim().min(1),
     budgetHash: sha256Schema,
+    retryPolicyVersion: z.string().trim().min(1).optional(),
+    retryPolicyHash: sha256Schema.optional(),
   })
   .strict()
+  .refine(
+    (receipt) =>
+      (receipt.retryPolicyVersion === undefined) ===
+        (receipt.retryPolicyHash === undefined),
+    "Retry Policy version 与 hash 必须同时存在或同时省略",
+  )
   .transform((receipt): PlanApprovalReceipt => receipt);
 
 const researchToolIntentSchema = z
@@ -415,6 +444,20 @@ const researchToolOutputSchema = z.union([
   z.object({ unresolvedQuestions: z.array(z.string().trim().min(1)) }).strict(),
 ]);
 
+const normalizedFailureSchema = z.object({
+  category: z.enum([
+    "infrastructure_transient",
+    "model_contract",
+    "model_permanent",
+    "permission_denied",
+    "stale_state",
+    "tool_execution",
+    "invariant_violation",
+  ]),
+  code: z.string().trim().min(1),
+  retryAfterMs: z.number().int().nonnegative().optional(),
+}).strict();
+
 const researchToolObservationSchema = z
   .object({
     observationId: z.string().trim().min(1),
@@ -423,12 +466,49 @@ const researchToolObservationSchema = z
     toolName: researchToolIntentSchema.shape.name,
     status: z.enum(["succeeded", "invalid", "denied", "failed"]),
     code: z.string().trim().min(1).optional(),
+    failure: normalizedFailureSchema.optional(),
     summary: z.string().trim().min(1),
     output: researchToolOutputSchema.optional(),
     observedAt: z.iso.datetime(),
   })
   .strict()
   .transform((observation): ResearchToolObservation => observation);
+
+const operationAttemptCommonFields = {
+  attemptId: z.string().trim().min(1),
+  operationId: z.string().trim().min(1),
+  operationKind: z.enum(["model_turn", "search_sources"]),
+  attemptNumber: z.number().int().positive(),
+  retryPolicy: retryPolicySchema,
+  startedAt: z.iso.datetime(),
+  toolCallId: z.string().trim().min(1).optional(),
+  intentId: z.string().trim().min(1).optional(),
+  latestSteering: z.string().trim().min(1).optional(),
+};
+
+const inProgressOperationAttemptSchema = z.object({
+  ...operationAttemptCommonFields,
+  outcome: z.literal("in_progress"),
+}).strict();
+
+const completedOperationAttemptSchema = z.object({
+  ...operationAttemptCommonFields,
+  outcome: z.enum([
+    "succeeded",
+    "retryable_failure",
+    "retry_exhausted",
+    "permanent_failure",
+  ]),
+  completedAt: z.iso.datetime(),
+  durationMs: z.number().int().nonnegative(),
+  failure: normalizedFailureSchema.optional(),
+  retryDelayMs: z.number().int().nonnegative().optional(),
+}).strict();
+
+const operationAttemptSchema = z.union([
+  inProgressOperationAttemptSchema,
+  completedOperationAttemptSchema,
+]).transform((attempt): OperationAttempt => attempt);
 
 const remainingRunBudgetSchema = z.object({
   modelTurns: z.number().int().nonnegative(),
@@ -451,6 +531,7 @@ const evidenceBackedStateFields = {
   pendingToolIntents: z.array(researchToolIntentSchema),
   latestSteering: z.string().trim().min(1).optional(),
   researchStartedAt: z.iso.datetime().optional(),
+  operationAttempts: z.array(operationAttemptSchema),
 };
 
 const researchCompletionSchema = z.object({
@@ -478,6 +559,7 @@ const legacyExplicitPublicationFields = {
   researchToolObservations: z.tuple([]),
   evidenceGaps: z.tuple([]),
   pendingToolIntents: z.tuple([]),
+  operationAttempts: z.array(operationAttemptSchema),
 };
 
 const researchLoopPublicationFields = {
@@ -493,6 +575,7 @@ const researchLoopPublicationFields = {
   latestSteering: z.string().trim().min(1).optional(),
   researchStartedAt: z.iso.datetime(),
   completion: researchCompletionSchema,
+  operationAttempts: z.array(operationAttemptSchema),
 };
 
 const runStateSchema = z.union([
@@ -528,6 +611,21 @@ const runStateSchema = z.union([
       "wall_time",
     ]),
     remainingBudget: remainingRunBudgetSchema,
+  }),
+  z.object({
+    type: z.literal("retry_exhausted"),
+    ...evidenceBackedStateFields,
+    operationId: z.string().trim().min(1),
+    operationKind: z.enum(["model_turn", "search_sources"]),
+    attemptsUsed: z.number().int().positive(),
+    failure: normalizedFailureSchema,
+  }),
+  z.object({
+    type: z.literal("failed"),
+    ...evidenceBackedStateFields,
+    operationId: z.string().trim().min(1),
+    operationKind: z.enum(["model_turn", "search_sources"]),
+    failure: normalizedFailureSchema,
   }),
   z.object({
     type: z.literal("budget_exhausted"),
@@ -582,6 +680,7 @@ const runProjectionSchema = z.object({
   question: z.string().min(1),
   sourceScope: sourceScopeValueSchema,
   runBudget: runBudgetValueSchema,
+  retryPolicy: retryPolicySchema.optional(),
   state: runStateSchema,
   lastEventSequence: z.number().int().positive(),
   createdAt: z.iso.datetime(),
@@ -598,11 +697,12 @@ const eventEnvelopeSchema = {
 const researchRunEventSchema = z.discriminatedUnion("type", [
   z.object({
     ...eventEnvelopeSchema,
-    type: z.literal("run_created"),
-    payload: z.object({
-      question: z.string().trim().min(1),
-      sourceScope: sourceScopeValueSchema,
-      runBudget: runBudgetValueSchema,
+      type: z.literal("run_created"),
+      payload: z.object({
+        question: z.string().trim().min(1),
+        sourceScope: sourceScopeValueSchema,
+        runBudget: runBudgetValueSchema,
+        retryPolicy: retryPolicySchema.optional(),
     }),
   }),
   z.object({
@@ -663,17 +763,50 @@ const researchRunEventSchema = z.discriminatedUnion("type", [
     .strict(),
   z.object({
     ...eventEnvelopeSchema,
+    type: z.literal("operation_attempt_started"),
+    payload: z.object({ attempt: inProgressOperationAttemptSchema }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("operation_attempt_failed"),
+    payload: z.object({ attempt: completedOperationAttemptSchema }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("run_retry_exhausted"),
+    payload: z.object({
+      operationId: z.string().trim().min(1),
+      operationKind: z.enum(["model_turn", "search_sources"]),
+      attemptsUsed: z.number().int().positive(),
+      failure: normalizedFailureSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
+    type: z.literal("run_failed"),
+    payload: z.object({
+      operationId: z.string().trim().min(1),
+      operationKind: z.enum(["model_turn", "search_sources"]),
+      failure: normalizedFailureSchema,
+    }).strict(),
+  }).strict(),
+  z.object({
+    ...eventEnvelopeSchema,
     type: z.literal("model_turn_completed"),
     payload: z.object({
       turn: modelTurnSchema,
       generationStartedAt: z.iso.datetime(),
       latestSteering: z.string().trim().min(1).optional(),
+      attempt: completedOperationAttemptSchema.optional(),
     }).strict(),
   }).strict(),
   z.object({
     ...eventEnvelopeSchema,
     type: z.literal("research_tool_observed"),
-    payload: z.object({ observation: researchToolObservationSchema }).strict(),
+    payload: z.object({
+      observation: researchToolObservationSchema,
+      attempt: completedOperationAttemptSchema.optional(),
+    }).strict(),
   }).strict(),
   z.object({
     ...eventEnvelopeSchema,
@@ -758,6 +891,10 @@ export function parseLearningArtifactProposal(
 
 export function parseRunBudget(input: unknown): RunBudget {
   return runBudgetSchema.parse(input);
+}
+
+export function parseRetryPolicy(input: unknown): RetryPolicy {
+  return retryPolicySchema.parse(input);
 }
 
 export function parseResearchRunEvent(input: unknown): ResearchRunEvent {

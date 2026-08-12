@@ -1,8 +1,8 @@
-# Evidence Research Agent 架构（Issue #6）
+# Evidence Research Agent 架构（Issue #7）
 
-当前 slice 已经把 #5 的 Evidence-backed publication 路径接到真正有界的多轮 Research Loop：一个 durable approved 的 Run 每轮从 canonical facts 重建 Model View，由 Scripted Model 返回完整、provider-neutral Model Turn，Harness 再按原始 intent 顺序调度五个模型可见 Research Tools。研究只有在 `complete_research` 成功后才成为 `research_complete`；任一硬预算耗尽则 durable 进入 `budget_exhausted`，不会被当作完成或进入 publication。
+当前 slice 在 #6 的有界多轮 Research Loop 上加入了可审批 Retry Policy、durable operation attempts 和稳定 failure taxonomy。Model generation 与 `search_sources` 的每次物理 I/O 都由 Journal 中的 started/completed attempt 包围；完整 Model Turn 或 Search observation 与成功 attempt 原子提交。研究只有在 `complete_research` 成功后才成为 `research_complete`；硬预算、retry exhaustion 与不可恢复 failure 分别进入明确状态，不会被当作完成或进入 publication。
 
-外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。当前仍没有自动 retry、live model、并行 tool batch、预算扩展恢复或 publication crash reconciliation；这些分别属于后续 tickets。
+外层 workflow 仍由 Harness 确定性控制。模型不能审批计划、选择 Retry Policy、扩大 Source Scope、提高预算、调用 shell、绕过 Evidence Gate 或授权 publication。当前仍没有 live model、并行 tool batch、预算扩展恢复或 publication crash reconciliation；这些分别属于后续 tickets。
 
 ## 组件、端口与单向能力流
 
@@ -16,7 +16,12 @@ flowchart LR
   Projection --> View["Model View Builder<br/>pinned facts + deterministic trimming"]
   View --> Model["Model Port<br/>Scripted Model"]
   Model --> Loop["Bounded Research Loop"]
-  Loop -->|"model_turn_completed"| Journal
+  Loop --> Attempts["Attempt controller<br/>approved policy + wall time"]
+  Attempts -->|"operation_attempt_started"| Journal
+  Attempts --> Retry["Retry Scheduler<br/>provider hint + bounded backoff"]
+  Retry --> Attempts
+  Attempts -->|"failure / exhaustion / failed"| Journal
+  Attempts -->|"atomic success + Model Turn"| Journal
   Loop --> Scheduler["Research Tool Scheduler<br/>sequential in Issue #6"]
 
   subgraph ResearchTools["Exactly five model-visible Research Tools"]
@@ -50,6 +55,7 @@ flowchart LR
   end
 
   Search --> Policy
+  Scheduler --> Attempts
   Policy --> Searcher
   Searcher -->|"bounded matches"| SearchArtifact
   SearchArtifact --> Registry
@@ -83,6 +89,12 @@ flowchart LR
 
 `advanceResearch` 是当前主 seam。每轮开始时，Runtime 只从 Run Journal、derived Projection 和 plan artifact 构造新的 Model View；它不会把 Journal 或完整 `messages[]` 直接传给模型。fixed rules、批准计划、approval binding、预算版本与余额、pending intents、evidence gaps 和最新 steering 是 pinned facts。超过 Model View 字节上限时，Builder 先删除最旧 observations，再从尾部删除 Evidence；pinned facts 仍放不下便抛出 `ModelViewTooLargeError`，不请求 LLM 摘要隐藏约束。
 
+Retry Policy 与 question、plan artifact、Source Scope 和 Run Budget 一起在 `run_created` 时成为 durable fact，并由 Plan Approval binding 精确授权。Runtime 重启时即使传入不同或空的本地配置，现有 Run 的下一逻辑 operation 仍使用 Journal 中已批准的 policy；每个 operation 的首次 attempt 又把完整 policy 冻结进 attempt，确保 operation 中途重启时策略也不会变化。
+
+Model generation 与 `search_sources` 都遵循同一个 attempt protocol：外部 I/O 前提交 `operation_attempt_started`；成功 Model Turn/Search observation 与 `succeeded` attempt 同事务提交；瞬时基础设施 failure 追加带 duration、safe code、provider hint 与实际 delay 的失败 attempt；未知 Model error、Model schema error 与 invariant violation 进入 terminal `failed`；达到 attempt 上限进入 suspended `retry_exhausted`。普通只读 Search failure 是 `tool_execution` observation，交回下一轮 Model View，而不是终止 Run。Search retries 共享同一 `toolCallId`，预算只计算一次逻辑调用。
+
+provider hint 是服务端最短等待，不能被本地 backoff 上限截短；本地指数 backoff 本身受 `maxDelayMs` 限制。attempt start 初始化 Research Loop wall-time，等待也消耗该时间；每次等待后、下一外部 I/O 前重新计算批准预算，耗尽则先 durable 进入 `budget_exhausted`。因此 retry 同时受 attempt policy 与 wall-time policy 约束。
+
 Harness 只在完整 generation 返回并通过结构 schema 后追加 `model_turn_completed`。该事件同时把有序 tool intents 变为 durable pending work；重启后的 `advanceResearch` 会先消费这些 pending intents，而不是再次 generation。`ResearchLoopLifecycleHooks` 为测试暴露 Model Turn 以及五个 Research Tool 的命名 Fault Injection Points：Model Turn 有 Journal append 前/后；search/read 有私有 CAS 写入后与 Journal/registry 原子提交后；Evidence、Claim 和 completion 有 Journal commit 前/后。commit 前中断时 pending intent 仍是 canonical work，重启会重试；commit 后中断时 Journal 已消费 intent，重启不会重复工具。search/read 的孤立 CAS 对象不能冒充 Journal 事实。Issue #6 的 scheduler 刻意顺序执行全部 intents；safe sibling search/read 的并发和原始顺序回填留给 Issue #11。
 
 `search_sources` 与 `read_source` 共享 Source Scope 权限边界。搜索通过可注入 `SourceSearchPort` 调用默认的固定参数 `rg` adapter，下推 extension、exclusion、secret 与 file-size 过滤，启动前复核批准 root identity，每个命中再过 realpath preflight。完整命中列表写入私有 JSON Artifact；Journal observation 只保存 artifact 引用和 `matchCount`，下一轮 Model View 再按需校验并展开最近结果。搜索仍不创建 Source Snapshot。只有成功 explicit read 才冻结完整原始 UTF-8 字节；`invalid`、`denied`、`stale` 与 `failed` 都只落安全 observation。Evidence Record 也没有读取 live file 的能力，只能由 Runtime 从已持久化的成功 observation 逐字段派生。
@@ -105,6 +117,8 @@ stateDiagram-v2
   created --> planning: planning_started
   planning --> waiting_plan_approval: plan_proposed
   waiting_plan_approval --> researching: plan_approved
+  researching --> researching: operation_attempt_started
+  researching --> researching: operation_attempt_failed (retryable)
   researching --> researching: model_turn_completed
   researching --> researching: research_tool_observed
   researching --> researching: source_read_observed
@@ -112,19 +126,31 @@ stateDiagram-v2
   researching --> researching: claim_recorded
   researching --> research_complete: research_completed
   researching --> budget_exhausted: run_budget_exhausted
+  researching --> retry_exhausted: run_retry_exhausted
+  researching --> failed: run_failed
   research_complete --> budget_exhausted: run_budget_exhausted
   research_complete --> waiting_publication_approval: learning_artifact_draft_proposed
   waiting_publication_approval --> ready_to_publish: publication_approved
   ready_to_publish --> completed: learning_artifact_published
 
   note right of researching
-    complete Model Turn becomes canonical first
-    then pending intents execute in source order
+    external I/O starts only after durable attempt
+    atomic success prevents duplicate resampling
   end note
 
   note right of budget_exhausted
     resumable non-success suspension
     budget extension belongs to Issue #9
+  end note
+
+  note right of retry_exhausted
+    suspended after approved attempt limit
+    no implicit continuation
+  end note
+
+  note right of failed
+    terminal model contract/permanent
+    or invariant violation
   end note
 
   note right of waiting_publication_approval
@@ -144,7 +170,7 @@ publication 状态以 `researchOrigin` 判别 provenance：Issue #5 的零 Resea
 
 `publication_approved` 也不是“文件已经写好”的断言。用户命令只批准等待状态中显示的 `draftHash`、canonical Output Root、`targetCanonicalPath`、父目录 `device` 和 `inode` 的精确聚合 hash。Runtime 在接受 receipt 前重新捕获 root 与 target parent identity；若目录被替换、target 逃出 root 或 canonical target 改变，旧 binding 失效。receipt 进入 `ready_to_publish` 后，只有显式 `publishLearningArtifact` 才会调用外部 publisher；正常 publisher 返回后才追加 `learning_artifact_published` 并进入 terminal `completed`。
 
-Trace 依次暴露不含源正文的 lineage：`read_source` 的 observation/tool call/Snapshot，**每个 Evidence 的相同 observation/tool call/Snapshot**，再到 Claim ID、draft artifact ID、publication receipt ID 与最终 Markdown SHA-256。这样可以从最终工件反向追到每条结构化证据实际来自哪次 Tool 调用，而不会把绝对来源路径、摘录正文、私有 Runtime Home 或 OS 错误放入 Trace。
+Trace 依次暴露不含秘密的 lineage：每个 attempt 的 operation kind/identity、序号、outcome、duration、Retry Policy version、failure category/code 与 retry delay；`read_source` 的 observation/tool call/Snapshot；**每个 Evidence 的相同 observation/tool call/Snapshot**；再到 Claim ID、draft artifact ID、publication receipt ID 与最终 Markdown SHA-256。schema error、permission denial、stale state、ordinary tool execution、infrastructure transient、model permanent 与 invariant violation 均使用 stable category/code，不包含绝对来源路径、provider payload、摘录正文、私有 Runtime Home 或 OS 错误。
 
 ## 正常发布语义与未实现的 crash 边界
 
@@ -156,7 +182,6 @@ Trace 依次暴露不含源正文的 lineage：`read_source` 的 observation/too
 
 ## 当前边界与后续 ticket
 
-- Issue #7 才加入错误分类、attempt、retry/backoff 与恢复策略。
 - Issue #8 才用 Vercel AI SDK `streamText` 接入 OpenAI-compatible live Model Port；SDK 类型仍隔离在 `ModelPort` 后。
 - Issue #9 才加入用户暂停、取消、预算版本扩展以及从 `budget_exhausted` 的恢复。
 - Issue #11 才加入 safe search/read sibling batch 的有界并发与模型原始顺序回填。

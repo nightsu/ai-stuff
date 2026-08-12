@@ -56,6 +56,10 @@ export type {
   PlanRequest,
   SourceSearchPort,
   SourceSearchRequest,
+  RetryScheduler,
+} from "./application/ports.js";
+export {
+  InfrastructureFailureError,
 } from "./application/ports.js";
 export type {
   AdvanceResearchCommand,
@@ -110,6 +114,9 @@ export type {
   ResearchToolObservation,
   SourceSearchMatch,
   BudgetExhaustedRunState,
+  RetryPolicy,
+  OperationAttempt,
+  NormalizedFailure,
   ResearchCompleteRunState,
   PublicationApprovalBinding,
   PublicationApprovalReceipt,

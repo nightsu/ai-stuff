@@ -286,6 +286,29 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
           expect.objectContaining({ code: "source_not_found" }),
         ]),
       );
+      const trace = await fixture.runtime.traceRun({ runId: fixture.runId });
+      expect(trace.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "research_tool_observed",
+          failureCategory: "model_contract",
+          failureCode: "invalid_tool_schema",
+        }),
+        expect.objectContaining({
+          type: "source_read_observed",
+          failureCategory: "permission_denied",
+          failureCode: "path_escape",
+        }),
+        expect.objectContaining({
+          type: "research_tool_observed",
+          failureCategory: "stale_state",
+          failureCode: "stale_observation",
+        }),
+        expect.objectContaining({
+          type: "source_read_observed",
+          failureCategory: "tool_execution",
+          failureCode: "source_not_found",
+        }),
+      ]));
     } finally {
       fixture.runtime.close();
     }
@@ -1772,9 +1795,13 @@ function invalidSearchObservationEvent(
         toolCallId: `tool-call-invalid-search-${sequence}`,
         intentId,
         toolName: "search_sources",
-        status: "invalid",
-        code: "invalid_tool_schema",
-        summary: "invalid search schema",
+              status: "invalid",
+              code: "invalid_tool_schema",
+              failure: {
+                category: "model_contract",
+                code: "invalid_tool_schema",
+              },
+              summary: "invalid search schema",
         observedAt: occurredAt,
       },
     },

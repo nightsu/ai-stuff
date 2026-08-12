@@ -9,10 +9,47 @@ import type {
   SourceScope,
 } from "../domain/types.js";
 
+/** provider/search adapter 可抛出的安全基础设施失败代码。 */
+export type InfrastructureFailureCode =
+  | "connection_failed"
+  | "rate_limited"
+  | "service_unavailable"
+  | "request_timeout";
+
+/** 基础设施失败可选的安全 retry 元数据。 */
+export interface InfrastructureFailureOptions {
+  /** provider 建议的 retry 最短等待，单位为毫秒。 */
+  readonly retryAfterMs?: number | undefined;
+}
+
+/** 端口通过此错误显式声明基础设施失败是否可由 Harness 自动 retry。 */
+export class InfrastructureFailureError extends Error {
+  /** 不依赖原始异常消息的稳定基础设施代码。 */
+  public readonly code: InfrastructureFailureCode;
+  /** provider 建议的 retry 最短等待，单位为毫秒。 */
+  public readonly retryAfterMs?: number | undefined;
+
+  public constructor(
+    code: InfrastructureFailureCode,
+    options: InfrastructureFailureOptions = {},
+  ) {
+    super("基础设施操作失败");
+    this.name = "InfrastructureFailureError";
+    this.code = code;
+    this.retryAfterMs = options.retryAfterMs;
+  }
+}
+
 /** 为运行时提供可注入时间的边界。 */
 export interface Clock {
   /** 返回当前时间的 ISO 8601 UTC 字符串。 */
   now(): string;
+}
+
+/** Harness 在两个物理 attempts 之间执行可注入等待的边界。 */
+export interface RetryScheduler {
+  /** 等待严格非负整数毫秒；测试实现可以只记录而不真实阻塞。 */
+  wait(delayMs: number): Promise<void>;
 }
 
 /** 为 canonical identity 提供可注入生成策略的边界。 */

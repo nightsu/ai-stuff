@@ -30,6 +30,7 @@ import {
   readSourceRequestSchema,
   parseRequestedSourceScope,
   parseRunBudget,
+  parseRetryPolicy,
 } from "../domain/schemas.js";
 import type {
   ArtifactReference,
@@ -55,6 +56,11 @@ import type {
   ResearchToolObservation,
   RemainingRunBudget,
   SucceededSourceReadObservation,
+  RetryPolicy,
+  CompletedOperationAttempt,
+  InProgressOperationAttempt,
+  NormalizedFailure,
+  RetryableOperationKind,
 } from "../domain/types.js";
 import { ContentAddressedArtifactStore } from "../infrastructure/content-addressed-artifact-store.js";
 import {
@@ -74,7 +80,16 @@ import {
   PublicationTargetPreparationError,
 } from "../infrastructure/learning-artifact-publisher.js";
 import { RgSourceSearch } from "../infrastructure/private-source-search.js";
-import type { Clock, IdGenerator, ModelPort, SourceSearchPort } from "./ports.js";
+import {
+  InfrastructureFailureError,
+} from "./ports.js";
+import type {
+  Clock,
+  IdGenerator,
+  ModelPort,
+  RetryScheduler,
+  SourceSearchPort,
+} from "./ports.js";
 
 /** 打开一个 headless runtime 所需的基础设施与可控边界。 */
 export interface OpenRuntimeOptions {
@@ -94,10 +109,16 @@ export interface OpenRuntimeOptions {
   readonly researchLoopHooks?: ResearchLoopLifecycleHooks;
   /** 单个 Model View 允许的确定性 JSON UTF-8 字节数；不足以容纳 pinned facts 时暂停。 */
   readonly maxModelViewBytes?: number;
+  /** 可选自动 retry 配置；省略时每个逻辑操作只执行一次。 */
+  readonly retryPolicy?: RetryPolicy;
+  /** 可选 retry 等待边界；生产默认使用真实 timer。 */
+  readonly retryScheduler?: RetryScheduler;
 }
 
 /** Research Loop durable 边界上的命名故障注入点。 */
 export interface ResearchLoopLifecycleHooks {
+  /** operation attempt started fact 已提交、外部 Model/search I/O 尚未执行前运行。 */
+  readonly afterOperationAttemptStarted?: () => void | Promise<void>;
   /** 完整 Model Turn 已构造、但尚未追加 Journal 前运行。 */
   readonly beforeModelTurnJournalAppend?: () => void | Promise<void>;
   /** `model_turn_completed` 已 durable 提交、但 pending intent 尚未执行前运行。 */
@@ -584,6 +605,20 @@ const systemClock: Clock = {
   now: () => new Date().toISOString(),
 };
 
+const noAutomaticRetryPolicy: RetryPolicy = {
+  version: "retry-disabled-v1",
+  modelMaxAttempts: 1,
+  toolMaxAttempts: 1,
+  baseDelayMs: 0,
+  maxDelayMs: 0,
+};
+
+const systemRetryScheduler: RetryScheduler = {
+  wait: async (delayMs) => {
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+  },
+};
+
 const uuidGenerator: IdGenerator = {
   nextRunId: () => `run-${randomUUID()}`,
   nextEventId: () => `event-${randomUUID()}`,
@@ -591,6 +626,30 @@ const uuidGenerator: IdGenerator = {
   nextToolCallId: () => `tool-call-${randomUUID()}`,
   nextObservationId: () => `observation-${randomUUID()}`,
 };
+
+/** 下一次物理 attempt 复用或创建逻辑 operation 所需的 durable 上下文。 */
+interface RetryContext {
+  /** 多个物理 attempts 共享的逻辑 operation identity。 */
+  readonly operationId: string;
+  /** 下一物理 attempt 在逻辑 operation 内的 1-based 序号。 */
+  readonly attemptNumber: number;
+  /** 第一个 attempt 开始时间，用于计算完整逻辑 operation wall time。 */
+  readonly operationStartedAt: string;
+  /** 逻辑 operation 第一次 started 时冻结、后续重启不得替换的策略。 */
+  readonly retryPolicy: RetryPolicy;
+  /** 开始下一 attempt 前应执行的等待；首次 attempt 时省略。 */
+  readonly retryDelayMs?: number | undefined;
+  /** search retry 跨 attempts 复用的逻辑 Research Tool call identity。 */
+  readonly toolCallId?: string | undefined;
+}
+
+/** 在 Journal 提交 started fact 后返回的 canonical attempt 与新 Projection。 */
+interface StartedAttemptResult {
+  /** 已包含 `operation_attempt_started` 的最新 Projection。 */
+  readonly projection: RunProjection;
+  /** 即将执行外部 I/O、且已 durable 的物理 attempt。 */
+  readonly attempt: InProgressOperationAttempt;
+}
 
 /** 去除 registry-only 时间字段，保证 Journal artifact 引用只保存可回放身份与内容元数据。 */
 function stripArtifactCreatedAt(artifact: PersistedArtifact): ArtifactReference {
@@ -618,6 +677,12 @@ export class ResearchAgentRuntime {
   readonly #researchLoopHooks: ResearchLoopLifecycleHooks;
   /** 不依赖 tokenizer/provider 的确定性 JSON byte 上限。 */
   readonly #maxModelViewBytes: number;
+  /** 本 Runtime 新逻辑操作采用并冻结进 attempt 的 Retry Policy。 */
+  readonly #retryPolicy: RetryPolicy;
+  /** caller 是否显式启用 attempt/retry 协议；false 时保持旧 Journal identity 序列。 */
+  readonly #retryEnabled: boolean;
+  /** 自动 retry 之间执行等待的可注入边界。 */
+  readonly #retryScheduler: RetryScheduler;
 
   private constructor(options: OpenRuntimeOptions) {
     // 两个 store 只能收到同一次集中准备得到的 canonical Runtime Home，避免
@@ -627,6 +692,11 @@ export class ResearchAgentRuntime {
     this.#ids = options.ids ?? uuidGenerator;
     this.#model = options.model;
     this.#maxModelViewBytes = options.maxModelViewBytes ?? 32_768;
+    this.#retryEnabled = options.retryPolicy !== undefined;
+    this.#retryPolicy = parseRetryPolicy(
+      options.retryPolicy ?? noAutomaticRetryPolicy,
+    );
+    this.#retryScheduler = options.retryScheduler ?? systemRetryScheduler;
     this.#artifacts = new ContentAddressedArtifactStore(runtimeHome);
     this.#store = new SqliteRunStore(runtimeHome);
     this.#publisher = new LearningArtifactPublisher({
@@ -671,7 +741,12 @@ export class ResearchAgentRuntime {
         sequence: 1,
         type: "run_created",
         occurredAt: createdAt,
-        payload: { question: parsed.question, sourceScope, runBudget },
+        payload: {
+          question: parsed.question,
+          sourceScope,
+          runBudget,
+          ...(this.#retryEnabled ? { retryPolicy: this.#retryPolicy } : {}),
+        },
       },
       {
         eventId: this.#ids.nextEventId(),
@@ -704,6 +779,7 @@ export class ResearchAgentRuntime {
       planHash: artifact.sha256,
       sourceScope,
       runBudget,
+      ...(this.#retryEnabled ? { retryPolicy: this.#retryPolicy } : {}),
     });
     const planProposed: ResearchRunEvent = {
       eventId: this.#ids.nextEventId(),
@@ -814,7 +890,11 @@ export class ResearchAgentRuntime {
     // 重新 generation，还是先完成已经 durable 的 pending intent。
     while (true) {
       const current = this.#store.readProjection(runId);
-      if (current.state.type === "budget_exhausted") {
+      if (
+        current.state.type === "budget_exhausted" ||
+        current.state.type === "retry_exhausted" ||
+        current.state.type === "failed"
+      ) {
         return current;
       }
       if (current.state.type === "research_complete") {
@@ -866,16 +946,96 @@ export class ResearchAgentRuntime {
         remainingBudget,
         steering ?? current.state.latestSteering,
       ));
+      if (current.retryPolicy === undefined) {
+        let generated: z.infer<typeof researchTurnOutputSchema>;
+        try {
+          generated = researchTurnOutputSchema.parse(
+            await this.#model.generateResearchTurn(view),
+          );
+        } catch {
+          throw new ResearchLoopError();
+        }
+        const occurredAt = this.#clock.now();
+        const eventId = this.#ids.nextEventId();
+        const turn: ModelTurn = {
+          turnId: `turn-${eventId}`,
+          ...generated,
+          completedAt: occurredAt,
+        };
+        const event: ResearchRunEvent = {
+          eventId,
+          runId,
+          sequence: current.lastEventSequence + 1,
+          type: "model_turn_completed",
+          occurredAt,
+          payload: {
+            turn,
+            generationStartedAt: now,
+            ...(steering === undefined ? {} : { latestSteering: steering }),
+          },
+        };
+        try {
+          await this.#runResearchLoopHook(
+            this.#researchLoopHooks.beforeModelTurnJournalAppend,
+          );
+          this.#store.appendEvents(
+            runId,
+            current.lastEventSequence,
+            [event],
+          );
+          await this.#runResearchLoopHook(
+            this.#researchLoopHooks.afterModelTurnJournalAppend,
+          );
+        } catch {
+          throw new ResearchLoopError();
+        }
+        continue;
+      }
+      const recovered = this.#recoverInterruptedAttempt(current);
+      if (recovered !== undefined) {
+        this.#commitFailedAttempt(current, recovered);
+        continue;
+      }
+      const retryContext = this.#retryContext(current, "model_turn");
+      if (retryContext.retryDelayMs !== undefined) {
+        const waited = await this.#waitBeforeRetry(
+          current,
+          retryContext.retryDelayMs,
+          "model",
+        );
+        if (waited !== undefined) return waited;
+      }
+      const started = await this.#startAttempt(
+        current,
+        "model_turn",
+        retryContext.operationId,
+        retryContext.attemptNumber,
+        retryContext.retryPolicy,
+        undefined,
+        undefined,
+        steering ?? current.state.latestSteering,
+      );
       let generated: z.infer<typeof researchTurnOutputSchema>;
       try {
         generated = researchTurnOutputSchema.parse(
           await this.#model.generateResearchTurn(view),
         );
-      } catch {
-        throw new ResearchLoopError();
+      } catch (error) {
+        this.#commitFailedAttempt(
+          started.projection,
+          this.#completeFailedAttempt(
+            started.attempt,
+            this.#normalizeModelFailure(error),
+          ),
+        );
+        continue;
       }
       const occurredAt = this.#clock.now();
       const eventId = this.#ids.nextEventId();
+      const succeededAttempt = this.#completeSucceededAttempt(
+        started.attempt,
+        occurredAt,
+      );
       const turn: ModelTurn = {
         turnId: `turn-${eventId}`,
         ...generated,
@@ -884,20 +1044,25 @@ export class ResearchAgentRuntime {
       const event: ResearchRunEvent = {
         eventId,
         runId,
-        sequence: current.lastEventSequence + 1,
+        sequence: started.projection.lastEventSequence + 1,
         type: "model_turn_completed",
         occurredAt,
         payload: {
           turn,
-          generationStartedAt: now,
+          generationStartedAt: retryContext.operationStartedAt,
           ...(steering === undefined ? {} : { latestSteering: steering }),
+          attempt: succeededAttempt,
         },
       };
       try {
         await this.#runResearchLoopHook(
           this.#researchLoopHooks.beforeModelTurnJournalAppend,
         );
-        this.#store.appendEvents(runId, current.lastEventSequence, [event]);
+        this.#store.appendEvents(
+          runId,
+          started.projection.lastEventSequence,
+          [event],
+        );
         await this.#runResearchLoopHook(
           this.#researchLoopHooks.afterModelTurnJournalAppend,
         );
@@ -1047,12 +1212,143 @@ export class ResearchAgentRuntime {
       this.#appendGenericToolObservation(current, intent, "invalid", "invalid_tool_schema");
       return;
     }
+    if (current.retryPolicy === undefined) {
+      await this.#executeSearchIntentOnce(current, intent, parsed.data);
+      return;
+    }
+    const recovered = this.#recoverInterruptedAttempt(current);
+    if (recovered !== undefined) {
+      this.#commitFailedAttempt(current, recovered);
+      return;
+    }
+    const retryContext = this.#retryContext(current, "search_sources");
+    if (retryContext.retryDelayMs !== undefined) {
+      const waited = await this.#waitBeforeRetry(
+        current,
+        retryContext.retryDelayMs,
+        "tool",
+      );
+      if (waited !== undefined) return;
+    }
+    const toolCallId = retryContext.toolCallId ?? this.#ids.nextToolCallId();
+    const started = await this.#startAttempt(
+      current,
+      "search_sources",
+      retryContext.operationId,
+      retryContext.attemptNumber,
+      retryContext.retryPolicy,
+      toolCallId,
+      intent.intentId,
+      undefined,
+    );
     let matches: readonly SourceSearchMatch[];
     try {
       matches = await this.#sourceSearch.search(
         current.sourceScope,
         parsed.data,
       );
+    } catch (error) {
+      const failure = error instanceof InfrastructureFailureError
+        ? this.#normalizeInfrastructureFailure(error)
+        : { category: "tool_execution", code: "search_failed" } as const;
+      const failedAttempt = this.#completeFailedAttempt(started.attempt, failure);
+      if (failure.category === "infrastructure_transient") {
+        this.#commitFailedAttempt(started.projection, failedAttempt);
+      } else {
+        this.#appendFailedSearchAttemptObservation(
+          started.projection,
+          intent,
+          failedAttempt,
+          toolCallId,
+        );
+      }
+      return;
+    }
+    try {
+      matches = parseSourceSearchMatches(matches);
+      if (matches.length > parsed.data.maxResults) {
+        throw new ResearchLoopError();
+      }
+    } catch {
+      this.#commitFailedAttempt(
+        started.projection,
+        this.#completeFailedAttempt(started.attempt, {
+          category: "invariant_violation",
+          code: "invalid_search_result",
+        }),
+      );
+      return;
+    }
+    const observedAt = this.#clock.now();
+    let artifact: PersistedArtifact;
+    try {
+      artifact = await this.#artifacts.putJson(
+        matches,
+        "application/json",
+        observedAt,
+      );
+    } catch {
+      this.#appendFailedSearchAttemptObservation(
+        started.projection,
+        intent,
+        this.#completeFailedAttempt(started.attempt, {
+          category: "tool_execution",
+          code: "search_result_persistence_failed",
+        }),
+        toolCallId,
+      );
+      return;
+    }
+    await this.#runResearchLoopHook(
+      this.#researchLoopHooks.afterSearchResultArtifactWrite,
+    );
+    try {
+      const observation = this.#createResearchObservation(
+        intent,
+        "succeeded",
+        undefined,
+        `找到 ${matches.length} 个批准来源命中`,
+        {
+          searchResultArtifact: stripArtifactCreatedAt(artifact),
+          matchCount: matches.length,
+        },
+        observedAt,
+        toolCallId,
+      );
+      const succeededAttempt = this.#completeSucceededAttempt(
+        started.attempt,
+        observedAt,
+      );
+      const event: ResearchRunEvent = {
+        eventId: this.#ids.nextEventId(),
+        runId: current.runId,
+        sequence: started.projection.lastEventSequence + 1,
+        type: "research_tool_observed",
+        occurredAt: observedAt,
+        payload: { observation, attempt: succeededAttempt },
+      };
+      this.#store.appendEvents(
+        current.runId,
+        started.projection.lastEventSequence,
+        [event],
+        [artifact],
+      );
+      await this.#runResearchLoopHook(
+        this.#researchLoopHooks.afterSearchObservationJournalAppend,
+      );
+    } catch {
+      throw new ResearchLoopError();
+    }
+  }
+
+  async #executeSearchIntentOnce(
+    current: RunProjection,
+    intent: ResearchToolIntent,
+    input: z.infer<typeof searchSourcesInputSchema>,
+  ): Promise<void> {
+    let matches: readonly SourceSearchMatch[];
+    try {
+      matches = await this.#sourceSearch.search(current.sourceScope, input);
     } catch {
       this.#appendGenericToolObservation(current, intent, "failed", "search_failed");
       return;
@@ -1279,14 +1575,19 @@ export class ResearchAgentRuntime {
     summary: string,
     output?: ResearchToolObservation["output"],
     observedAt = this.#clock.now(),
+    toolCallId = this.#ids.nextToolCallId(),
+    failure = code === undefined
+      ? undefined
+      : this.#classifyResearchObservationFailure(status, code),
   ): ResearchToolObservation {
     return {
       observationId: this.#ids.nextObservationId(),
-      toolCallId: this.#ids.nextToolCallId(),
+      toolCallId,
       intentId: intent.intentId,
       toolName: intent.name,
       status,
       ...(code === undefined ? {} : { code }),
+      ...(failure === undefined ? {} : { failure }),
       summary,
       ...(output === undefined ? {} : { output }),
       observedAt,
@@ -1313,6 +1614,291 @@ export class ResearchAgentRuntime {
       }
       throw error;
     }
+  }
+
+  #retryContext(
+    current: RunProjection,
+    operationKind: RetryableOperationKind,
+  ): RetryContext {
+    if (current.state.type !== "researching") throw new ResearchLoopError();
+    const latest = current.state.operationAttempts.at(-1);
+    if (
+      latest !== undefined &&
+      latest.operationKind === operationKind &&
+      latest.outcome === "retryable_failure"
+    ) {
+      const first = current.state.operationAttempts.find(
+        (attempt) => attempt.operationId === latest.operationId,
+      );
+      if (first === undefined) throw new ResearchLoopError();
+      return {
+        operationId: latest.operationId,
+        attemptNumber: latest.attemptNumber + 1,
+        operationStartedAt: first.startedAt,
+        retryPolicy: first.retryPolicy,
+        retryDelayMs: latest.retryDelayMs,
+        ...(first.toolCallId === undefined ? {} : { toolCallId: first.toolCallId }),
+      };
+    }
+    const identity = this.#ids.nextEventId();
+    if (current.retryPolicy === undefined) throw new ResearchLoopError();
+    return {
+      operationId: `operation-${identity}`,
+      attemptNumber: 1,
+      operationStartedAt: this.#clock.now(),
+      retryPolicy: current.retryPolicy,
+    };
+  }
+
+  async #startAttempt(
+    current: RunProjection,
+    operationKind: RetryableOperationKind,
+    operationId: string,
+    attemptNumber: number,
+    retryPolicy: RetryPolicy,
+    toolCallId: string | undefined,
+    intentId: string | undefined,
+    latestSteering: string | undefined,
+  ): Promise<StartedAttemptResult> {
+    const startedAt = this.#clock.now();
+    const eventId = this.#ids.nextEventId();
+    const attempt = {
+      attemptId: `attempt-${eventId}`,
+      operationId,
+      operationKind,
+      attemptNumber,
+      retryPolicy,
+      startedAt,
+      outcome: "in_progress",
+      ...(toolCallId === undefined ? {} : { toolCallId }),
+      ...(intentId === undefined ? {} : { intentId }),
+      ...(latestSteering === undefined ? {} : { latestSteering }),
+    } as const;
+    const projection = this.#store.appendEvents(
+      current.runId,
+      current.lastEventSequence,
+      [{
+        eventId,
+        runId: current.runId,
+        sequence: current.lastEventSequence + 1,
+        type: "operation_attempt_started",
+        occurredAt: startedAt,
+        payload: { attempt },
+      }],
+    );
+    await this.#runResearchLoopHook(
+      this.#researchLoopHooks.afterOperationAttemptStarted,
+    );
+    return { projection, attempt };
+  }
+
+  #recoverInterruptedAttempt(
+    current: RunProjection,
+  ): CompletedOperationAttempt | undefined {
+    if (current.state.type !== "researching") return undefined;
+    const latest = current.state.operationAttempts.at(-1);
+    if (latest?.outcome !== "in_progress") return undefined;
+    const failure: NormalizedFailure = {
+      category: "infrastructure_transient",
+      code: latest.operationKind === "model_turn"
+        ? "model_turn_interrupted"
+        : "search_interrupted",
+    };
+    return this.#completeFailedAttempt(latest, failure);
+  }
+
+  #completeSucceededAttempt(
+    attempt: InProgressOperationAttempt,
+    completedAt = this.#clock.now(),
+  ): CompletedOperationAttempt {
+    return {
+      ...attempt,
+      outcome: "succeeded",
+      completedAt,
+      durationMs: Date.parse(completedAt) - Date.parse(attempt.startedAt),
+    };
+  }
+
+  #completeFailedAttempt(
+    attempt: InProgressOperationAttempt,
+    failure: NormalizedFailure,
+  ): CompletedOperationAttempt {
+    const completedAt = this.#clock.now();
+    const retryable = failure.category === "infrastructure_transient";
+    const maxAttempts = attempt.operationKind === "model_turn"
+      ? attempt.retryPolicy.modelMaxAttempts
+      : attempt.retryPolicy.toolMaxAttempts;
+    const canRetry = retryable && attempt.attemptNumber < maxAttempts;
+    return {
+      ...attempt,
+      outcome: canRetry
+        ? "retryable_failure"
+        : retryable
+          ? "retry_exhausted"
+          : "permanent_failure",
+      completedAt,
+      durationMs: Date.parse(completedAt) - Date.parse(attempt.startedAt),
+      failure,
+      ...(canRetry
+        ? { retryDelayMs: this.#retryDelay(attempt, failure) }
+        : {}),
+    };
+  }
+
+  #commitFailedAttempt(
+    current: RunProjection,
+    attempt: CompletedOperationAttempt,
+  ): RunProjection {
+    if (attempt.failure === undefined) throw new ResearchLoopError();
+    const failureEvent: ResearchRunEvent = {
+      eventId: this.#ids.nextEventId(),
+      runId: current.runId,
+      sequence: current.lastEventSequence + 1,
+      type: "operation_attempt_failed",
+      occurredAt: attempt.completedAt,
+      payload: { attempt },
+    };
+    const events: ResearchRunEvent[] = [failureEvent];
+    if (attempt.retryDelayMs === undefined) {
+      events.push({
+        eventId: this.#ids.nextEventId(),
+        runId: current.runId,
+        sequence: current.lastEventSequence + 2,
+        type: attempt.failure.category === "infrastructure_transient"
+          ? "run_retry_exhausted"
+          : "run_failed",
+        occurredAt: attempt.completedAt,
+        payload: attempt.failure.category === "infrastructure_transient"
+          ? {
+              operationId: attempt.operationId,
+              operationKind: attempt.operationKind,
+              attemptsUsed: attempt.attemptNumber,
+              failure: attempt.failure,
+            }
+          : {
+              operationId: attempt.operationId,
+              operationKind: attempt.operationKind,
+              failure: attempt.failure,
+            },
+      } as ResearchRunEvent);
+    }
+    return this.#store.appendEvents(
+      current.runId,
+      current.lastEventSequence,
+      events,
+    );
+  }
+
+  #normalizeModelFailure(error: unknown): NormalizedFailure {
+    if (error instanceof InfrastructureFailureError) {
+      return this.#normalizeInfrastructureFailure(error);
+    }
+    if (error instanceof z.ZodError) {
+      return { category: "model_contract", code: "invalid_model_turn" };
+    }
+    return { category: "model_permanent", code: "model_generation_failed" };
+  }
+
+  #normalizeInfrastructureFailure(
+    error: InfrastructureFailureError,
+  ): NormalizedFailure {
+    return {
+      category: "infrastructure_transient",
+      code: error.code,
+      ...(error.retryAfterMs === undefined
+        ? {}
+        : { retryAfterMs: error.retryAfterMs }),
+    };
+  }
+
+  #appendFailedSearchAttemptObservation(
+    current: RunProjection,
+    intent: ResearchToolIntent,
+    attempt: CompletedOperationAttempt,
+    toolCallId: string,
+  ): RunProjection {
+    const observation = this.#createResearchObservation(
+      intent,
+      "failed",
+      attempt.failure?.code ?? "search_failed",
+      "search_sources failed: search_failed",
+      undefined,
+      attempt.completedAt,
+      toolCallId,
+      attempt.failure,
+    );
+    const events: ResearchRunEvent[] = [
+      {
+        eventId: this.#ids.nextEventId(),
+        runId: current.runId,
+        sequence: current.lastEventSequence + 1,
+        type: "operation_attempt_failed",
+        occurredAt: attempt.completedAt,
+        payload: { attempt },
+      },
+      {
+        eventId: this.#ids.nextEventId(),
+        runId: current.runId,
+        sequence: current.lastEventSequence + 2,
+        type: "research_tool_observed",
+        occurredAt: attempt.completedAt,
+        payload: { observation },
+      },
+    ];
+    return this.#store.appendEvents(
+      current.runId,
+      current.lastEventSequence,
+      events,
+    );
+  }
+
+  #classifyResearchObservationFailure(
+    status: ResearchToolObservation["status"],
+    code: string,
+  ): NormalizedFailure {
+    if (status === "invalid") {
+      return { category: "model_contract", code };
+    }
+    if (status === "denied") {
+      return { category: "permission_denied", code };
+    }
+    if (code === "stale_observation") {
+      return { category: "stale_state", code };
+    }
+    return { category: "tool_execution", code };
+  }
+
+  #retryDelay(
+    attempt: InProgressOperationAttempt,
+    failure: NormalizedFailure,
+  ): number {
+    const exponential = attempt.retryPolicy.baseDelayMs *
+      2 ** Math.max(0, attempt.attemptNumber - 1);
+    const harnessBackoff = Math.min(
+      attempt.retryPolicy.maxDelayMs,
+      exponential,
+    );
+    // provider retry hint 是服务端声明的最短等待，不能被本地 backoff cap 截短；
+    // 自动工作仍由 attempt 上限和已批准 Run wall-time 双重约束。
+    return Math.max(harnessBackoff, failure.retryAfterMs ?? 0);
+  }
+
+  async #waitBeforeRetry(
+    current: RunProjection,
+    requestedDelayMs: number,
+    phase: "model" | "tool",
+  ): Promise<RunProjection | undefined> {
+    const beforeWait = this.#remainingBudget(current, this.#clock.now());
+    const delayMs = Math.min(requestedDelayMs, beforeWait.wallTimeMs);
+    await this.#retryScheduler.wait(delayMs);
+    const evaluatedAt = this.#clock.now();
+    const afterWait = this.#remainingBudget(current, evaluatedAt);
+    if (afterWait.wallTimeMs === 0) {
+      // backoff 自身属于 Research Loop wall time；若等待已耗尽批准窗口，必须在
+      // 发起下一次 provider/tool I/O 前先持久化 budget suspension。
+      return this.#suspendForBudget(current, phase, evaluatedAt);
+    }
+    return undefined;
   }
 
   #suspendForBudget(
@@ -1471,6 +2057,10 @@ export class ResearchAgentRuntime {
                     }
                   : {
                       code: observation.code,
+                      failure: this.#classifyResearchObservationFailure(
+                        observation.status,
+                        observation.code,
+                      ),
                       summary: `read_source ${observation.status}: ${observation.code}`,
                     }),
                 observedAt,

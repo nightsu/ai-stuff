@@ -42,6 +42,9 @@ import type {
   PublicationTarget,
   PublishedLearningArtifact,
   ResearchRunEvent,
+  CompletedOperationAttempt,
+  InProgressOperationAttempt,
+  OperationAttempt,
   ResearchToolIntent,
   ResearchToolObservation,
   ResearchingRunState,
@@ -139,6 +142,9 @@ function applyRunEvent(
       question: event.payload.question,
       sourceScope: event.payload.sourceScope,
       runBudget: event.payload.runBudget,
+      ...(event.payload.retryPolicy === undefined
+        ? {}
+        : { retryPolicy: event.payload.retryPolicy }),
       state: { type: "created" },
       lastEventSequence: event.sequence,
       createdAt: event.occurredAt,
@@ -187,6 +193,7 @@ function applyRunEvent(
         planHash: event.payload.planArtifact.sha256,
         sourceScope: current.sourceScope,
         runBudget: current.runBudget,
+        retryPolicy: current.retryPolicy,
       });
       // approvalBinding 是方便审计的冗余摘要，不是新的事实源。回放必须从
       // run_created 与 plan artifact 重新计算，否则被篡改但内部自洽的摘要
@@ -226,6 +233,7 @@ function applyRunEvent(
         planHash: current.state.planArtifact.sha256,
         sourceScope: current.sourceScope,
         runBudget: current.runBudget,
+        retryPolicy: current.retryPolicy,
       });
       // Receipt 是回放时唯一持久化的用户授权事实，因此既要重新确认等待状态的
       // artifact/binding 不变量，也要逐字段匹配完整 Receipt；actor 或 kind 即使被
@@ -264,7 +272,84 @@ function applyRunEvent(
           researchToolObservations: [],
           evidenceGaps: [],
           pendingToolIntents: [],
+          operationAttempts: [],
         },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "operation_attempt_started": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError("只有 researching Run 可以开始 operation attempt");
+      }
+      validateStartedAttempt(current, event.payload.attempt, event.occurredAt);
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          operationAttempts: [
+            ...current.state.operationAttempts,
+            event.payload.attempt,
+          ],
+          researchStartedAt:
+            current.state.researchStartedAt ?? event.payload.attempt.startedAt,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "operation_attempt_failed": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError("只有 researching Run 可以完成失败 attempt");
+      }
+      const attempts = completePendingAttempt(
+        current.state.operationAttempts,
+        event.payload.attempt,
+        event.occurredAt,
+      );
+      return {
+        ...current,
+        state: { ...current.state, operationAttempts: attempts },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "run_retry_exhausted": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError("只有 researching Run 可以因 retry exhaustion 暂停");
+      }
+      validateTerminalAttemptTransition(
+        current.state.operationAttempts,
+        event.payload.operationId,
+        event.payload.operationKind,
+        event.payload.attemptsUsed,
+        event.payload.failure,
+      );
+      return {
+        ...current,
+        state: {
+          ...current.state,
+          type: "retry_exhausted",
+          ...event.payload,
+        },
+        lastEventSequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
+    }
+    case "run_failed": {
+      if (current.state.type !== "researching") {
+        throw new IllegalRunEventError("只有 researching Run 可以进入 failed");
+      }
+      validateTerminalAttemptTransition(
+        current.state.operationAttempts,
+        event.payload.operationId,
+        event.payload.operationKind,
+        undefined,
+        event.payload.failure,
+      );
+      return {
+        ...current,
+        state: { ...current.state, type: "failed", ...event.payload },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
       };
@@ -277,6 +362,13 @@ function applyRunEvent(
         throw new IllegalRunEventError("pending Research Tool intent 尚未获得 observation");
       }
       const { turn } = event.payload;
+      const operationAttempts = event.payload.attempt === undefined
+        ? current.state.operationAttempts
+        : completePendingAttempt(
+            current.state.operationAttempts,
+            event.payload.attempt,
+            event.occurredAt,
+          );
       if (
         turn.turnId !== `turn-${event.eventId}` ||
         turn.completedAt !== event.occurredAt ||
@@ -313,6 +405,7 @@ function applyRunEvent(
             : { latestSteering: event.payload.latestSteering }),
           researchStartedAt:
             current.state.researchStartedAt ?? event.payload.generationStartedAt,
+          operationAttempts,
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -329,6 +422,13 @@ function applyRunEvent(
         event.occurredAt,
       );
       const output = event.payload.observation.output;
+      const operationAttempts = event.payload.attempt === undefined
+        ? current.state.operationAttempts
+        : completePendingAttempt(
+            current.state.operationAttempts,
+            event.payload.attempt,
+            event.occurredAt,
+          );
       assertResearchToolCallWithinBudget(current, event.payload.observation);
       if (event.payload.observation.status === "succeeded") {
         if (
@@ -356,6 +456,7 @@ function applyRunEvent(
             event.payload.observation,
           ],
           pendingToolIntents: pending,
+          operationAttempts,
         },
         lastEventSequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -639,6 +740,7 @@ function applyRunEvent(
         proposal: event.payload.proposal,
         publicationTarget: event.payload.publicationTarget,
         publicationBinding: event.payload.publicationBinding,
+        operationAttempts: current.state.operationAttempts,
       } as const;
       return {
         ...current,
@@ -768,6 +870,149 @@ function remainingBudgetsEqual(
   );
 }
 
+function validateStartedAttempt(
+  projection: RunProjection,
+  attempt: InProgressOperationAttempt,
+  occurredAt: string,
+): void {
+  if (projection.state.type !== "researching") {
+    throw new IllegalRunEventError("只有 researching Run 可以开始 operation attempt");
+  }
+  const state = projection.state;
+  const sameOperation = state.operationAttempts.filter(
+    (candidate) => candidate.operationId === attempt.operationId,
+  );
+  const latest = sameOperation.at(-1);
+  const expectedNumber = sameOperation.length + 1;
+  const modelShape =
+    attempt.operationKind === "model_turn" &&
+    attempt.toolCallId === undefined &&
+    attempt.intentId === undefined &&
+    state.pendingToolIntents.length === 0;
+  const searchIntent = state.pendingToolIntents[0];
+  const searchShape =
+    attempt.operationKind === "search_sources" &&
+    attempt.toolCallId !== undefined &&
+    attempt.intentId === searchIntent?.intentId &&
+    searchIntent?.name === "search_sources";
+  if (
+    attempt.attemptId.trim() === "" ||
+    attempt.operationId.trim() === "" ||
+    attempt.attemptNumber !== expectedNumber ||
+    attempt.startedAt !== occurredAt ||
+    !isIsoUtc(attempt.startedAt) ||
+    state.operationAttempts.some(
+      (candidate) => candidate.attemptId === attempt.attemptId,
+    ) ||
+    projection.retryPolicy === undefined ||
+    !retryPoliciesEqual(attempt.retryPolicy, projection.retryPolicy) ||
+    (latest !== undefined && latest.outcome === "in_progress") ||
+    (!modelShape && !searchShape)
+  ) {
+    throw new IllegalRunEventError("operation attempt start 与当前逻辑操作不一致");
+  }
+}
+
+function completePendingAttempt(
+  attempts: readonly OperationAttempt[],
+  completed: CompletedOperationAttempt,
+  occurredAt: string,
+): readonly OperationAttempt[] {
+  const latestIndex = attempts.length - 1;
+  const started = attempts[latestIndex];
+  if (started?.outcome !== "in_progress") {
+    throw new IllegalRunEventError("operation attempt completion 与 pending attempt 不一致");
+  }
+  const hasFailure = completed.outcome !== "succeeded";
+  const maxAttempts = completed.operationKind === "model_turn"
+    ? completed.retryPolicy.modelMaxAttempts
+    : completed.retryPolicy.toolMaxAttempts;
+  const infrastructureTransient =
+    completed.failure?.category === "infrastructure_transient";
+  const canRetry = infrastructureTransient &&
+    completed.attemptNumber < maxAttempts;
+  const expectedOutcome = completed.failure === undefined
+    ? "succeeded"
+    : canRetry
+      ? "retryable_failure"
+      : infrastructureTransient
+        ? "retry_exhausted"
+        : "permanent_failure";
+  const expectedRetryDelayMs = canRetry && completed.failure !== undefined
+    ? retryDelayFromPolicy(started, completed.failure)
+    : undefined;
+  if (
+    completed.attemptId !== started.attemptId ||
+    completed.operationId !== started.operationId ||
+    completed.operationKind !== started.operationKind ||
+    completed.attemptNumber !== started.attemptNumber ||
+    completed.startedAt !== started.startedAt ||
+    !retryPoliciesEqual(completed.retryPolicy, started.retryPolicy) ||
+    completed.toolCallId !== started.toolCallId ||
+    completed.intentId !== started.intentId ||
+    completed.latestSteering !== started.latestSteering ||
+    completed.completedAt !== occurredAt ||
+    completed.durationMs !== Date.parse(occurredAt) - Date.parse(started.startedAt) ||
+    completed.durationMs < 0 ||
+    completed.outcome !== expectedOutcome ||
+    (hasFailure !== (completed.failure !== undefined)) ||
+    completed.retryDelayMs !== expectedRetryDelayMs
+  ) {
+    throw new IllegalRunEventError("operation attempt completion 与 pending attempt 不一致");
+  }
+  return [...attempts.slice(0, latestIndex), completed];
+}
+
+function retryDelayFromPolicy(
+  attempt: InProgressOperationAttempt,
+  failure: import("./types.js").NormalizedFailure,
+): number {
+  const exponential = attempt.retryPolicy.baseDelayMs *
+    2 ** Math.max(0, attempt.attemptNumber - 1);
+  return Math.max(
+    Math.min(attempt.retryPolicy.maxDelayMs, exponential),
+    failure.retryAfterMs ?? 0,
+  );
+}
+
+function retryPoliciesEqual(
+  left: import("./types.js").RetryPolicy,
+  right: import("./types.js").RetryPolicy,
+): boolean {
+  return left.version === right.version &&
+    left.modelMaxAttempts === right.modelMaxAttempts &&
+    left.toolMaxAttempts === right.toolMaxAttempts &&
+    left.baseDelayMs === right.baseDelayMs &&
+    left.maxDelayMs === right.maxDelayMs;
+}
+
+function validateTerminalAttemptTransition(
+  attempts: readonly OperationAttempt[],
+  operationId: string,
+  operationKind: OperationAttempt["operationKind"],
+  attemptsUsed: number | undefined,
+  failure: import("./types.js").NormalizedFailure,
+): void {
+  const latest = attempts.at(-1);
+  const operationAttempts = attempts.filter(
+    (attempt) => attempt.operationId === operationId,
+  );
+  if (
+    latest === undefined ||
+    latest.outcome === "in_progress" ||
+    latest.operationId !== operationId ||
+    latest.operationKind !== operationKind ||
+    latest.failure?.category !== failure.category ||
+    latest.failure.code !== failure.code ||
+    latest.failure.retryAfterMs !== failure.retryAfterMs ||
+    (attemptsUsed !== undefined && latest.outcome !== "retry_exhausted") ||
+    (attemptsUsed === undefined && latest.outcome !== "permanent_failure") ||
+    (attemptsUsed !== undefined && operationAttempts.length !== attemptsUsed)
+  ) {
+    throw new IllegalRunEventError("terminal attempt transition 与 canonical attempts 不一致");
+  }
+}
+
 function traceLineage(
   event: ResearchRunEvent,
 ): Pick<
@@ -781,7 +1026,54 @@ function traceLineage(
   | "draftArtifactId"
   | "publicationApprovalId"
   | "learningArtifactSha256"
+  | "operationId"
+  | "operationKind"
+  | "attemptNumber"
+  | "attemptOutcome"
+  | "attemptDurationMs"
+  | "retryPolicyVersion"
+  | "failureCategory"
+  | "failureCode"
+  | "retryDelayMs"
 > {
+  const attempt =
+    event.type === "operation_attempt_started" ||
+      event.type === "operation_attempt_failed"
+      ? event.payload.attempt
+      : event.type === "model_turn_completed" ||
+          event.type === "research_tool_observed"
+        ? event.payload.attempt
+        : undefined;
+  if (attempt !== undefined) {
+    return {
+      operationId: attempt.operationId,
+      operationKind: attempt.operationKind,
+      attemptNumber: attempt.attemptNumber,
+      attemptOutcome: attempt.outcome,
+      ...(attempt.outcome === "in_progress"
+        ? {}
+        : { attemptDurationMs: attempt.durationMs }),
+      retryPolicyVersion: attempt.retryPolicy.version,
+      ...(attempt.outcome === "in_progress" || attempt.failure === undefined
+        ? {}
+        : {
+            failureCategory: attempt.failure.category,
+            failureCode: attempt.failure.code,
+          }),
+      ...(attempt.outcome === "in_progress" || attempt.retryDelayMs === undefined
+        ? {}
+        : { retryDelayMs: attempt.retryDelayMs }),
+      ...(attempt.toolCallId === undefined ? {} : { toolCallId: attempt.toolCallId }),
+    };
+  }
+  if (event.type === "run_retry_exhausted" || event.type === "run_failed") {
+    return {
+      operationId: event.payload.operationId,
+      operationKind: event.payload.operationKind,
+      failureCategory: event.payload.failure.category,
+      failureCode: event.payload.failure.code,
+    };
+  }
   if (event.type === "source_read_observed") {
     return {
       toolCallId: event.payload.observation.toolCallId,
@@ -792,7 +1084,12 @@ function traceLineage(
             sourceSnapshotId:
               event.payload.observation.sourceSnapshot.snapshotId,
           }
-        : {}),
+        : {
+            failureCategory: event.payload.observation.status === "denied"
+              ? "permission_denied"
+              : "tool_execution",
+            failureCode: event.payload.observation.code,
+          }),
     };
   }
   if (event.type === "research_tool_observed") {
@@ -801,6 +1098,12 @@ function traceLineage(
       observationId: event.payload.observation.observationId,
       observationStatus:
         event.payload.observation.status === "succeeded" ? "succeeded" : "failed",
+      ...(event.payload.observation.failure === undefined
+        ? {}
+        : {
+            failureCategory: event.payload.observation.failure.category,
+            failureCode: event.payload.observation.failure.code,
+          }),
     };
   }
   if (event.type === "research_completed") {
@@ -958,12 +1261,28 @@ function validateResearchObservation(
         prior.toolCallId === observation.toolCallId,
     ) ||
     (observation.status === "succeeded"
-      ? observation.code !== undefined
-      : observation.code === undefined || observation.output !== undefined)
+      ? observation.code !== undefined || observation.failure !== undefined
+      : observation.code === undefined ||
+        observation.output !== undefined ||
+        observation.failure?.code !== observation.code ||
+        observation.failure.category !== expectedObservationFailureCategory(
+          observation.status,
+          observation.code,
+        ))
   ) {
     throw new IllegalRunEventError("Research Tool observation 未精确消费 pending intent");
   }
   return pendingIntents.slice(1);
+}
+
+function expectedObservationFailureCategory(
+  status: ResearchToolObservation["status"],
+  code: string,
+): import("./types.js").FailureCategory {
+  if (status === "invalid") return "model_contract";
+  if (status === "denied") return "permission_denied";
+  if (code === "stale_observation") return "stale_state";
+  return "tool_execution";
 }
 
 function validateSourceReadObservation(
@@ -1388,6 +1707,8 @@ function approvalBindingsEqual(
     actual.sourceScopeHash === expected.sourceScopeHash &&
     actual.budgetVersion === expected.budgetVersion &&
     actual.budgetHash === expected.budgetHash &&
+    actual.retryPolicyVersion === expected.retryPolicyVersion &&
+    actual.retryPolicyHash === expected.retryPolicyHash &&
     actual.bindingHash === expected.bindingHash
   );
 }
