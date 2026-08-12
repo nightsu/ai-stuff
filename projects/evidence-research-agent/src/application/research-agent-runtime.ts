@@ -818,9 +818,12 @@ export class ResearchAgentRuntime {
         return current;
       }
       if (current.state.type === "research_complete") {
+        // completion 结束了 Research Loop 的 wall-time 计费窗口。这里只用 durable
+        // completedAt 防御旧 Journal 漏写同拍预算暂停；用户之后的空闲时间不能
+        // 让一个已合法完成的 Run 追溯变成 budget_exhausted。
         const remainingBudget = this.#remainingBudget(
           current,
-          this.#clock.now(),
+          current.state.completion.completedAt,
         );
         const exhausted = firstExhaustedRunBudgetDimension(
           remainingBudget,

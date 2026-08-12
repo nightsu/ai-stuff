@@ -137,7 +137,7 @@ stateDiagram-v2
   end note
 ```
 
-`research_complete` 不是最终 terminal `completed`：它只表示模型通过 `complete_research` 显式结束调查并保存 unresolved questions，可以进入确定性 Gate。完成工具返回后 Runtime 会在 completion 的同一个 `occurredAt` 用 canonical budget calculator 再检查 Model Turn 与 wall time；若此时刚好耗尽，`research_completed` 与 `run_budget_exhausted` 会在同一个 SQLite transaction 中追加，最终 Run 直接成为 `budget_exhausted`，并以 `researchOutcome: research_complete` 保留 completion provenance。这样 completion commit 前的崩溃仍留下 pending intent，commit 后的崩溃则一定同时看见 completion 与预算暂停，不存在 exhausted 但可发布的中间 Journal。更早暂停保存 `researchOutcome: incomplete`。两者都是 suspended non-success，均拒绝 draft/publication；Issue #9 才会加入新预算版本、重新审批和精确恢复。
+`research_complete` 不是最终 terminal `completed`：它只表示模型通过 `complete_research` 显式结束调查并保存 unresolved questions，可以进入确定性 Gate。完成工具返回后 Runtime 会在 completion 的同一个 `occurredAt` 用 canonical budget calculator 再检查 Model Turn 与 wall time，并把 durable `completion.completedAt` 冻结为 Research Loop 的计费终点；之后的用户空闲或重复 `advanceResearch` 不会让合法完成的 Run 追溯耗尽。若 completion 当拍刚好耗尽，`research_completed` 与 `run_budget_exhausted` 会在同一个 SQLite transaction 中追加，最终 Run 直接成为 `budget_exhausted`，并以 `researchOutcome: research_complete` 保留 completion provenance。这样 completion commit 前的崩溃仍留下 pending intent，commit 后的崩溃则一定同时看见 completion 与预算暂停，不存在 exhausted 但可发布的中间 Journal。更早暂停保存 `researchOutcome: incomplete`。两者都是 suspended non-success，均拒绝 draft/publication；Issue #9 才会加入新预算版本、重新审批和精确恢复。
 
 publication 状态以 `researchOrigin` 判别 provenance：Issue #5 的零 Research Loop Model Turn 显式教学路径只能是 `legacy_explicit`，真正多轮路径只能是 `research_loop` 且结构上必须同时保留非空 Model Turns、tool observations、`researchStartedAt` 与 `completion`。因此 schema 和 reducer 都无法表达“有 Research Loop turns 但没有完成事实”或“零 turn 凭空带 completion”的非法组合。
 

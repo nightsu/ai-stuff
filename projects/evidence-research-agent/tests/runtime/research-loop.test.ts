@@ -1378,7 +1378,7 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
     let clockCalls = 0;
     const clock: Clock = {
       now: () =>
-        clockCalls++ < 7
+        clockCalls++ < 6
           ? "2026-08-12T08:00:00.000Z"
           : "2026-08-12T08:00:00.010Z",
     };
@@ -1398,6 +1398,31 @@ describe("ResearchAgentRuntime bounded Research Loop", () => {
           completion: { unresolvedQuestions: [] },
         },
       });
+    } finally {
+      fixture.runtime.close();
+    }
+  });
+
+  it("does not charge idle time after research completed within the wall-time budget", async () => {
+    let clockCalls = 0;
+    const clock: Clock = {
+      now: () =>
+        clockCalls++ < 7
+          ? "2026-08-12T08:00:00.000Z"
+          : "2026-08-12T10:00:00.000Z",
+    };
+    const fixture = await createApprovedLoopRun(
+      [turn("complete", "complete_research", { unresolvedQuestions: [] })],
+      { maxWallTimeMs: 1 },
+      { clock },
+    );
+    try {
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "research_complete" } });
+      await expect(
+        fixture.runtime.advanceResearch({ runId: fixture.runId }),
+      ).resolves.toMatchObject({ state: { type: "research_complete" } });
     } finally {
       fixture.runtime.close();
     }
